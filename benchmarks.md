@@ -105,3 +105,25 @@ The 32 GiB RAM ceiling means the >32 GiB models must keep experts on disk
 - Qwen3.8-Flash-Next (reap-288, Swift) carry PLE tensors inline
   (`ple_conv1d/key/value/norm`, `per_layer_token_embd`); the standalone
   `*-ngram-embeddings-*` GGUF is an alternative PLE asset, not required.
+
+## 9. Expert pool type coverage (tt_bytes fix)
+
+`tt_bytes()` now defers to `ggml_blck_size`/`ggml_type_size`, so the pool covers
+every ggml type with an exact per-expert stride. Verified with
+`examples/pool_types.rs` against the real `ggml-base.dll`:
+
+| type | size/blck | bits/wt | old pool |
+|---|---:|---:|---|
+| Q2_K | 84/256 | 2.625 | skipped |
+| Q4_K | 144/256 | 4.500 | skipped |
+| Q5_K | 176/256 | 5.500 | skipped |
+| Q6_K | 210/256 | 6.562 | skipped |
+| IQ2_XXS | 66/256 | 2.062 | skipped |
+| MXFP4 | 17/32 | 4.250 | skipped |
+| NVFP4 | 36/64 | 4.500 | skipped |
+| Q8_0 | 34/32 | 8.500 | skipped |
+
+Per-expert bytes exact (35B MXFP4 557056, 35B Q6_K 860160, gpt-oss MXFP4 4406400,
+DSV4 IQ2_XXS 2162688 / Q2_K 2752512). Live pool test (35B, `E0_POOL_MB=4096`,
+pool-only): `POOL2 init: tt=120` (was 0), `bypass=0`, hits 327680+, hot 2.3 GB.
+

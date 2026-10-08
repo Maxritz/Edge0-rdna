@@ -68,10 +68,9 @@ void skip_val(FILE * f, uint32_t t) {
     size_t s = scalar_size(t);
     if (s) fseek(f, (long) s, SEEK_CUR);
 }
-// Tensor dtype uses the GGML_TYPE enum: 0=F32 1=F16 2=BF16 3=Q4_1 (NOT the GGUF KV enum — don't mix).
-bool   is_q4_1(uint32_t t) { return t == 3; }
-size_t plain_esz(uint32_t t) { return t == 0 ? 4 : (t == 1 || t == 2) ? 2 : 0; }
-
+// Tensor dtype is the GGML_TYPE enum (ggml.h). Size via ggml's own block arithmetic so
+// every type is covered (F32/F16/BF16, Q4_1, the K-quants, MXFP4, NVFP4, IQ*) instead of
+// a hand table. Returns 0 for anything ggml cannot size -> the tensor is simply not pooled.
 struct TT {
     std::string name;
     uint32_t type = 0;
@@ -79,10 +78,13 @@ struct TT {
     uint64_t off = 0;
 };
 size_t tt_bytes(const TT & x) {
+    const int64_t bs = ggml_blck_size((ggml_type) x.type);
+    const size_t  es = ggml_type_size((ggml_type) x.type);
+    if (bs <= 0 || es == 0) return 0;
     size_t n = 1;
     for (int i = 0; i < 4; ++i) n *= (size_t) x.dim[i];
-    if (is_q4_1(x.type)) return (size_t) x.dim[1] * x.dim[2] * x.dim[3] * ((size_t) x.dim[0] / 32) * 20;
-    return n * plain_esz(x.type);
+    if (n % (size_t) bs) return 0;
+    return es * (n / (size_t) bs);
 }
 
 // IEEE half → float (subnormals included)
