@@ -146,3 +146,26 @@ in page cache; the pool's value is under real RAM pressure. The pool has no evic
 (fill-once), so a pool smaller than the working set permanently bypasses the overflow to
 mmap — an LRU/eviction policy is the next change needed.
 
+## 11. Multi-model `--n-cpu-moe` sweep (RX 9070 XT 16 GiB, 96 GiB RAM, t=16)
+
+`llama-bench -p 256 -n 64 -ngl 99 -fa auto`, decode tok/s (tg64) per `--n-cpu-moe`:
+
+| model | size | arch | experts | 0 | 16 | 24 | 31 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Laguna-XS-2.1 IQ3_XXS | 13.0 | laguna | 256 | **112.0** | 44.4 | 33.1 | 27.6 |
+| laguna-xs2 Q4_K_M | 20.3 | laguna | 256 | **43.6** | 36.2 | 30.6 | 25.8 |
+| GLM-4.7-Flash Q4_K_M | 18.1 | deepseek2 | 64 | **41.9** | 31.1 | 25.3 | 21.0 |
+| Qwen3.5-35B-A3B Q4_K_XL | 19.7 | qwen35moe | 256 | 35.0 | **39.1** | 29.3 | 24.5 |
+| gpt-oss-120b Q8_0 | 63.4 | gpt-oss | 128 | - | 12.9 | - | - |
+
+Prefill (pp256) follows the same shape — 600-700 tok/s when experts fit on GPU, falling
+with `--n-cpu-moe`. Two regimes:
+- **Fits on the 16 GiB card** (Laguna-XS-2.1 13 GB, laguna-xs2 20 GB, GLM 18 GB): decode
+  peaks at `--n-cpu-moe 0` (all experts on GPU). Laguna-XS-2.1 IQ3_XXS hits **112 tok/s**
+  — the fastest config measured on this card.
+- **Barely over budget** (Qwen3.5-35B 19.7 GB, 256 experts): `--n-cpu-moe 0` spills and
+  drops; a small offload (`--n-cpu-moe 8-16`) is the sweet spot.
+
+gpt-oss-120b thread sweep (n_cpu_moe 32): t=8 59.2 pp / 13.0 tg, t=16 56.5 / 12.9,
+t=24 56.5 / 12.7 — thread count barely matters; ~8 threads is fine.
+
