@@ -127,3 +127,22 @@ Per-expert bytes exact (35B MXFP4 557056, 35B Q6_K 860160, gpt-oss MXFP4 4406400
 DSV4 IQ2_XXS 2162688 / Q2_K 2752512). Live pool test (35B, `E0_POOL_MB=4096`,
 pool-only): `POOL2 init: tt=120` (was 0), `bypass=0`, hits 327680+, hot 2.3 GB.
 
+## 10. gpt-oss-120b pool coverage vs pool size (pool-only, MXFP4)
+
+gpt-oss-120b Q8_0 (63.4 GB, 36 layers x 128 experts, K=4), `-ngl 99 --n-cpu-moe 32
+-c 4096 -fa auto`, no prerouter. Coverage = pool hits / (hits + mmap bypasses).
+
+| pool | tt | fills | hits | bypass | coverage | hot | decode tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 GiB  | 108 | 974  | 81920  | 576535 | 12.4% | 4093 MB  | 10.5 |
+| 6 GiB  | 108 | 1462 | 147456 | 504121 | 22.6% | 6143 MB  | 11.0 |
+| 8 GiB  | 108 | 1949 | 212992 | 453076 | 32.0% | 8190 MB  | 10.8 |
+| 16 GiB | 108 | 3898 | 442368 | 216691 | 67.1% | 16380 MB | 10.7 |
+
+Coverage is ~pool_size / 24 GiB (the distinct-expert working set), linear until it
+saturates. A 6-8 GiB pool (product tiers) covers ~1/4 to 1/3 of expert reads. Decode is
+flat across pool sizes here because this machine (96 GiB RAM) keeps the whole 63 GB file
+in page cache; the pool's value is under real RAM pressure. The pool has no eviction
+(fill-once), so a pool smaller than the working set permanently bypasses the overflow to
+mmap — an LRU/eviction policy is the next change needed.
+

@@ -97,7 +97,7 @@ Any GGUF from a supported MoE family runs on the same engine as the Edge0 tiers.
 - otherwise the smallest `--n-cpu-moe N` that fits (experts of the first N layers stay in system RAM); if even that does not fit, `--cpu-moe`;
 - the KV cache for the chosen context and 1.5 GiB of headroom come off the GPU budget first.
 
-**Load** stays disabled unless the plan says the model fits. The engine then starts with the planned flags plus `--ctx-size`, `--flash-attn auto` and `--no-webui`. Local GGUF loads do not use the LoRA adapter or `--pool-mb`, which are Edge0-tier features.
+**Load** stays disabled unless the plan says the model fits. The engine then starts with the planned flags plus `--ctx-size`, `--flash-attn auto` and `--no-webui`. Local GGUF loads do not use the LoRA adapter (an Edge0-tier feature), but they do use the expert pool: `--pool-mb` is set from `E0_POOL_MB` (0 disables), else a RAM-clamped default (see below).
 
 #### Disk expert streaming (any model, including small ones)
 

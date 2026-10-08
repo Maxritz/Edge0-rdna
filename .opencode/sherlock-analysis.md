@@ -175,3 +175,58 @@ blocked 18/32).
   (Qwen3.8), IQ2_XXS+Q2_K (DeepSeek-V4).
 - Remaining: wire `--pool-mb` into the local-GGUF load path (currently Edge0-tier only);
   measure pool hit rate + disk throughput on a real >32 GiB model (DeepSeek / gpt-oss).
+
+## [RUN-005] 2026-10-09 — MODE: HIGH — gpt-oss-120b pool-only + --pool-mb wiring
+
+### CHANGES
+- `engine.rs`: local GGUF loads now pass `--pool-mb` (`pool_for_gguf()`: `E0_POOL_MB`
+  override, else RAM-clamped default; 0 disables). Build clean.
+- `windows/README.md` §1.4 updated (local GGUFs now use the pool).
+
+### WORKLOAD
+gpt-oss-120b Q8_0 (63.4 GB, MXFP4 experts, 36 layers x 128 experts, K=4),
+`-ngl 99 --n-cpu-moe 32 -c 4096 -fa auto`, pool-only (no E0_PREROUTER), 27-token prompt
++ 96 decode tokens.
+
+### DATA
+| pool | tt | fillD | hits | bypass | coverage | hot | decode | prefill |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 GiB  | 108 | 974  | 81920  | 576535 | 12.4% | 4093 MB  | 10.48 tok/s | 2.75 tok/s |
+| 6 GiB  | 108 | 1462 | 147456 | 504121 | 22.6% | 6143 MB  | 10.98 tok/s | 4.52 tok/s |
+| 8 GiB  | 108 | 1949 | 212992 | 453076 | 32.0% | 8190 MB  | 10.84 tok/s | 4.39 tok/s |
+| 16 GiB | 108 | 3898 | 442368 | 216691 | 67.1% | 16380 MB | 10.70 tok/s | 2.85 tok/s |
+
+Coverage ≈ pool_size / ~24 GiB working set (linear until it saturates): 4/6/8/16 GiB ->
+12/23/32/67%. The effective distinct-expert working set touched is ~24 GiB, so a 6-8 GiB
+pool (the product-tier range) covers only a quarter to a third of gpt-oss expert reads.
+
+- tt=108 = 36 layers x 3 MXFP4 expert tensors registered (per=4406400 exact, matches
+  `pool_types`); resolver accepts (per==nb02).
+- Coverage = hits/(hits+bypass): fraction of CPU-expert accesses served by the pool vs
+  mmap. Scales strongly with pool size.
+
+### FINDINGS
+| Rank | Component | Cost / evidence | Status |
+|------|-----------|-----------------|--------|
+| 1 | Pool coverage scales with size | 4->16 GiB: 12.4% -> 67.1% (-360k mmap bypasses) | CONFIRMED |
+| 2 | Pool has no eviction | slots fill once; once at cap (~930 experts @4 GiB, ~3898 @16 GiB) remaining experts bypass to mmap permanently | CONFIRMED (by design) |
+| 3 | gpt-oss expert working set ~18 GiB | 32 CPU layers x 128 experts x 4.4 MB; needs ~18 GiB pool to fully cover | CONFIRMED |
+| 4 | Decode unchanged by pool size | 10.5 vs 10.7 tok/s; this box has 96 GiB RAM so experts are page-cache resident (no disk pressure) | CONFIRMED |
+| 5 | Single-fill waits | wait=68629 (threads sleeping on a slot being filled) | SUSPECTED tax |
+
+### ANALYSIS
+- The MXFP4 fix works on gpt-oss (tt=108, exact strides). The limiter is pool *capacity*
+  vs working set, not type support.
+- The no-eviction design (fill-once, no recycle) is safe but wrong for working sets
+  larger than the pool: it fills with the first-touched experts and cannot adapt. On a
+  32 GiB machine the gpt-oss 18 GiB expert set cannot be fully pooled, so a large
+  fraction stays on the mmap path — the reload churn the pool is meant to remove.
+- Decode here is not a disk test (96 GiB RAM holds the whole 63 GiB file in page cache);
+  the pool's value shows up under real RAM pressure, which this machine cannot reproduce.
+
+### ACTIONS
+- [ ] Pool eviction (LRU / age-based) so a small pool adapts to the hot set instead of
+      filling once. This is the change that makes disk streaming real for >pool models.
+- [ ] Re-test under an enforced RAM cap (Job Object) to see disk-throughput impact.
+- [ ] Consider an explicit "stream experts" mode (force `--n-cpu-moe` = all, pool on)
+      for models that would otherwise fit, per the disk-tier intent.

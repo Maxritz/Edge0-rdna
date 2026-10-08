@@ -83,6 +83,18 @@ pub fn pool_for(tier: &str) -> u32 {
     base.min(cap).max(512)
 }
 
+/// Pool size for a local GGUF load. `E0_POOL_MB` overrides (0 disables); otherwise the
+/// same RAM-clamped default as the tiers, so local GGUF experts stream through the L1
+/// pool instead of mmap page-faults.
+pub fn pool_for_gguf() -> u32 {
+    if let Ok(v) = std::env::var("E0_POOL_MB") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            return n;
+        }
+    }
+    pool_for("")
+}
+
 // Job Object safety net: llama-server is assigned to a job created with
 // KILL_ON_JOB_CLOSE, so whether the shell exits cleanly, crashes, or is force-killed
 // (taskkill /f), the OS closes the process handle -> closes the job -> kills the
@@ -310,6 +322,7 @@ pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u3
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+    let pool = pool_for_gguf();
     launch(
         sink,
         state,
@@ -317,7 +330,7 @@ pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u3
             tier: "local-gguf".into(),
             model: name,
             args,
-            pool_mb: None,
+            pool_mb: if pool > 0 { Some(pool) } else { None },
             plan: Some(plan),
             log_stem: "engine-gguf".into(),
         },
