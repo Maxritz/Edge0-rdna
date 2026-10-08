@@ -1,4 +1,4 @@
-# scripts/vendor-build.ps1 — llama engine assembly for the Windows product (monorepo layout)
+﻿# scripts/vendor-build.ps1 — llama engine assembly for the Windows product (monorepo layout)
 # The pristine upstream tree (../vendor/llama.cpp, pinned commit) is NEVER patched in place:
 # this script replays the patch bands into an isolated build worktree (../wt/win), copies the
 # edge0 serving pieces from serve/ into src/edge0 (patch #3's CMake glob compiles them into
@@ -78,7 +78,7 @@ function Find-HipSdk {
 # for the requested targets (plus arch-neutral files) are copied to keep the folder small.
 function Copy-HipRuntime($hip, [string]$binDir, [string]$targets) {
     $sdkBin = Join-Path $hip.Root "bin"
-    $patterns = @("amdhip64*.dll", "amd_comgr*.dll", "hipblas*.dll", "rocblas*.dll", "hiprtc*.dll", "libomp*.dll")
+    $patterns = @("amdhip64*.dll", "amd_comgr*.dll", "hipblas*.dll", "rocblas*.dll", "hiprtc*.dll", "libomp*.dll", "libhipblaslt.dll", "rocm_kpack.dll", "rocsolver.dll")
     foreach ($pat in $patterns) {
         Get-ChildItem (Join-Path $sdkBin $pat) -File -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName $binDir -Force }
     }
@@ -136,7 +136,16 @@ try {
         Write-Host "[4/4] configure + build (Release/HIP, targets $GpuTargets, $BuildDir)" -ForegroundColor Cyan
         $hip = Find-HipSdk
         $env:HIP_PATH = $hip.Root
-        cmake -S $WT -B $bd -G Ninja "-DGGML_HIP=ON" "-DGPU_TARGETS=$GpuTargets" "-DCMAKE_C_COMPILER=$($hip.Clang)" "-DCMAKE_CXX_COMPILER=$($hip.ClangXX)" "-DCMAKE_BUILD_TYPE=Release"
+        # Runtime-only ROCm packages (and FindOpenMP picking up a stray MinGW libgomp) leave the
+        # OpenMP link unresolved; the full SDK ships libomp. Without it, configure without OpenMP.
+        $ompExtra = @()
+        $libomp = @((Join-Path $hip.Root "lib\llvm\lib\libomp.lib"), (Join-Path $hip.Root "lib\omp\lib\libomp.lib")) |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $libomp) {
+            Write-Host "  no libomp.lib in HIP SDK tree — adding -DGGML_OPENMP=OFF (CPU backend loses OpenMP parallelism only)" -ForegroundColor Yellow
+            $ompExtra = @("-DGGML_OPENMP=OFF")
+        }
+        cmake -S $WT -B $bd -G Ninja "-DGGML_HIP=ON" "-DGPU_TARGETS=$GpuTargets" "-DCMAKE_C_COMPILER=$($hip.Clang)" "-DCMAKE_CXX_COMPILER=$($hip.ClangXX)" "-DCMAKE_BUILD_TYPE=Release" @ompExtra
         if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (hip): needs HIP SDK 6.1+, Ninja on PATH, and GPU targets the SDK supports ($GpuTargets)" }
         cmake --build $bd
         if ($LASTEXITCODE -ne 0) { throw "build failed (hip)" }

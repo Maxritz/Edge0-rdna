@@ -47,12 +47,14 @@ fn serve(content: Vec<u8>, mode: &'static str) -> String {
                     break;
                 }
             }
+            // HTTP/1.1 header names are case-insensitive; hyper writes `range:` lowercase on the wire.
+            let head_l = head.to_ascii_lowercase();
             let want: Option<u64> = match mode {
-                _ if !head.contains("Range:") => None,
-                _ => head
+                _ if !head_l.contains("range:") => None,
+                _ => head_l
                     .find("bytes=")
-                    .and_then(|i| head[i + 6..].split('-').next())
-                    .and_then(|s| s.parse().ok()),
+                    .and_then(|i| head_l[i + 6..].split('-').next())
+                    .and_then(|s| s.parse().ok())
             };
             let mut body = content.clone();
             if mode == "corrupt" {

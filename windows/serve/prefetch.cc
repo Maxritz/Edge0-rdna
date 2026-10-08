@@ -297,12 +297,16 @@ bool g_pool_on = false;
 volatile LONG g_p_hits = 0, g_p_miss_d = 0, g_p_bypass = 0, g_p_waits = 0, g_p_fills = 0;
 
 // Expert-base resolver hook from the patch band (exported by ggml.dll, C decoration).
+// Decls mirror the patch header's extern "C" block (C language linkage on the fn-pointer type).
+extern "C" {
 typedef const char * (*ggml_edge0_mmid_base_fn)(const struct ggml_tensor * src0, int64_t id, size_t nb02);
-extern "C" __declspec(dllimport) void ggml_edge0_set_mmid_resolver(ggml_edge0_mmid_base_fn fn);
+__declspec(dllimport) void ggml_edge0_set_mmid_resolver(ggml_edge0_mmid_base_fn fn);
+}
 
 // Resolver callback (patch surface #7, runs on ggml compute threads): returns the base
 // address of expert `id`'s data.
-extern "C" static const char * e0_mmid_base_res(const ggml_tensor * s, int64_t id, size_t nb02) {
+extern "C" {
+static const char * e0_mmid_base_res(const ggml_tensor * s, int64_t id, size_t nb02) {
     LONG c = InterlockedIncrement(&g_p_calls);
     if (c <= 2) { fprintf(stderr, "[pref-trace] POOL2 call#%ld name=%s nb02=%zu\n", c, s->name ? s->name : "?", nb02); fflush(stderr); }
     const char * orig = (const char *) s->data + (size_t) id * nb02;
@@ -367,6 +371,7 @@ extern "C" static const char * e0_mmid_base_res(const ggml_tensor * s, int64_t i
         LeaveCriticalSection(&pt->cvlk[id]);
         return ok ? (const char *) (pt->arena + (size_t) id * pt->per) : orig;
     }
+}
 }
 
 // Worker prefill (teacher=hot / head=obs): called outside the resolver path; same per-slot CAS pattern.
