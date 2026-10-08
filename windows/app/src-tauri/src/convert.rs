@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 pub fn run(sink: &Arc<dyn Sink>, tier: &str) -> Result<String, String> {
+    let _perf = crate::perf::scope("convert.run");
     let repo = paths::repo_root();
     let script = repo.join("tools").join("convert_mlx_to_gguf.py");
     if !script.exists() {

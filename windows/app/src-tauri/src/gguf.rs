@@ -70,6 +70,7 @@ pub fn checked_model_path(path: &str) -> Result<String, String> {
 
 /// Inspect every GGUF under `dir` (default: the local-gguf folder). Read-only.
 pub fn scan(dir: Option<&str>) -> Result<Value, String> {
+    let _perf = crate::perf::scope("gguf.scan");
     let d = match dir {
         Some(p) if !p.trim().is_empty() => PathBuf::from(p.trim()),
         _ => local_dir(),
@@ -122,6 +123,7 @@ pub fn parse_devices(text: &str) -> Vec<Device> {
 /// The usable GPU with the most free memory, or None when the engine lists only CPU.
 /// Runs `llama-server --list-devices`, which prints and exits without loading a model.
 pub fn detect_gpu() -> Result<Option<Device>, String> {
+    let _perf = crate::perf::scope("gguf.detect_gpu");
     let bin = paths::bin_dir();
     let exe = bin.join("llama-server.exe");
     if !exe.exists() {
@@ -157,6 +159,7 @@ fn device_json(d: &Device) -> Value {
 /// Inspect one model against the GPU the engine reports now. The result always carries
 /// `gpu` (null when none is reported); `plan` is present only when a GPU budget exists.
 pub fn inspect_for_gpu(path: &str, ctx: u32) -> Result<Value, String> {
+    let _perf = crate::perf::scope("gguf.inspect_for_gpu");
     let model = checked_model_path(path)?;
     let gpu = detect_gpu()?;
     let ram_gb = engine::phys_mem_gb() as f64;

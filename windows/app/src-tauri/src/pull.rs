@@ -110,6 +110,7 @@ fn probe_ordered(client: &Client, tr: &Tier) -> Vec<(&'static str, String)> {
 /// One file: Range resume + sha256 verification + atomic rename on the same volume.
 pub fn pull_one(client: &Client, base: &str, tier: &str, fc: &catalog::CatFile,
             cancel: &AtomicBool, on_bytes: &dyn Fn(u64)) -> Result<(), String> {
+    let _perf = crate::perf::scope("pull.pull_one");
     if cancel.load(Ordering::Relaxed) {
         return Err("E-CANCEL".into());
     }
@@ -243,6 +244,7 @@ pub fn start(app: AppHandle, tasks: &Tasks, cancels: &Cancels,
 /// directly). An Err return means the error phase was already set on the task view.
 pub fn run(sink: Arc<dyn Sink>, tasks: Tasks, cancels: Cancels, tier: String, tr: Tier,
            cancel: Arc<AtomicBool>, source_hint: Option<String>) {
+    let _perf = crate::perf::scope("pull.run");
     let _ = paths::ensure_dirs(Some(&tier));
     let client = Client::builder().user_agent("edge0-app/0.1").build().unwrap();
     let ordered: Vec<(&'static str, String)> = match source_hint {

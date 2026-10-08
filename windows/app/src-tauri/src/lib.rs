@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod engine;
 pub mod gguf;
 pub mod paths;
+pub mod perf;
 pub mod pull;
 pub mod sink;
 
@@ -96,6 +97,31 @@ fn engine_status(st: tauri::State<AppState>) -> Value {
     engine::status(&st.engine)
 }
 
+/// Toggle performance tracing at runtime ("activate it anytime in run"). Enabling
+/// starts the resource sampler; the shell's own scopes were already compiled in and
+/// cost nothing while off.
+#[tauri::command]
+fn perf_set(enabled: bool) -> Value {
+    perf::set_enabled(enabled);
+    json!({ "enabled": perf::enabled() })
+}
+
+/// Current trace snapshot (component table + live resources). Refreshes the running
+/// engine's phase timings from its log first, so the report reflects real requests.
+#[tauri::command]
+fn perf_report(st: tauri::State<AppState>) -> Value {
+    if let Some(log) = engine::status(&st.engine)["log"].as_str() {
+        perf::ingest_log(log);
+    }
+    perf::snapshot_json()
+}
+
+#[tauri::command]
+fn perf_reset() -> Value {
+    perf::reset();
+    json!({ "reset": true, "enabled": perf::enabled() })
+}
+
 #[tauri::command]
 async fn doctor_run(app: AppHandle) -> Result<Value, String> {
     // Offloaded like model_load: disk-scan / recompute commands never run on the main thread.
@@ -151,6 +177,15 @@ async fn model_delete(app: AppHandle, tier: String) -> Result<Value, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // --profileperf (or EDGE0_PROFILEPERF=1) arms the tracer for the whole session,
+    // including `--perf` on every engine launch. It is also toggleable at runtime
+    // through the perf_set command.
+    let profile = std::env::args().any(|a| a == "--profileperf")
+        || std::env::var("EDGE0_PROFILEPERF").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    if profile {
+        perf::set_enabled(true);
+    }
+
     tauri::Builder::default()
         .manage(AppState {
             tasks: Arc::new(Mutex::new(Default::default())),
@@ -179,7 +214,8 @@ pub fn run() {
             download_start, download_status, download_cancel,
             model_load, model_unload, engine_status,
             doctor_run, model_delete,
-            gguf_scan, gguf_inspect, gguf_load
+            gguf_scan, gguf_inspect, gguf_load,
+            perf_set, perf_report, perf_reset
         ])
         .build(tauri::generate_context!())
         .expect("edge0 shell failed to start")

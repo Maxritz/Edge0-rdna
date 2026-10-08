@@ -125,6 +125,7 @@ const en: Table = {
       lifecycle: "Lifecycle & ownership", lifecycleNote: "Start or stop the engine and inspect port, version, and uptime.",
       logs: "Request log", logsNote: "Shows the generation-request window since this app started.",
       doctor: "Environment checks", doctorNote: "Shows shell-side measured findings and next actions.",
+      perf: "Performance trace", perfNote: "Per-function and per-phase timings with live CPU/GPU/VRAM/RAM/ReBAR utilization. Enable at launch with --profileperf or toggle below.",
     },
     panel: {
       title: "Service Panel", start: "Start service", stop: "Stop service",
@@ -151,6 +152,17 @@ const en: Table = {
       next: "Next", goModels: "Go to Models",
       overall: { pass: "All passing", warn: "Warnings" },
       verdict: { pass: "pass", warn: "warn", fail: "fail" },
+    },
+    perf: {
+      title: "Performance Trace", kicker: "Where the model-handling time actually goes: shell scopes, engine phases, and live resources.",
+      on: "Tracing on", off: "Tracing off", enable: "Enable tracing", disable: "Disable tracing",
+      refresh: "Refresh trace", reset: "Reset", loading: "Reading trace…", empty: "No measurements yet — enable tracing, then load a model and run a request.",
+      note: "Scope: app = shell function wall time, engine = device phase time parsed from the engine log. ReBAR from the AMD driver registry value KMD_RebarControlMode.",
+      th: { component: "Component", scope: "Scope", ops: "Ops", pct: "%dev", dev: "Dev us", idle: "Idle us", host: "Host us" },
+      floor: "Instrumentation floor: {{us}} us host per op ({{n}} empty ops)",
+      resources: "Resources", cpu: "CPU", ram: "RAM", gpu: "GPU util (busiest engine)", vram: "VRAM", rebar: "ReBAR",
+      unavailable: "n/a", samples: "{{n}} resource samples",
+      engineLog: "Engine log",
     },
   },
 };

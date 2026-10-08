@@ -4,6 +4,7 @@
 import { Server } from "lucide-react";
 
 import { DoctorSection } from "../service/doctor";
+import { PerfSection } from "../service/perf";
 import { ServicePanel } from "../service/panel";
 import { RequestLogSection } from "../service/reqlog";
 import { t } from "../lib/t";
@@ -40,6 +41,13 @@ export function ServicePage() {
           <p className="e0-section-note">{t("service.sections.doctorNote")}</p>
         </div>
         <DoctorSection />
+      </section>
+      <section aria-labelledby="service-perf-title" data-testid="service-perf-section">
+        <div className="mb-2 px-1">
+          <h3 id="service-perf-title" className="e0-section-title">{t("service.sections.perf")}</h3>
+          <p className="e0-section-note">{t("service.sections.perfNote")}</p>
+        </div>
+        <PerfSection />
       </section>
     </div>
   );

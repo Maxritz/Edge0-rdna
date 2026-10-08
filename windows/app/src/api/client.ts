@@ -164,6 +164,25 @@ export const ggufScan = (dir: string | null): Promise<{ ok: boolean; models: Ggu
   invoke("gguf_scan", { dir });
 export const ggufInspect = (path: string, ctx: number): Promise<GgufInfo> => invoke("gguf_inspect", { path, ctx });
 
+// —— performance tracing (opt-in; --profileperf at launch or perf_set at runtime). ——
+export type PerfComponent = {
+  name: string; scope: "app" | "engine" | "both"; ops: number; pct_dev: number;
+  dev_us: number; idle_us: number; host_us: number; host_us_max: number;
+};
+export type PerfRebar = { state: string; value: number; source: string } | null;
+export type PerfResources = {
+  t_ms: number; cpu_pct: number | null; ram_used_gb: number | null; ram_total_gb: number | null;
+  gpu_util_pct: number | null; vram_used_gb: number | null; vram_total_gb: number | null; rebar: PerfRebar;
+} | null;
+export type PerfReport = {
+  enabled: boolean; started_at: number; engine_log: string | null;
+  components: PerfComponent[]; resources: PerfResources; resource_samples: number;
+  floor: { n: number; host_us_each: number } | null; report: string;
+};
+export const perfSet = (enabled: boolean): Promise<{ enabled: boolean }> => invoke("perf_set", { enabled });
+export const perfReport = (): Promise<PerfReport> => invoke("perf_report");
+export const perfReset = (): Promise<{ reset: boolean; enabled: boolean }> => invoke("perf_reset");
+
 /** Load a local GGUF through the shared engine (explicit user action; the shell refuses a plan that does not fit). */
 export async function loadGguf(path: string, ctx: number): Promise<EngStatus> {
   engineStore.loadingTier = "local-gguf";

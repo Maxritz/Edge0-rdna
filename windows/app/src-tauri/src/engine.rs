@@ -188,6 +188,7 @@ fn wait_ready(state: &EngineState, log_p: &Path, base: &str) -> Result<u64, Stri
 }
 
 fn launch(sink: &Arc<dyn Sink>, state: &EngineState, l: Launch) -> Result<Value, String> {
+    let _perf = crate::perf::scope("engine.launch");
     let Launch { tier, model, mut args, pool_mb, plan, log_stem } = l;
     let bin = paths::bin_dir();
     let exe = bin.join("llama-server.exe");
@@ -201,6 +202,9 @@ fn launch(sink: &Arc<dyn Sink>, state: &EngineState, l: Launch) -> Result<Value,
     if let Some(mb) = pool_mb {
         args.push("--pool-mb".into());
         args.push(mb.to_string().into());
+    }
+    if crate::perf::enabled() {
+        args.push("--perf".into()); // llama-server internal phase timings -> perf::ingest_log
     }
     args.push("--port".into());
     args.push(port.to_string().into());
@@ -225,7 +229,11 @@ fn launch(sink: &Arc<dyn Sink>, state: &EngineState, l: Launch) -> Result<Value,
         log_path: log_path.clone(),
         job,
     });
-    let uptime_s = wait_ready(state, &log_p, &base)?;
+    let uptime_s = {
+        let _w = crate::perf::scope("engine.wait_ready");
+        wait_ready(state, &log_p, &base)?
+    };
+    crate::perf::ingest_log(&log_path); // load-phase timing recorded as soon as the log exists
     // Pool telemetry line from the engine log (absent line = pool not active; surfaced, not hidden)
     let pool_line = pool_telemetry(&log_path);
     let v = json!({ "running": true, "tier": tier, "model": model, "base_url": base, "bound": "127.0.0.1",
@@ -237,6 +245,7 @@ fn launch(sink: &Arc<dyn Sink>, state: &EngineState, l: Launch) -> Result<Value,
 }
 
 pub fn start(sink: &Arc<dyn Sink>, state: &EngineState, tier: &str) -> Result<Value, String> {
+    let _perf = crate::perf::scope("engine.start");
     stop(state);
     let model_path = paths::gguf_dir(tier).join(format!("edge0-{tier}.gguf"));
     let adapter = paths::files_dir(tier).join(format!("lora_edge0_{tier}-gguf.gguf"));
@@ -274,6 +283,7 @@ pub fn start(sink: &Arc<dyn Sink>, state: &EngineState, tier: &str) -> Result<Va
 /// Load a local GGUF file through the same engine. gguf_tool.py plans the expert offload
 /// for the GPU the engine reports; the engine starts only when that plan fits.
 pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u32) -> Result<Value, String> {
+    let _perf = crate::perf::scope("engine.start_gguf");
     stop(state);
     let ctx = ctx.clamp(512, 262_144);
     let info = gguf::inspect_for_gpu(path, ctx)?;

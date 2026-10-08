@@ -45,6 +45,7 @@ fn check(id: &str, verdict: &str, detail: impl Into<String>, code: Option<&str>,
 /// Main entry (forwarded by doctor_run in lib.rs): takes the engine state so the
 /// pool-telemetry check reads the live process, not a snapshot.
 pub fn run(state: &engine::EngineState) -> Value {
+    let _perf = crate::perf::scope("doctor.run");
     let mut checks: Vec<Value> = Vec::new();
 
     // home: exists and writable (write + delete one probe file to be sure)
