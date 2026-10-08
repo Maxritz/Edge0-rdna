@@ -47,7 +47,7 @@ The llama.cpp tree is **not** a submodule: on first run the script clones upstre
 `-AssembleOnly` runs everything except compilation (seconds; verifies the patch replay still applies and hashes match). Output:
 
 ```
-wt\win\build-hip\bin\llama-server.exe          (-Backend hip: + ggml*.dll, HIP runtime DLLs, rocblas\library)
+wt\win\build-hip\bin\llama-server.exe          (-Backend hip: + ggml*.dll, HIP runtime DLLs, rocblas\library, hipblaslt\library\<arch>)
 wt\win\build-vk\bin\Release\llama-server.exe   (-Backend vulkan: + llama.dll, ggml*.dll)
 ```
 
@@ -56,7 +56,8 @@ wt\win\build-vk\bin\Release\llama-server.exe   (-Backend vulkan: + llama.dll, gg
 - **HIP (ROCm), default.** Targets: RDNA2 `gfx1030` (RX 6800 / 6900 family; the `gfx1031` and `gfx1032` SKUs need `-GpuTargets` with their own targets) and RDNA4 `gfx1200` / `gfx1201` (RX 9060 and RX 9070 family). The default `-GpuTargets` is `gfx1030;gfx1200;gfx1201`; each extra target adds compile time.
 - The script uses the HIP SDK's own `clang` / `clang++` (found under `%HIP_PATH%\lib\llvm\bin` or `%HIP_PATH%\bin`) and Ninja. It copies the HIP runtime DLLs and the rocBLAS kernel data for the requested targets next to `llama-server.exe`. That copy matters: the driver's `amdhip64` DLL in `System32` is searched before `PATH`.
 - The app uses HIP when the `build-hip` depot build exists. Force a backend with `EDGE0_BACKEND=hip` or `EDGE0_BACKEND=vulkan`. The Service page doctor reports the backend and the GPU the engine itself lists.
-- **Status:** the HIP build follows upstream's Windows HIP instructions and CI matrix. It has not yet been compiled or run on RDNA2 or RDNA4 hardware from this repository. The numbers in §2 come from the Vulkan build.
+- **Status:** the HIP build follows upstream's Windows HIP instructions and CI matrix. It is **verified on RDNA4 (`gfx1201`, RX 9070 XT)** — see §2.1; RDNA2 (`gfx1030`) is still unverified. The §2 Vulkan table predates the HIP measurements; §2.1 has the HIP numbers.
+- **Runtime staging:** the script copies both `rocblas\library` and `hipblaslt\library\<arch>` next to `llama-server.exe`. Both are required: hipBLAS dispatches RDNA2 to rocBLAS and RDNA3/4 to hipBLASLt, and a missing hipBLASLt library dir makes the dense f16 GEMM fall back to ~8 TF (vs ~96 TF) on RDNA4.
 
 ### 1.3 Build the app (Tauri installer + portable exe)
 
@@ -97,6 +98,10 @@ Any GGUF from a supported MoE family runs on the same engine as the Edge0 tiers.
 - the KV cache for the chosen context and 1.5 GiB of headroom come off the GPU budget first.
 
 **Load** stays disabled unless the plan says the model fits. The engine then starts with the planned flags plus `--ctx-size`, `--flash-attn auto` and `--no-webui`. Local GGUF loads do not use the LoRA adapter or `--pool-mb`, which are Edge0-tier features.
+
+#### Disk expert streaming (any model, including small ones)
+
+Expert weights are read from the GGUF on demand, not preloaded. With mmap (the default) the OS pages experts in per forward; `--pool-mb` (`E0_POOL_MB`) adds a self-managed L1 that serves routed experts from committed private pages. This is not only a "does not fit" fallback: **any** GGUF can be run with its experts streamed from disk, including a model that would otherwise fit entirely on the GPU — keep the experts off the GPU (`--n-cpu-moe`), and peak VRAM/RAM stays bounded by the *active* expert set instead of the parameter count. mmap streaming applies to every model; the L1 pool additionally requires a supported expert tensor type (F32/F16/BF16/Q4_1 today; the generalization to the K-quants / MXFP4 / NVFP4 experts used by most GGUFs is in progress). With no prerouter sidecar the pool is demand-fill only (routed experts, no prediction); the `[pref-trace]` lines in the engine log report pool hits, fills, and bytes.
 
 Families are tied to the pinned engine (`tools/moe_families.json`). `gguf_tool.py registry-check` checks each arch against `src/llama-arch.cpp` at the pin, and CI runs that check.
 
@@ -187,6 +192,31 @@ Context to keep when reading these numbers:
 - Same-condition A/B against unpatched vanilla llama.cpp (vendor tree with the patch bands skipped) shows the patch set costs nothing (8B: 41.5 vs 39.5 decode; 35B: 27.2 vs 27.4 — within machine drift).
 - Expect day-to-day drift of a few percent on this class of machine; compare like-for-like, same day, same process if you benchmark.
 
+### 2.1 HIP (ROCm) on RDNA4 — measured
+
+Reference: **AMD Radeon RX 9070 XT (`gfx1201`) · 16 GiB VRAM · ReBAR on · 96 GiB RAM · Windows 11**, HIP build, `llama-bench -p 512,2048 -n 128 -ngl 99 -fa auto`.
+
+Qwen3.5-35B-A3B (MXFP4 experts + Q6_K dense), `--n-cpu-moe` sweep:
+
+| n_cpu_moe | pp512 | pp2048 | tg128 |
+|---:|---:|---:|---:|
+| 0 | 760 | 763 | 33.8 |
+| 8 | 430 | 453 | **44.1** |
+| 16 | 481 | 536 | 40.7 |
+| 24 | 340 | 384 | 30.4 |
+| 31 | 267 | 305 | 25.8 |
+| 40 | 219 | 247 | 21.9 |
+
+Prefill scales with GPU-resident experts (pp2048 247 → 763, ~3.1×); decode peaks at `--n-cpu-moe 8` (44 tok/s) and drops at 0 (weights spill to RAM over PCIe). Recommended per-profile plans (`gguf_tool.py`, 32k ctx):
+
+| profile | n_cpu_moe | gpu est | cpu est | pp512 | tg128 |
+|---|---:|---:|---:|---:|---:|
+| 16 GiB VRAM / 32 GiB RAM | 16 | 7.9 GiB | 10.4 GiB | 481 | 40.7 |
+| 12 GiB VRAM / 32 GiB RAM | 25 | 7.9 GiB | 10.4 GiB | 344 | 29.9 |
+| 8 GiB VRAM / 32 GiB RAM | 35 | 3.7 GiB | 14.7 GiB | 252 | 23.0 |
+
+Dense GEMM (`test-backend-ops`, m4096 n512 k14336): ggml's quantized paths already sit near the card's ~96 TF fp16 peak — MXFP4 86, Q8_0 80, Q4_K 75 TF — while f16 reaches 96 TF only with the hipBLASLt library data staged (§1.2). Decode is bandwidth-bound and unchanged by the f16 path.
+
 ---
 
 ## 3. Technical Details
@@ -235,7 +265,8 @@ hook-point patches + band README (`common/`, `windows/` here; `android/` for the
 - Installer is **unsigned** (SmartScreen warning on first run); no auto-updater yet.
 - Engine is not yet bundled inside the installer — portable builds assume the engine build dir; bundling is on the roadmap.
 - The `--pool-mb` L1 pool is env-dormant on Windows pending the final memory-tier A/B; the app clamps `--mem-budget-mb` regardless.
-- HIP (ROCm) backend: the build and runtime path are written but not yet verified on RDNA2 or RDNA4 hardware. On a machine where HIP fails, use `-Backend vulkan`.
+- HIP (ROCm) backend: **verified on RDNA4 (`gfx1201`, RX 9070 XT)** — see §2.1. RDNA2 (`gfx1030`) is still unverified. On a machine where HIP fails, use `-Backend vulkan`.
+- Dense f16/bf16 GEMM on RDNA3/4 needs `hipblaslt\library\<arch>` staged next to the engine (the build script does this); without it the path falls back to ~8 TF instead of ~96 TF. This does not affect the shipped Edge0 tiers or quantized (MXFP4/Q4_K/Q8_0) models, whose GEMM paths are already near peak.
 - Local GGUF MoE loading is verified against synthetic GGUF files and the pinned engine's architecture table. A real download and a GPU load of each family are still to do.
 - 35B on ≤16 GB machines is functional but paging-bound; documented floor is 8 GB *working with* the memory cap, at reduced tok/s.
 

@@ -92,6 +92,20 @@ function Copy-HipRuntime($hip, [string]$binDir, [string]$targets) {
             ($archs | Where-Object { $n -like "*$_*" }).Count -gt 0 -or $n -notmatch "gfx"
         } | ForEach-Object { Copy-Item $_.FullName $dst -Force }
     }
+    # hipBLASLt ships per-arch library dirs (hipblaslt\library\<gfx>). RDNA3/4 dense GEMM is
+    # dispatched through hipBLASLt (RDNA2 through rocBLAS). Without these the BLASLt path
+    # cannot load its Tensile data and GEMM falls to a slow fallback.
+    $hblLib = Join-Path $sdkBin "hipblaslt\library"
+    if (Test-Path $hblLib) {
+        foreach ($arch in $targets.Split(";")) {
+            $src = Join-Path $hblLib $arch
+            if (Test-Path $src) {
+                $dst = Join-Path $binDir "hipblaslt\library\$arch"
+                New-Item -ItemType Directory -Force $dst | Out-Null
+                Copy-Item (Join-Path $src "*") $dst -Force -Recurse
+            }
+        }
+    }
 }
 
 Push-Location $VENDOR
