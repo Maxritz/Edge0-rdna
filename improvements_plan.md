@@ -246,9 +246,8 @@ FFI. So a Rust runner over tilelang kernels is easy; a llama.cpp custom-op is C+
 
 Cheapest, highest-confidence first:
 
-1. **`tt_bytes` -> ggml_type_size fix** (unblocks the pool for MXFP4/NVFP4/Q6_K,
-   i.e. both target models). Then verify with gpt-oss-120b pool-only on a capped
-   profile.
+1. ~~**`tt_bytes` -> ggml_type_size fix**~~ DONE (committed). Then verify with gpt-oss-120b
+   pool-only on a capped profile.
 2. **KV experiments** at 128k: add q4_0 / iq4_nl rows, push `n_cpu_moe` lower, find
    the free-VRAM-for-experts sweet spot.
 3. **MTP self-speculative decode** (decode speed; needs an MTP-head model).
@@ -261,9 +260,23 @@ Cheapest, highest-confidence first:
 8. **Long-term**: MLA model bring-up; sparse attention (#4); own-runtime engine
    (Kraken-style) if the above hit a wall.
 
+### Done this session (RDNA2 trace, RUN-011..014)
+- **RAM-aware pool default**: `pool_for_gguf(model)` enables the prefetch pool only when
+  the model does not fit in RAM (fixed 17.1 -> 28.8 tok/s decode, +68%).
+- **Measured n_cpu_moe autotune**: `autotune.rs` sweeps with `llama-bench -o json` and
+  picks the measured best (decode peaks below the planner's smallest-fit pick: 26 -> 20,
+  +18%). Cached per (model, ctx, gpu); `EDGE0_AUTOTUNE=1` to sweep.
+- **RAM-resident load**: `--load-mode none` when the model fits in RAM (pp2048 434 -> 772
+  tok/s, 1.78x, no decode cost).
+- **Window-peak resources**: perf report now carries cpu/gpu/vram peak across the window,
+  not just the last sample (fixed the 15.5% GPU-util false reading).
+
 ## 11. Open questions / blockers
 - 32 GiB / 12 GiB test profile is not this machine (95.9 GiB / 16 GiB); needs a
   commit-capped harness to reproduce.
+- The pool's benefit on a genuinely RAM-starved box (<20 GiB) is still unvalidated.
+- rocprof is not installed on either box, so per-kernel dispatch/memory counters
+  (RUN-010 T4) remain unavailable.
 - MTP needs a model with an MTP/NextN head.
 - tilelang bridge integration is per-kernel C/C++ work.
 
