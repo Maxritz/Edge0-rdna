@@ -572,3 +572,40 @@ Both remaining items are in `ggml/src/ggml-quants.c` (raw:
 https://raw.githubusercontent.com/charlie12345/ROCmFPX/main/ggml/src/ggml-quants.c). That file is
 237 KB and will truncate a single fetch; grab it with a range/grep (offset around the
 `turbo` / `rocmfp4` symbols) rather than whole.
+
+## 22. TurboQuant codes (fetched from ggml-quants.c) + ROCmFP4 location
+
+### TurboQuant codebooks (Lloyd-Max optimal for head_dim=128 after WHT) - verbatim
+    turbo_codebook_3bit[8] = { -0.1883972972, -0.1181399059, -0.0665857641, -0.0216044751,
+                                0.0216041461,  0.0665854520,  0.1181396281,  0.1883970748 }
+    turbo_codebook_4bit[16] = { -0.2376389871, -0.1808080141, -0.1417777640, -0.1102646123,
+                                -0.0828112376, -0.0577640422, -0.0341540905, -0.0113168380,
+                                 0.0112761586,  0.0341139667,  0.0577250301,  0.0827738972,
+                                 0.1102295202,  0.1417455465,  0.1807794468,  0.2376153882 }
+
+### TurboQuant dequant (block -> f32), turbo3 (3-bit) / turbo4 (4-bit)
+    PASS 1: unpack indices; y[i] = codebook[idx]              # idx 3-bit from 12B, or 4-bit from 16B
+    PASS 2: per 128-element chunk (TURBO_HEAD_DIM):
+              turbo_fwht_f32(y+off, chunk)          # inverse FWHT: butterfly + 1/sqrt(n)  (self-inverse)
+              norm = fp16(x[off/32].d)              # d = L2 norm of the chunk, stored per block (same in all 4)
+              y[off+i] *= norm
+    block: { ggml_half d; uint8_t qs[12] }  = 14 B / 32 (turbo3, 3.5 bpw)
+           { ggml_half d; uint8_t qs[16] }  = 18 B / 32 (turbo4, 4.5 bpw)
+    pack: turbo_pack3/unpack3 (bit-packed 3-bit), turbo_pack4/unpack4 (nibble)
+    FWHT: for h=1;h<n;h*=2: for i step 2h: for j in [i,i+h): (a,b)=(x[j],x[j+h]); x[j]=a+b; x[j+h]=a-b;
+          then scale 1/sqrt(n). Head dim 128, 4 blocks of 32 per chunk.
+
+### vec_dot (for flash attention): dequant the key chunk (centroid + inverse FWHT + *norm), dot with f32 q.
+
+### ROCmFP4 (types 100/101) - location
+ggml-quants.c includes `../rocmfp4/rocmfp4.h` -> the ROCmFP4 block struct + dequant live in
+`ggml/rocmfp4/rocmfp4.{h,c}` (a dir we have NOT fetched). Codebook already known:
+    kvalues_rocmfp4[16] = { 0,1,2,3,4,6,8,10, 0,-1,-2,-3,-4,-6,-8,-10 }   (E2M1-derived, top 12->10)
+Layout 17 B (qs[16]+e), dual half-block UE4M3 scales (non-FAST 4.50 bpw, FAST single-scale 4.25).
+
+### Status: ALL requested codes now in hand
+- UE4M3 scale table + formula (rocmfpx.c) [sec 21]
+- ROCmFP2/3/6/8 codebooks + dequant (rocmfpx.c) [sec 21]
+- ROCmFP4 codebook (common.h) + struct location (rocmfp4/), dequant body still in rocmfp4/ [here]
+- TurboQuant 3/4-bit codebooks + dequant + FWHT + pack (ggml-quants.c) [here]
+Remaining un-grabbed: `ggml/rocmfp4/rocmfp4.{h,c}` bodies (struct + dequant) - one file pair.
