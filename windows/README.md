@@ -109,6 +109,7 @@ Families are tied to the pinned engine (`tools/moe_families.json`). `gguf_tool.p
 |---|---|---|
 | Qwen3 MoE | `qwen3moe` | `unsloth/Qwen3-30B-A3B-GGUF` |
 | Qwen3.5 / 3.6 MoE | `qwen35moe` | — |
+| Qwen3.8-Flash-Next MoE | `qwen4exp` | — |
 | Qwen3-Next | `qwen3next` | — |
 | Qwen3-VL MoE (text path only) | `qwen3vlmoe` | — |
 | Qwen2 MoE | `qwen2moe` | — |
@@ -118,6 +119,7 @@ Families are tied to the pinned engine (`tools/moe_families.json`). `gguf_tool.p
 | GLM-5 | `glm-dsa` | — |
 | DeepSeek V2 / V3 / R1, Kimi K2 | `deepseek2` | — |
 | DeepSeek V3.2 | `deepseek32` | — |
+| DeepSeek V4 | `deepseek4` | — |
 | Mixtral (`llama` arch with experts) | `llama` | — |
 | Llama 4 | `llama4` | — |
 | MiniMax M2 | `minimax-m2` | — |
@@ -177,7 +179,7 @@ pwsh ..\..\scripts\vendor-build.ps1 -AssembleOnly
 
 ## 2. Performance
 
-Reference machine: **Intel i7-14700K · AMD Radeon RX 9070 GRE (Vulkan) · 48 GB DDR5 · Windows 11**, steady-state (`-ngl 99 -cmoe`), bench medians of 3 reps (`tools/r3_bench.py`, ~240-token mixed-language prompt, native context). These numbers come from the Vulkan build; the HIP build has not been measured yet.
+Reference machine: **Intel i7-14700K · AMD Radeon RX 9070 GRE (Vulkan) · 48 GB DDR5 · Windows 11**, steady-state (`-ngl 99 -cmoe`), bench medians of 3 reps (`tools/r3_bench.py`, ~240-token mixed-language prompt, native context). These tier numbers come from the Vulkan build; §2.1-2.3 add the HIP (ROCm) measurements on RDNA4, a multi-model local-GGUF sweep, and expert-pool coverage.
 
 | model | prefill (tok/s) | decode (tok/s) | prefill of 240-tok prompt |
 |---|---:|---:|---:|
@@ -216,6 +218,61 @@ Prefill scales with GPU-resident experts (pp2048 247 → 763, ~3.1×); decode pe
 | 8 GiB VRAM / 32 GiB RAM | 35 | 3.7 GiB | 14.7 GiB | 252 | 23.0 |
 
 Dense GEMM (`test-backend-ops`, m4096 n512 k14336): ggml's quantized paths already sit near the card's ~96 TF fp16 peak — MXFP4 86, Q8_0 80, Q4_K 75 TF — while f16 reaches 96 TF only with the hipBLASLt library data staged (§1.2). Decode is bandwidth-bound and unchanged by the f16 path.
+
+### 2.2 Multi-model sweep (RDNA4, 16 GiB)
+
+`llama-bench -p 256 -n 64 -ngl 99 -fa auto -t 16`, decode (tg64) tok/s per `--n-cpu-moe`:
+
+| model | size | arch | experts | 0 | 16 | 24 | 31 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **Laguna-XS-2.1 IQ3_XXS** | 13.0 GB | `laguna` | 256 | **112.0** | 44.4 | 33.1 | 27.6 |
+| laguna-xs2 Q4_K_M | 20.3 GB | `laguna` | 256 | 43.6 | 36.2 | 30.6 | 25.8 |
+| GLM-4.7-Flash Q4_K_M | 18.1 GB | `deepseek2` | 64 | 41.9 | 31.1 | 25.3 | 21.0 |
+| Qwen3.5-35B-A3B Q4_K_XL | 19.7 GB | `qwen35moe` | 256 | 35.0 | **39.1** | 29.3 | 24.5 |
+| gpt-oss-120b Q8_0 | 63.4 GB | `gpt-oss` | 128 | — | 12.9 | — | — |
+| qwen3.8-flash-next reap-288 Q4_K_M | 83.8 GB | `qwen4exp` | 288 | — | — | — | 7.6 |
+
+Two regimes:
+
+- **Fits on the 16 GiB card** (Laguna-XS-2.1 13 GB, GLM 18 GB, laguna-xs2 20 GB): decode peaks at `--n-cpu-moe 0` (all experts on GPU). **Laguna-XS-2.1 IQ3_XXS at 112 tok/s / 2349 prefill is the fastest config measured on this card** — fitting fully on the GPU beats every offload plan.
+- **Barely over budget** (Qwen3.5-35B 19.7 GB, 256 experts): `--n-cpu-moe 0` spills and drops, so a small offload (8-16) wins. The 83.8 GB qwen3.8 reap-288 heavily exceeds the card and runs at single-digit tok/s without disk streaming — a disk-tier candidate.
+
+Thread count barely matters: gpt-oss-120b at `--n-cpu-moe 32` gave t=8 59.2 pp / 13.0 tg, t=16 56.5 / 12.9, t=24 56.5 / 12.7.
+
+### 2.3 Expert pool: coverage and type support
+
+The expert pool (`serve/prefetch.cc`, `--pool-mb` / `E0_POOL_MB`) serves routed experts from committed private pages via whole-block `ReadFile` (no mmap page-faults). Verified working on MXFP4 / Q6_K / NVFP4 / K-quants / IQ* after the `tt_bytes` fix (defers to `ggml_blck_size`/`ggml_type_size`; unknown types are not pooled). Correctness check: `cargo run --example pool_types` (reads the real `ggml-base.dll`; all types size to an exact per-expert stride).
+
+Pool coverage on gpt-oss-120b (63.4 GB, 36x128 MXFP4 experts, `--n-cpu-moe 32`, pool-only), coverage = pool hits / (hits + mmap bypasses):
+
+| pool | fills | hits | bypass | coverage |
+|---:|---:|---:|---:|---:|
+| 4 GiB | 974 | 81920 | 576535 | 12.4% |
+| 6 GiB | 1462 | 147456 | 504121 | 22.6% |
+| 8 GiB | 1949 | 212992 | 453076 | 32.0% |
+| 16 GiB | 3898 | 442368 | 216691 | 67.1% |
+
+Coverage tracks `pool_size / ~24 GiB` (the distinct-expert working set). **Known gap:** the pool fills once and never evicts, so a pool smaller than the working set permanently bypasses the overflow to mmap; an LRU/eviction policy is required for the 6-8 GiB product tiers to cover a large model's hot set.
+
+### 2.4 Reproduce
+
+```powershell
+# kernel GEMM (all types)
+wt\win\build-hip\bin\test-backend-ops.exe perf -o MUL_MAT -b ROCm0
+
+# model sweep
+wt\win\build-hip\bin\llama-bench.exe -m <model.gguf> -p 256 -n 64 -ngl 99 --n-cpu-moe N -fa auto -t 16
+
+# expert pool correctness
+cd windows\app\src-tauri; cargo run --example pool_types
+
+# pool run (pool-only; experts streamed, no prerouter)
+set E0_POOL_MB=8192
+wt\win\build-hip\bin\llama-server.exe -m <big-moe.gguf> -ngl 99 --n-cpu-moe 32 -c 4096 -fa auto --no-webui
+# -> read [pref-trace] POOL2 lines in %USERPROFILE%\.edge0\logs\engine-gguf-*.log
+```
+
+Full per-type and round-by-round data: [`../benchmarks.md`](../benchmarks.md); diagnosis log: [`../.opencode/sherlock-analysis.md`](../.opencode/sherlock-analysis.md).
 
 ---
 
@@ -264,10 +321,10 @@ hook-point patches + band README (`common/`, `windows/` here; `android/` for the
 
 - Installer is **unsigned** (SmartScreen warning on first run); no auto-updater yet.
 - Engine is not yet bundled inside the installer — portable builds assume the engine build dir; bundling is on the roadmap.
-- The `--pool-mb` L1 pool is env-dormant on Windows pending the final memory-tier A/B; the app clamps `--mem-budget-mb` regardless.
+- The `--pool-mb` L1 pool serves experts via whole-block reads (no mmap fault churn) and sizes every expert type via ggml; it fills once and **does not yet evict**, so a pool smaller than a model's working set bypasses the overflow to mmap (see §2.3). LRU/eviction is the next change. `--mem-budget-mb` is clamped from physical RAM regardless.
 - HIP (ROCm) backend: **verified on RDNA4 (`gfx1201`, RX 9070 XT)** — see §2.1. RDNA2 (`gfx1030`) is still unverified. On a machine where HIP fails, use `-Backend vulkan`.
 - Dense f16/bf16 GEMM on RDNA3/4 needs `hipblaslt\library\<arch>` staged next to the engine (the build script does this); without it the path falls back to ~8 TF instead of ~96 TF. This does not affect the shipped Edge0 tiers or quantized (MXFP4/Q4_K/Q8_0) models, whose GEMM paths are already near peak.
-- Local GGUF MoE loading is verified against synthetic GGUF files and the pinned engine's architecture table. A real download and a GPU load of each family are still to do.
+- Local GGUF loading is verified on real models across families: `qwen35moe` (Qwen3.5-35B), `laguna` (Laguna-XS-2.1 / xs2), `gpt-oss` (gpt-oss-120b), `deepseek2` (GLM-4.7-Flash), and `qwen4exp` (Qwen3.8-Flash-Next reap-288) — all launched and benchmarked on RDNA4 (§2.2). Other registered families are verified only against the pinned engine's architecture table.
 - 35B on ≤16 GB machines is functional but paging-bound; documented floor is 8 GB *working with* the memory cap, at reduced tok/s.
 
 ---
