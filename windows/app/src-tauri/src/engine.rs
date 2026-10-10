@@ -229,11 +229,22 @@ fn launch(sink: &Arc<dyn Sink>, state: &EngineState, l: Launch) -> Result<Value,
     if crate::perf::enabled() {
         args.push("--perf".into()); // llama-server internal phase timings -> perf::ingest_log
     }
-    args.push("--port".into());
-    args.push(port.to_string().into());
     let mut cmd = Command::new(&exe);
-    crate::no_window(&mut cmd)
-        .args(&args)
+    crate::no_window(&mut cmd);
+    // CPU-expert MoE: the GPU-offload prefill threshold defaults to 32 tokens; with many
+    // CPU-resident experts each offloaded batch copies a lot of weight, so a higher
+    // threshold keeps small prompts on the CPU (measured +15% pp512 with -b/-ub 4096).
+    // Opt-in via EDGE0_OFFLOAD_MIN_BATCH so it can be tuned per box; unset = engine default.
+    let cpu_experts = plan.as_ref().and_then(|p| p["mode"].as_str()) == Some("cpu-experts");
+    if cpu_experts {
+        if let Ok(v) = std::env::var("EDGE0_OFFLOAD_MIN_BATCH") {
+            let v = v.trim();
+            if v.parse::<u32>().is_ok() {
+                cmd.env("GGML_OP_OFFLOAD_MIN_BATCH", v);
+            }
+        }
+    }
+    cmd.args(&args)
         .current_dir(&bin) // resolve llama/ggml DLLs from the engine's own directory
         .stdout(Stdio::from(logfile))
         .stderr(Stdio::from(log2));
