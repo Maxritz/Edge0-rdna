@@ -609,3 +609,40 @@ Layout 17 B (qs[16]+e), dual half-block UE4M3 scales (non-FAST 4.50 bpw, FAST si
 - ROCmFP4 codebook (common.h) + struct location (rocmfp4/), dequant body still in rocmfp4/ [here]
 - TurboQuant 3/4-bit codebooks + dequant + FWHT + pack (ggml-quants.c) [here]
 Remaining un-grabbed: `ggml/rocmfp4/rocmfp4.{h,c}` bodies (struct + dequant) - one file pair.
+
+## 23. ROCmFP4 (types 100/101) block + dequant (fetched, verified)
+
+From `ggml/rocmfp4/rocmfp4.{h,c}`:
+    block_rocmfp4      { uint8_t qs[16]; uint8_t e[2]; }  = 18 B / 32 (type 100, dual-scale, 4.50 bpw)
+    block_rocmfp4_fast { uint8_t qs[16]; uint8_t e;    }  = 17 B / 32 (type 101, single-scale, 4.25 bpw)
+    codebook (kvalues_rocmfp4[16]) = { 0,1,2,3,4,6,8,10, 0,-1,-2,-3,-4,-6,-8,-10 }
+    decode(q) = q&0x0f -> mag3=q&7; mag = mag3<=4 ? mag3 : 2*mag3-4; sign = q&8 ? -mag : mag
+    scale: UE4M3 "half" value (same table/formula as rocmfpx). dequant:
+      y[j]      = decode(qs[j] & 0x0f) * scale(e[0])
+      y[j + 16] = decode(qs[j] >> 4)   * scale(e[1])       # fast: single e
+    (0..15 use e[0], 16..31 use e[1]) - confirmed against the source dequantize_row.
+
+## 24. ROCmFPX reference decoder (PASSED)
+
+New example `windows/app/src-tauri/examples/rocmfpx_dequant.rs`: pure-Rust, no crates/GPU;
+implements UE4M3 encode/decode + the codebooks + bit-packing for FP2/FP3/FP4/FP4-fast/FP6/FP8
+and TurboQuant TURBO3/4 (with inverse FWHT + per-chunk L2 norm scaling), then round-trips a
+deterministic vector through each format's quantize->dequant.
+
+Command: `cd windows/app/src-tauri && cargo run --release --example rocmfpx_dequant`
+Actual output:
+```
+  fp2         10 B/32  max_abs_err=0.36410  PASS
+  fp3         14 B/32  max_abs_err=0.23724  PASS
+  fp4         18 B/32  max_abs_err=0.13295  PASS
+  fp4_fast    17 B/32  max_abs_err=0.15077  PASS
+  fp6         26 B/32  max_abs_err=0.02941  PASS
+  fp8         33 B/32  max_abs_err=0.00382  PASS
+  turbo3      14 B/32  max_abs_err=0.30658  PASS  (FWHT, norm-scaled)
+  turbo4      18 B/32  max_abs_err=0.15183  PASS  (FWHT, norm-scaled)
+  RESULT: PASS - all formats decode
+```
+Measured errors match each format's real resolution (half the largest codebook gap * scale);
+byte sizes match the struct layouts (10/14/18/17/26/33 B and turbo 14/18 B per 32). This
+validates the layouts, codebooks, packing and (for turbo) the FWHT+norm path - the decode half
+a port needs. Encoding kernels are not part of this (dequant is what the engine reads).
