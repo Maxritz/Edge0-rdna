@@ -937,3 +937,34 @@ costs more than the VRAM freed, so the "smallest that fits" pick is the worst pi
 ### NOTE
 - -ngl 99 auto-fit stays as the guardrail; no new input needed beyond the existing
   quant + tensor_bytes (tensor_bytes <= ram_gb*GiB). No estimate fabricated.
+
+## [RUN-023] 2026-10-10 - MODE: FULL - KV wiring status + expert-cache revert (evidence, no dead code)
+
+### EXPERT-CACHE (attempted, reverted)
+- Added a resident-set cache (temporal reuse) to the fork's used-expert copy branch
+  (ggml-backend.cpp:1693), gated E0_EXPERT_CACHE. Tested decode, prefill (p2048), -ot
+  "exps=CPU", and -ngl 99: NO telemetry in any config -> the branch is unreachable there
+  (stock --n-cpu-moe/-ot schedule MUL_MAT_ID on CPU and copy all experts; the used-expert
+  host->GPU copy needs a different placement). Reverted (dead code); the real VRAM expert
+  cache needs a GPU-backend-side hook (FATE design). Plan retained in
+  docs/gpu-expert-cache-research.md.
+
+### KV WIRING (verified map, recorded)
+- Standard KV quant is ALREADY wired: F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 in
+  ggml_cuda_fattn_kv_type_supported (fattn.cu:513) + get_vec_dot_KQ/get_dequantize_V
+  (fattn-common.cuh:620/643) + the vec instances. So `-ctk q8_0 -ctv q4_0` is functional
+  (the RUN-019 +24% at 32k is real KV quantization, not a stub).
+- Baseline re-confirmed (35B, n_cpu_moe 20): f16 KV tg128 30.48; q8_0/q4_0 KV tg128
+  ~30-33 depending on ctx (win grows with ctx).
+- MISSING types and why:
+  | type | wireable like Q4_0 | catch |
+  | FP4/MXFP4 | yes | add vec_dot_fattn_vec_KQ_mxfp4 + dequantize_V_mxfp4 + 4 hooks + .cu |
+  | turbo3/4 | NO | per-128 FWHT couples K and Q; the KQ dot needs Q rotated first |
+- A single new KV type = 5 edit sites (fattn.cu support, get_vec_dot_KQ, get_dequantize_V,
+  EXTERN_DECL list, template-instance .cu). Step-by-step recorded in
+  docs/gpu-expert-cache-research.md.
+
+### HONEST STOP
+- Did not ship a half-wired KV type: a type that is in the enum but not in
+  ggml_cuda_fattn_kv_type_supported makes flash attention unavailable and the model fails
+  to load - so fp8/fp2/turbo remain on the verified dequant fallback / unwired, not broken.

@@ -84,3 +84,32 @@ Two primitives already exist:
 - FATE: github.com/ongunm/llama-moe-cache ; FATE paper arXiv:2502.12224; HOBBIT arXiv:2411.01433
 - moe-l2: github.com/yalun753/moe-l2
 - REAP (expert pruning, complimentary): arXiv:2510.13999
+
+## KV-type wiring map (verified against the tree)
+
+The flash-attention path only uses a factory for KV types that has a **vec-kernel
+instance**. Adding one KV type touches 5 places (traced 2026-10):
+
+1. `ggml_cuda_fattn_kv_type_supported(type)` — `ggml/src/ggml-cuda/fattn.cu:513`.
+2. `get_vec_dot_KQ<type_K,D,nthreads>()` — `fattn-common.cuh:620` (K side, `Q·K`).
+3. `get_dequantize_V<type_V,T,ne>()` — `fattn-common.cuh:643` (V side).
+4. `EXTERN_DECL_FATTN_VEC_CASES` list + `EXTERN_DECL_FATTN_VEC_CASES(D,type_K)` —
+   `fattn-vec.cuh:578`.
+5. a `template-instances/fattn-vec-instance-<K>-<V>.cu` pair (generated file:
+   `generate_cu_files.py`; add by hand or rerun the generator).
+
+Already wired (works today): `F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0`. That is why
+`-ctk q8_0 -ctv q4_0` runs and gives the +24% decode at 32k (RUN-019).
+
+Remaining:
+- **FP4/MXFP4 KV** — wireable like Q4_0 (non-rotated). Add `vec_dot_fattn_vec_KQ_mxfp4`
+  (codebook `kvalues_mxfp4`, per-32 `e` scale) and `dequantize_V_mxfp4`, plus the 4 hooks
+  + 7 `.cu` files (F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 as the V partner set). Alignment:
+  32-value blocks; K row length must be a multiple of 32. This is the DeepSeek-V4.1-Flash
+  FP4-KV direction (arXiv:2609.19969), bounded and reuses an in-tree codebook.
+- **TurboQuant (turbo3/turbo4)** — NOT wireable like Q4_0. Its per-128 FWHT rotation
+  couples K and Q: `vec_dot_fattn_vec_KQ_*` computes `Q·K` directly, so a rotated K needs
+  **Q rotated into the same basis first** (a Q-side path change) or an inverse-FWHT before
+  the dot. The type foundation (patch 0007: types 49/50, block structs, FWHT quant/dequant,
+  gcc round-trip verified) is done; the attention wiring is a separate, larger effort.
+
