@@ -464,3 +464,35 @@ packed layouts, expert handling), not the ROCmFPX GLSL.
 Decision: ROCmFPX = charlie's fork only (not portable, Vulkan here). IQK = study for a fast
 routed quantized matmul in our HIP engine; its 4x4/8x8 layouts are the analog of the
 "dedicated routed mmvq" idea.
+
+## 17c. ROCmFPX quant type codes (public enum) - exact map
+
+From charlie12345/ROCmFPX `ggml/include/ggml.h` (enum ggml_type):
+    100 GGML_TYPE_Q4_0_ROCMFP4        (UE4M3 scales + packed AMD FP4)
+    101 GGML_TYPE_Q4_0_ROCMFP4_FAST   (single-scale speed layout)
+    102 GGML_TYPE_Q6_0_ROCMFPX        (6-bit UE4M3-scale)
+    103 GGML_TYPE_Q8_0_ROCMFPX        (8-bit UE4M3-scale)
+    104 GGML_TYPE_Q3_0_ROCMFPX        (3-bit UE4M3-scale)
+    105 GGML_TYPE_TURBO3_0            (TurboQuant 3-bit KV-cache, 3.5 bpw)
+    106 GGML_TYPE_TURBO4_0            (TurboQuant 4-bit KV-cache, 4.5 bpw)
+    107 GGML_TYPE_Q2_0_ROCMFPX        (2-bit S40 codebook + dual UE4M3)
+    108 GGML_TYPE_Q4_0_ROCMI4         (native signed 4-bit + UE4M3)
+    109 GGML_TYPE_COUNT
+
+Maps our files:
+- Qwen3.8-Distill-35B-A3B-Q2KXL_ROCMFPX: 102 (Q6_0) + 107 (Q2_0)
+- ornith-1.0-35B-Q3_0_ROCMFPX: 101 + 102 + 104 (Q3_0)
+- Spark-X2.5-4B / granite-4.1-3b / gemma-4-E2B / Ornith-9b ROcmFP4: 100, 101
+- Ternary-Bonsai-2-27B-PQ2_0: type 142 -> NOT in this enum (max 108); different fork, not ROCmFPX.
+
+Key consequences:
+1) The codes are public. Loading these in OUR engine = a port: add the enum values + the block
+   structs (ggml-common.h) + ggml_type_size/ggml_blck_size entries + dequant/MMVQ/GEMV kernels
+   to the HIP backend. Bounded, fully specified, not a mystery. NOTE: our pool's tt_bytes now
+   defers to ggml_type_size, so registering the enum+sizes alone makes the pool size these
+   experts; the kernels are what actually run them.
+2) TURBO3_0/TURBO4_0 (105/106) are the low-bit KV-cache quant we flagged as our missing
+   capacity lever (our pin only has f16/q8_0/q4_0/q5_0/iq4_nl). Same repo -> the KV-compression
+   path is available as types 105/106 if we port them.
+3) GGML_TYPE_COUNT=109 (not 143), so any file with type >=109 (e.g. Ternary-Bonsai 142) comes
+   from a different quantizer fork.
