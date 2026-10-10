@@ -262,8 +262,6 @@ Cheapest, highest-confidence first:
    (Kraken-style) if the above hit a wall.
 
 ## 11. Open questions / blockers
-
-- Pool fix requires an engine rebuild (long pole).
 - 32 GiB / 12 GiB test profile is not this machine (95.9 GiB / 16 GiB); needs a
   commit-capped harness to reproduce.
 - MTP needs a model with an MTP/NextN head.
@@ -286,3 +284,24 @@ Cheapest, highest-confidence first:
   (near noise). The model has no f16 tensors, so the f16 GEMM path is unused; its prefill
   is CPU-expert bound. The fix matters for f16/bf16 models and removes error spam.
 - NOTE: this run staged the libs manually; a `vendor-build.ps1` rebuild bakes it in.
+
+## 13. Split-precision FP32 GEMM (tilelang) - attempted, does NOT validate
+
+Technique borrowed from the "AI agents write CUDA kernels" article: split each fp32 into
+hi+lo fp16, 3 tensor-core MMAs (hi*hi + hi*lo + lo*hi), fp32 accumulate, skip the
+negligible lo*lo. Goal: fp32-accurate GEMM at fp16 tensor-core speed.
+
+Chain: `gen_split.py` (tilelang, gfx1201) -> `launcher_split.cpp` (C ABI) ->
+`examples/split_gemm.rs` (Rust; f64 reference + fp16 baseline). All under
+`%TEMP%\opencode` except the Rust example.
+
+Result: FAIL.
+- Accuracy: max abs err vs f64 = 39.9, vs plain fp16 = 0.024 -> the split kernel is
+  wrong (worse than plain fp16) and identically wrong across kernel variants, so the
+  shared->shared cast/residual lowering is at fault, not the math.
+- Speed: ~1.5 TF (1024x1024x2048) vs ggml ROCm0 f16 96.3 TF / f32 12.4 TF. Six shared
+  buffers (2 fp32 + 4 fp16) = 64 KB shmem/block -> ~1 block/SM on RDNA4.
+
+Conclusion: technique sound, this tilelang implementation is neither correct nor
+competitive. Not shipped (no fake success). If revisited: split in fragments, shrink
+shared footprint, and validate against ggml f32 before timing.
