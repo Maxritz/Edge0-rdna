@@ -496,3 +496,35 @@ Key consequences:
    path is available as types 105/106 if we port them.
 3) GGML_TYPE_COUNT=109 (not 143), so any file with type >=109 (e.g. Ternary-Bonsai 142) comes
    from a different quantizer fork.
+
+## 20. Porting TurboQuant KV + ROCmFP4 into our HIP engine - spec + staged plan
+
+Scope reality: this is a multi-stage kernel port into the vendored ggml HIP backend, not a
+flag. Each type needs: enum + block struct (ggml-common.h) + ggml_type_size/ggml_blck_size +
+traits/name table (ggml.c) + a dequant kernel + an MMVQ (GEMV) path + (for MoE) a MUL_MAT_ID
+path + (for KV) KV-cache dtype integration. Our vendor tree is never patched in place
+(patch band). No stubs: a type is either fully loadable+runnable or not registered.
+
+### TurboQuant KV (types 105 TURBO3_0 / 106 TURBO4_0) - data model (byte-exact, from source)
+    block_turbo3_0 { ggml_half d; uint8_t qs[12]; }  sizeof=14  -> 32 vals, 3.5 bpw
+    block_turbo4_0 { ggml_half d; uint8_t qs[16]; }  sizeof=18  -> 32 vals, 4.5 bpw
+    d = FP16 L2-norm; qs = packed 3-bit (turbo3) / 4-bit (turbo4) codebook indices.
+    QK=32, QR=2. (Codebook tables + the actual dequant formula still to pull: the header only
+    defines the block; the kvalue table + to-from-float live in ggml-quants.c.)
+
+### ROCmFP4 (types 100/101) - data model
+    Block structs are defined in the same ggml-common.h but were in the truncated half of the
+    fetch. Still to retrieve before implementing. Known: UE4M3 scale(s), packed FP4 codes,
+    32-element blocks; _FAST = single-scale layout.
+
+### Staged plan (each stage independently verifiable; stop if a stage cannot be completed clean)
+    Stage A  TurboQuant KV (105/106): enum + block struct + size/blck table + ggml_type_name +
+             dequant(block->f32) in ggml-quants + ggml_get_rows/vec_dot + KV-cache accept path.
+             Verify: quantize a vector, dequant, assert round-trip vs reference; then KV at ctx.
+    Stage B  ROCmFP4 (100/101): same skeleton + the repack/MMVQ kernel for decode; the MoE
+             MUL_MAT_ID path if a routed model is the target.
+    Stage C  (optional) ROCmFP2/FP3/FP6/FP8 + the SWAR FP2 unpack for the low-bit disk tier.
+
+Note: our pool's tt_bytes already defers to ggml_type_size, so registering the enum+sizes makes
+the pool SIZE these experts automatically; the kernels are what actually run them. For the KV
+lever specifically (Stage A) no MoE kernel is needed - it is a KV cache dtype + dequant.
