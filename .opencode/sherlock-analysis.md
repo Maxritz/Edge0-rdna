@@ -854,3 +854,16 @@ at 32k vs the f16 default (26.68 -> 33.10 tok/s). The `-b/-ub 4096` lever stacks
 - turbo3/turbo4 KV (above).
 - fp8(103)/fp2(107) MMVQ kernels if a fixture needs them.
 - GGML_OP_OFFLOAD_MIN_BATCH wiring into the app (needs per-box VRAM testing).
+
+### RUN-020 CORRECTION (invalid test artifact)
+- The fp8/fp2 verification used a file I COPIED to the box (`qwen38distill-fp2.gguf`,
+  a rename of Qwen3.8-Distill-35B-Q2KXL_ROCMFPX). The output was degenerate, but the
+  copy was unvalidated, so the "fp2 kernel is wrong" conclusion is VOID. The user deleted
+  the copy; no cross-copying models again.
+- State therefore stands at: fp4(100)/fp4_fast(101)/fp3(104)/fp6(102) have VERIFIED native
+  MMVQ (ornith-9b 62 tok/s, ornith-35b 29.9 tok/s, coherent). fp8(103)/fp2(107) are left on
+  the dequant-to-f16 fallback because no valid `C:\x` fixture exercises them - the safe,
+  verified path. The fp2/fp8 vec_dot code remains in the tree, gated off (should_usq_mmvq
+  returns false for both), to be enabled only with a real reference-vs-kernel test.
+- Process lesson: test only against models already present in C:\x; never copy/rename model
+  files onto a test box (risk of truncated/corrupt transfers producing false conclusions).
