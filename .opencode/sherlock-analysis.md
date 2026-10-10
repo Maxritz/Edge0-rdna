@@ -230,3 +230,47 @@ pool (the product-tier range) covers only a quarter to a third of gpt-oss expert
 - [ ] Re-test under an enforced RAM cap (Job Object) to see disk-throughput impact.
 - [ ] Consider an explicit "stream experts" mode (force `--n-cpu-moe` = all, pool on)
       for models that would otherwise fit, per the disk-tier intent.
+
+## [RUN-006] 2026-10-10 — MODE: HIGH — pool step-boundary eviction
+
+### CHANGE
+`serve/prefetch.cc`: per-slot `lastuse`/`sreg`; `e0_pool_step()` decommits slots not
+served within `E0_POOL_KEEP_STEPS` steps, gated on `g_pool_full` (only when the working
+set exceeds the pool). Runs from `edge0_pref_on_step` after `llama_synchronize`.
+Slot stride page-aligned (`stride = align_up(per, 4096)`) so commit/decommit of one
+slot never touches a neighbour (gpt-oss `per`=4406400 is NOT page-aligned; 35B's is).
+
+### BUGS FOUND AND FIXED (both would corrupt/crash)
+1. Evicting without `llama_synchronize` decommitted pages a compute thread was mid-read
+   on -> 0xC0000005 access violation in ggml-cpu. Fixed: `e0_pool_step` runs after sync.
+2. Non-page-aligned slot stride made `VirtualAlloc`/`Free` overlap adjacent slots ->
+   corruption/AV (only on models whose per-expert size is not a 4096 multiple, e.g.
+   gpt-oss MXFP4 4406400). Fixed: page-aligned stride.
+
+### VERIFICATION (correctness)
+`E0_POOL_SELFCHECK=1` byte-compares every fill against the mmap view:
+| run | fills | sc ok | sc bad |
+|---|---:|---:|---:|
+| 35B fits (no evict) | 4887 | 4887 | **0** |
+| gpt-oss, evict on | 7414 | 7414 | **0** |
+Zero mismatches -> eviction + refill serve correct bytes.
+
+### DATA (gpt-oss-120b, MXFP4, `--n-cpu-moe 32`, pool 8 GiB)
+| variant | evict | fills | coverage | hot | decode |
+|---|---:|---:|---:|---:|---:|
+| keep=1000000 (no evict) | 0 | 1949 | 35.0% | 8190 MB | 9.95 tok/s |
+| keep=16 (evict on) | 5883 | 7414 | 49.7% | 6434 MB | 4.64 tok/s |
+
+### HONEST FINDING
+- Eviction works and bounds pool RAM (hot 6.4 GB < 8 GB cap) and lifts "coverage", BUT on
+  this 96 GiB box it is **net-negative**: eviction causes refills (7414 vs 1949) and decode
+  drops 9.95 -> 4.64 tok/s. With ample RAM the OS page cache holds the file and mmap is
+  effectively free; the pool's explicit `ReadFile` is slower than a page-cache-resident
+  mmap fault.
+- The pool (9.95 tok/s) is itself **slower than mmap-only** (~12.9 tok/s) on this box.
+  The pool only wins under real RAM pressure, which this machine cannot reproduce.
+- "Coverage" (hits/(hits+bypass)) is the wrong KPI: a bypass is a fast page-cache hit, and
+  an evicted+refilled slot is a slow disk read. Disk reads / refills is the metric that
+  matters, and eviction increases them.
+- Conclusion: eviction is correct and necessary for RAM-constrained machines, but must be
+  tuned (or off by default) where RAM is plentiful. Needs a real 32 GiB test to justify.
