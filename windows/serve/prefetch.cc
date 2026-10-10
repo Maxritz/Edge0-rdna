@@ -14,6 +14,7 @@
 #include <psapi.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -281,6 +282,8 @@ struct PoolTT {                       // one 3D experts tensor (40 slots measure
     uint64_t foff = 0;                // file offset of expert 0
     uint64_t * lastuse = nullptr;     // per-slot step number when last served (0 = never)
     uint8_t  * sreg = nullptr;        // per-slot region the slot was committed in (0=hot 1=obs)
+    double   * freq = nullptr;        // per-slot decayed routing frequency (hot-expert score)
+    uint64_t * hits = nullptr;        // per-slot total routing count (for the stats dump)
 };
 static volatile LONG g_p_sc_ok = 0, g_p_sc_bad = 0;      // byte-level self-check (fill vs view memcmp sampling)
 static bool g_pool_sc = false;                           // E0_POOL_SELFCHECK=1 enables
@@ -309,6 +312,10 @@ volatile LONG g_p_step = 0;
 volatile LONG g_p_evicts = 0;
 size_t g_p_evict_bytes = 0;
 int g_keep_steps = 16;
+int g_max_swaps = 256;             // per-step eviction cap (churn control; ninfer: 2/layer/call)
+const double g_freq_decay = 0.9576; // 2^(-1/16): half-life 16 decode steps, per ninfer
+std::string g_stats_path;          // E0_POOL_STATS: dump per-expert routing counts on exit
+bool g_pool_freq = false;          // E0_POOL_FREQ=1: frequency-based eviction (else recency)
 volatile LONG g_pool_full = 0;   // set when a fill is refused for budget: the working set exceeds the pool
 
 // Expert-base resolver hook from the patch band (exported by ggml.dll, C decoration).
@@ -346,6 +353,8 @@ static const char * e0_mmid_base_res(const ggml_tensor * s, int64_t id, size_t n
         }
         if (st == 2) {
             pt->lastuse[id] = (uint64_t) g_p_step;             // recency for step-boundary eviction
+            if (pt->freq) pt->freq[id] += 1.0;                 // decayed-frequency hot score (benign race)
+            if (pt->hits) pt->hits[id] += 1;                   // total count for the stats dump
             LONG h = InterlockedIncrement(&g_p_hits);
             if (h <= 3 || (h & 0x3FFF) == 0)
                 fprintf(stderr, "[pref-trace] POOL2 hit=%ld fillD=%ld bypass=%ld wait=%ld evict=%ld sc=%ld/%ld | hot=%lluMB obs=%lluMB\n",
@@ -384,6 +393,7 @@ static const char * e0_mmid_base_res(const ggml_tensor * s, int64_t id, size_t n
             if (ok) InterlockedIncrement(&g_p_miss_d);
         }
         if (ok && pt->lastuse) { pt->lastuse[id] = (uint64_t) g_p_step; pt->sreg[id] = 0; }
+        if (ok) { if (pt->freq) pt->freq[id] += 1.0; if (pt->hits) pt->hits[id] += 1; }
         pt->st[id] = ok ? 2 : 3;
         WakeAllConditionVariable(&pt->cv[id]);
         LeaveCriticalSection(&pt->cvlk[id]);
@@ -417,6 +427,7 @@ static void e0_pool_prefill(int c, const std::vector<int> & ids, int reg) {
                 }
             }
             if (ok && pt->lastuse) { pt->lastuse[id] = (uint64_t) g_p_step; pt->sreg[id] = (uint8_t) reg; }
+            if (ok) { if (pt->freq) pt->freq[id] += 1.0; if (pt->hits) pt->hits[id] += 1; }
             pt->st[id] = ok ? 2 : 3;
             WakeAllConditionVariable(&pt->cv[id]);
             LeaveCriticalSection(&lk);
@@ -429,42 +440,93 @@ static void e0_pool_trace_final() {
             g_p_hits, g_p_miss_d, g_p_bypass, g_p_waits, g_p_evicts,
             (unsigned long long) (g_p_evict_bytes >> 20), (long) g_p_sc_ok, (long) g_p_sc_bad,
             (unsigned long long) (g_pool_bytes[0] >> 20), (unsigned long long) (g_pool_bytes[1] >> 20));
+    // routing-count dump (borrowed from ninfer's write_routing_counts): one whitespace-separated
+    // line of per-expert counts per tensor, for seeding the pool / the prerouter next run
+    if (!g_stats_path.empty()) {
+        FILE * f = fopen(g_stats_path.c_str(), "w");
+        if (f) {
+            for (auto & kv : g_ptt_by_name) {
+                fprintf(f, "%s", kv.first.c_str());
+                PoolTT * pt = kv.second;
+                for (size_t id = 0; id < pt->nexps; ++id)
+                    fprintf(f, " %llu", (unsigned long long) (pt->hits ? pt->hits[id] : 0));
+                fprintf(f, "\n");
+            }
+            fclose(f);
+            fprintf(stderr, "[pref-trace] POOL2 stats written: %s (%zu tensors)\n", g_stats_path.c_str(), g_ptt_by_name.size());
+        }
+    }
 }
 
-// Step-boundary eviction (LRU-ish by recency): decommit every slot not served within the
-// last g_keep_steps steps. Runs from on_step, after llama_decode returned, so no compute
-// thread holds an expert pointer — safe to overwrite/decommit. Freed physical pages drop
-// resident RAM; the slot returns to state 0 and refills from disk on demand. This lets a
-// pool smaller than the working set retain the *hot* experts instead of the first-touched
-// ones. g_pmtx serializes against concurrent fills.
+// Step-boundary eviction by decayed routing frequency (borrowed from ninfer-offload):
+// retain the *frequently routed* experts, not just the recently used ones. Runs from on_step,
+// after llama_synchronize, so no compute thread holds an expert pointer. Freed pages drop
+// resident RAM; evicted slots return to state 0 and refill on demand. g_pmtx serializes
+// against concurrent fills.
 static void e0_pool_step() {
     if (!g_pool_on) return;
     const LONG now = InterlockedIncrement(&g_p_step);
     size_t freed = 0;
     long ev = 0;
-    if ((now % 32) == 0)
-        fprintf(stderr, "[pref-trace] POOL2 step#%ld full=%ld committed=%lluMB cap=%lluMB\n", now, g_pool_full,
-                (unsigned long long) ((g_pool_bytes[0] + g_pool_bytes[1]) >> 20),
-                (unsigned long long) ((g_pool_cap[0] + g_pool_cap[1]) >> 20));
     {
         std::lock_guard<std::mutex> lk(g_pmtx);
         // Only reclaim when the working set exceeds the pool (a fill was refused). If the
         // set fits, keep every slot (no churn, full coverage); eviction exists to bound RAM.
-        if (g_pool_full)
-        for (auto & kv : g_ptt_by_name) {
-            PoolTT * pt = kv.second;
-            if (!pt->lastuse || !pt->sreg) continue;
-            for (size_t id = 0; id < pt->nexps; ++id) {
-                if (pt->st[id] != 2) continue;
-                if (now - (LONG) pt->lastuse[id] <= g_keep_steps) continue;
-                if (VirtualFree(pt->arena + id * pt->stride, pt->stride, MEM_DECOMMIT)) {
-                    const int reg = pt->sreg[id] < 2 ? (int) pt->sreg[id] : 0;
-                    g_pool_bytes[reg] = g_pool_bytes[reg] >= pt->stride ? g_pool_bytes[reg] - pt->stride : 0;
-                    pt->st[id] = 0;
-                    ++ev;
-                    freed += pt->stride;
+        if (g_pool_full) {
+          if (g_pool_freq) {
+            // frequency-based victim selection (ninfer-style): decay then evict the least
+            // frequently routed stale slots, capped per step to bound churn.
+            for (auto & kv : g_ptt_by_name) {
+                PoolTT * pt = kv.second;
+                if (!pt->freq) continue;
+                for (size_t id = 0; id < pt->nexps; ++id) pt->freq[id] *= g_freq_decay;
+            }
+            struct Cand { PoolTT * pt; size_t id; double f; };
+            std::vector<Cand> cand;
+            for (auto & kv : g_ptt_by_name) {
+                PoolTT * pt = kv.second;
+                if (!pt->lastuse || !pt->sreg) continue;
+                for (size_t id = 0; id < pt->nexps; ++id) {
+                    if (pt->st[id] != 2) continue;
+                    if (now - (LONG) pt->lastuse[id] <= g_keep_steps) continue;
+                    cand.push_back({ pt, id, pt->freq ? pt->freq[id] : 0.0 });
                 }
             }
+            size_t cap = (size_t) g_max_swaps;
+            if (cand.size() < cap) cap = cand.size();
+            if (cap) {
+                std::partial_sort(cand.begin(), cand.begin() + cap, cand.end(),
+                                  [](const Cand & a, const Cand & b) { return a.f < b.f; });
+                for (size_t i = 0; i < cap; ++i) {
+                    PoolTT * pt = cand[i].pt;
+                    size_t id = cand[i].id;
+                    if (VirtualFree(pt->arena + id * pt->stride, pt->stride, MEM_DECOMMIT)) {
+                        const int reg = pt->sreg[id] < 2 ? (int) pt->sreg[id] : 0;
+                        g_pool_bytes[reg] = g_pool_bytes[reg] >= pt->stride ? g_pool_bytes[reg] - pt->stride : 0;
+                        pt->st[id] = 0;
+                        ++ev;
+                        freed += pt->stride;
+                    }
+                }
+            }
+          } else {
+            // recency-based (default): decommit every stale slot
+            for (auto & kv : g_ptt_by_name) {
+                PoolTT * pt = kv.second;
+                if (!pt->lastuse || !pt->sreg) continue;
+                for (size_t id = 0; id < pt->nexps; ++id) {
+                    if (pt->st[id] != 2) continue;
+                    if (now - (LONG) pt->lastuse[id] <= g_keep_steps) continue;
+                    if (VirtualFree(pt->arena + id * pt->stride, pt->stride, MEM_DECOMMIT)) {
+                        const int reg = pt->sreg[id] < 2 ? (int) pt->sreg[id] : 0;
+                        g_pool_bytes[reg] = g_pool_bytes[reg] >= pt->stride ? g_pool_bytes[reg] - pt->stride : 0;
+                        pt->st[id] = 0;
+                        ++ev;
+                        freed += pt->stride;
+                    }
+                }
+            }
+          }
         }
         g_p_evict_bytes += freed;
     }
@@ -497,10 +559,12 @@ static void e0_pool_scan(const std::map<std::string, TT> & tinfo) {   // pool al
         e->st = (volatile LONG *) VirtualAlloc(nullptr, sizeof(LONG) * (size_t) tt.dim[2], MEM_COMMIT, PAGE_READWRITE);
         e->lastuse = (uint64_t *) VirtualAlloc(nullptr, sizeof(uint64_t) * e->nexps, MEM_COMMIT, PAGE_READWRITE);
         e->sreg = (uint8_t *) VirtualAlloc(nullptr, e->nexps, MEM_COMMIT, PAGE_READWRITE);
+        e->freq = (double *) VirtualAlloc(nullptr, sizeof(double) * e->nexps, MEM_COMMIT, PAGE_READWRITE);
+        e->hits = (uint64_t *) VirtualAlloc(nullptr, sizeof(uint64_t) * e->nexps, MEM_COMMIT, PAGE_READWRITE);
         e->cvlk = new CRITICAL_SECTION[(size_t) tt.dim[2]];
         e->cv = new CONDITION_VARIABLE[(size_t) tt.dim[2]];
         for (size_t z = 0; z < (size_t) tt.dim[2]; ++z) { InitializeCriticalSection(&e->cvlk[z]); InitializeConditionVariable(&e->cv[z]); }
-        if (!e->arena || !e->st || !e->lastuse || !e->sreg) { delete[] e->cvlk; delete[] e->cv; e->cvlk = nullptr; e->cv = nullptr; delete e; continue; }
+        if (!e->arena || !e->st || !e->lastuse || !e->sreg || !e->freq || !e->hits) { delete[] e->cvlk; delete[] e->cv; e->cvlk = nullptr; e->cv = nullptr; delete e; continue; }
         g_ptt_by_name[nm] = e;
     }
     g_pool_on = !g_ptt_by_name.empty();
@@ -873,6 +937,9 @@ bool edge0_pref_init(llama_model * model, llama_context * ctx, int pool_mb, cons
         g_pool_cap[0] = (size_t) g.pool_mb << 20;
         if (const char * pom = getenv("E0_POOL_OBS_MB")) g_pool_cap[1] = (size_t) atoll(pom) << 20;
         if (const char * ks = getenv("E0_POOL_KEEP_STEPS")) { int v = atoi(ks); if (v >= 0) g_keep_steps = v; }
+        if (const char * ms = getenv("E0_POOL_MAX_SWAPS")) { int v = atoi(ms); if (v > 0) g_max_swaps = v; }
+        if (const char * sp = getenv("E0_POOL_STATS")) g_stats_path = sp;
+        g_pool_freq = getenv("E0_POOL_FREQ") != nullptr;
         g_pool_sc = getenv("E0_POOL_SELFCHECK") != nullptr;
         if (g_pool_sc && !g.view) {      // self-check needs the view: map it even in pool-only mode
             g.mh = CreateFileMappingA(g.fh, NULL, PAGE_READONLY, 0, 0, NULL);

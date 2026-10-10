@@ -305,3 +305,33 @@ Result: FAIL.
 Conclusion: technique sound, this tilelang implementation is neither correct nor
 competitive. Not shipped (no fake success). If revisited: split in fragments, shrink
 shared footprint, and validate against ggml f32 before timing.
+
+## 14. ninfer-offload borrows (H:\ports\ninfer-offload)
+
+CUDA fork (device-slot cache over page-locked host banks); its code is not portable, its
+hot-expert POLICY is. Implemented in `windows/serve/prefetch.cc`:
+
+- **Decayed routing frequency** per slot (`freq[]`), decay `2^(-1/16)` per step (half-life 16
+  steps, per ninfer), incremented on each hit/fill. Also a total-count `hits[]`.
+- **Frequency-based eviction** (opt-in `E0_POOL_FREQ=1`): when the pool is full, evict the
+  lowest-frequency stale slots, capped at `E0_POOL_MAX_SWAPS` (default 256) per step. Default
+  stays recency-based (no regression); frequency is the better policy by design but unproven here.
+- **Routing-count dump** (`E0_POOL_STATS=<file>`): one whitespace line of per-expert counts per
+  tensor, ninfer's `write_routing_counts`, for seeding the pool / feeding the prerouter next run.
+
+### Result (gpt-oss-120b, MXFP4, --n-cpu-moe 32, pool 8 GiB, selfcheck on)
+| policy | evict | fillD | coverage | selfcheck bad |
+|---|---:|---:|---:|---:|
+| recency (default) | 5883 | 7414 | 49.7% | 0 |
+| frequency (E0_POOL_FREQ=1) | 7554 | 9011 | 50.0% | 0 |
+
+Both correct (0 mismatches). Frequency is a wash on this box (page-cache absorbs the disk reads),
+and slightly more evictions here; its value is for a RAM-constrained host, untestable here.
+Kept opt-in and documented, not made the default.
+
+### What we did NOT take (deliberately)
+- The device-slot / page-locked-host-bank design and the CUDA replacement protocol (unmap ->
+  wait 2 requests -> copy on a side stream -> map): CUDA-specific. Our analog is decommit after
+  `llama_synchronize`. Different cache level: ninfer caches GPU<->host; we cache disk<->RAM.
+- No predictor in ninfer; we have the prerouter (predict-ahead). The two compose: predict (admit
+  early) + decayed frequency (retain).
