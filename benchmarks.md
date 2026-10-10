@@ -251,3 +251,20 @@ Traced the real app path (`trace_demo` -> `engine::start_gguf`) on the gfx1031 b
 | VRAM | 9.59/11.98 GiB | 9.60/11.98 GiB | - |
 
 Root cause: `pool_for_gguf()` defaulted `--pool-mb 2048`, so the app always used the expert prefetch pool. On this 47.9 GiB box the 19.69 GB model fits in RAM, so the pool thrashed (`bypass=176229 evict=12896`) while mmap page cache stayed hot. Fix: `pool_for_gguf(model)` enables the pool only when `model_bytes + 4 GB > RAM`; `E0_POOL_MB` still overrides. Verified: +68% decode on RDNA2, matches llama-bench. This extends the RUN-006 correction (mmap beats the pool at every budget when RAM holds the weights).
+
+## 20. Prefill / KV levers + ROCmFPX 35B breakdown (RDNA2, RUN-019)
+
+35B-A3B Q4_K, n_cpu_moe 20, `llama-bench -p 512`:
+
+| config | pp512 |
+|---|---:|
+| default (-b2048 -ub512) | 308.9 |
+| -b4096 -ub4096 | 329.1 |
+| + GGML_OP_OFFLOAD_MIN_BATCH=512 | 356.6 |
+
+KV cache at n_cpu_moe 20 (llama-bench, short ctx): f16 37.9 tg vs q8_0/q4_0 37.2 tg
+(neutral - KV is tiny at 512 tokens; the win is at long context).
+
+ROCmFPX ornith-1.0-35B byte breakdown (why 3.6 tok/s): fp3=8.95 GB, Q5_K=5.17 GB,
+fp6=4.38 GB, fp4_fast=0.54 GB. The native MMVQ kernel covers fp4_fast only (0.54 GB);
+fp3+fp6 = 13.3 GB run the dequant-to-f16 fallback. fp6/fp3 MMVQ is the next kernel.

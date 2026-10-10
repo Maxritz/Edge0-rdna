@@ -428,11 +428,13 @@ def plan_offload(
             gpu = dense + suffix[n]
             cpu = suffix[0] - suffix[n]
             if n >= layers:
-                return out(True, "cpu-experts", n, cpu, gpu, ["-ngl", "99", "--cpu-moe"])
+                # all expert layers on CPU. --n-cpu-moe <layers> is equivalent to
+                # --cpu-moe but is also accepted by llama-bench (which lacks --cpu-moe).
+                return out(True, "cpu-experts", n, cpu, gpu, ["-ngl", "99", "--n-cpu-moe", str(layers)])
             return out(True, "cpu-experts", n, cpu, gpu, ["-ngl", "99", "--n-cpu-moe", str(n)])
     # Every expert on CPU and the dense part still does not fit.
     notes.append("dense tensors and KV cache exceed the GPU budget; lower --ctx or pick a smaller quant")
-    return out(False, "does-not-fit", layers, suffix[0], dense, ["-ngl", "99", "--cpu-moe"])
+    return out(False, "does-not-fit", layers, suffix[0], dense, ["-ngl", "99", "--n-cpu-moe", str(layers)])
 
 
 def inspect_model(

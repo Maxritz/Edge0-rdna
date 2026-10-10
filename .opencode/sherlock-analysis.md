@@ -758,3 +758,61 @@ llama-bench p32/n256 (r=3): n16 31.37+-0.26, n20 **37.60+-0.47**, n24 33.69+-0.4
 - [ ] Test asymmetric KV (-ctk q8_0 -ctv q4_0) on the 35B; measure decode + context.
 - [ ] fp6/fp3 native MMVQ (finish ornith-35b fast path).
 - [ ] Long-context (>=118k) sweep with quantized KV.
+
+## [RUN-019] 2026-10-10 - MODE: HIGH - remaining items: prefill levers, KV, fp6/fp3 gap, planner fix
+
+### PREFILL (the "prefill sucks" axis) - 35B MoE, n_cpu_moe 20
+| config | pp512 |
+|---|---:|
+| default (-b2048 -ub512) | 308.9 +-46.7 |
+| -b4096 -ub4096 | 329.1 +-39.2 |
+| + GGML_OP_OFFLOAD_MIN_BATCH=512 | 356.6 +-79.8 |
+- b/ub 4096: +6.5%; offload-min-batch 512: +15.4% cumulative. Both are the
+  Doctor-Shotgun levers. Variance is high; effect is real but modest at p512.
+- Root cause stays CPU-expert streaming: prefill runs prompt tokens through the same
+  CPU experts, so it saturates at a few hundred tok/s regardless.
+
+### KV CACHE (short ctx) - 35B, n_cpu_moe 20
+| KV | pp512 | tg128 |
+|---|---:|---:|
+| f16 | 359.1 | 37.9 |
+| q8_0/q4_0 | 359.8 | 37.2 |
+| q8_0/q4_0, n_cpu_moe 12 | 266.1 | 31.9 |
+- KV quant is neutral at short ctx: KV at 512 tokens is ~40 MB, so quantizing it changes
+  nothing. The payoff is at long ctx (32k -> ~2.7 GB f16 vs ~0.7 GB q4). Untested here.
+- Lowering n_cpu_moe to 12 REGRESSED (31.9 < 37.2): the model then spills, confirming the
+  decode peak is a VRAM-fit balance, not "more GPU experts always wins".
+
+### ROCmFPX 35B TYPE BREAKDOWN (why it is only 3.6 tok/s)
+| type | bytes |
+|---|---:|
+| fp3 (104) | 8.95 GB |
+| Q5_K (native MMVQ) | 5.17 GB |
+| fp6 (102) | 4.38 GB |
+| fp4_fast (101, has MMVQ) | 0.54 GB |
+| Q4_K / F32 | 0.24 GB |
+- The native MMVQ kernel I added covers fp4_fast = 0.54 GB only. The experts are fp3 +
+  fp6 = 13.3 GB with NO kernel -> dequant-to-f16 fallback. That is the 3.6 tok/s.
+
+### PLANNER FIX
+- `gguf_tool.py` emitted `--cpu-moe` when all experts go to CPU; llama-bench rejects it
+  (only `-ncmoe/--n-cpu-moe`). Changed to `--n-cpu-moe <layers>` (equivalent: all layers'
+  experts on CPU; accepted by both llama-server and llama-bench). plan_flags accepts it.
+
+### MTP MODEL
+- Underdog-Saluki-27B IQ2-mix-MTP is DENSE qwen35, 65 layers, fits VRAM (mode gpu),
+  kv_bytes 266 KB/token. Not a MoE; MTP head is a spec-decode lever, not offload.
+  Sweep: pp512 178.4 / tg128 21.8.
+
+### REMAINING (honest)
+- fp6/fp3 native MMVQ: the single highest-value kernel for ornith-35b (13.3 GB). Needs a
+  custom warp-cooperative 6-bit/3-bit vec_dot; unlike fp4 there is no upstream type with
+  the same layout to mirror (MXFP4 matched fp4). High risk without a unit-testable
+  isolation -> deferred rather than ship an unverified kernel.
+- Long-context (>=118k) KV-quant sweep: validate the freed-VRAM -> more-GPU-experts lever.
+- turbo3/turbo4 KV formats.
+
+### ACTIONS
+- [ ] fp6/fp3 MMVQ (custom bit-unpack vec_dot).
+- [ ] Long-ctx KV-quant sweep at 32k/128k.
+- [ ] Wire b/ub + offload-min-batch into the app's launch defaults.
