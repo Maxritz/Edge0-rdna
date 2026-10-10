@@ -968,3 +968,41 @@ costs more than the VRAM freed, so the "smallest that fits" pick is the worst pi
 - Did not ship a half-wired KV type: a type that is in the enum but not in
   ggml_cuda_fattn_kv_type_supported makes flash attention unavailable and the model fails
   to load - so fp8/fp2/turbo remain on the verified dequant fallback / unwired, not broken.
+
+## [RUN-024] 2026-10-11 - MODE: FULL - FP4/MXFP4 KV value assessment (before implementing)
+
+### DECOMPOSE - KV block sizes (bytes per 32 values)
+| KV type | bytes/32 | bits/value | vs q4_0 |
+|---|---:|---:|---:|
+| f16  | 64 | 16.0  | 3.56x larger |
+| q8_0 | 34 | 8.5   | 1.89x |
+| q4_0 | 18 | 4.5   | 1.00x (already wired) |
+| **mxfp4** | **17** | **4.25** | **0.94x (-5.5%)** |
+
+### FINDING
+- **FP4/MXFP4 KV is only 5.5% smaller than q4_0, which is ALREADY wired and working.**
+  A 4-bit KV format cannot beat another 4-bit KV format by more than the shared-scale
+  overhead (mxfp4 saves 1 byte per 32 = the f16 scale vs q4_0's 2-byte f16 scale).
+- Wiring MXFP4 KV = 2 device fns (needs the NON-LINEAR codebook path, not a plain dp4a) +
+  4 host hooks + cmake FA_TYPES entry + instance .cu files, for a 5.5% KV reduction.
+  Low value; the real cost is the kernel + the pfill/decode re-verify.
+- The DeepSeek-V4.1-Flash KV win (890 B/token) is NOT a KV *type*: it is **CSA2
+  cross-layer reuse** (share KV across layers) + **CED** (fewer active params at prefill).
+  Those are architecture, not a quant format - not portable to arbitrary GGUFs.
+- Therefore the genuine KV levers for us, in value order:
+  1. **q8_0/q4_0 KV + recomputed n_cpu_moe** - DONE, +24% decode at 32k (RUN-019).
+  2. **TurboQuant turbo3 (3-bit, 14 B/32 = 3.5 bit = 22% smaller than q4_0)** - real
+     saving, but hard: FWHT rotation couples K and Q (needs Q rotated into the same basis
+     before the dot). Type foundation done (patch 0007, round-trip verified).
+  3. **CX = cross-layer KV reuse** (the actual DeepSeek trick) - a bigger architectural
+     change; would need a fork-level KV-sharing path.
+
+### DECISION
+- NOT implementing MXFP4 KV: 5.5% is below the noise of the measurement and the kernel is
+  not free. Report honestly rather than ship a low-value, unverifiable kernel.
+- If a genuinely smaller KV is wanted, turbo3 (3.5 bit) or cross-layer reuse are the real
+  levers; both are larger efforts than the FP4 wire-up.
+
+### EVIDENCE GAP
+- The llama-server "KV self size" line was not captured (server invocation timed out); the
+  block-size arithmetic above is from ggml-common.h struct layouts and is exact.
