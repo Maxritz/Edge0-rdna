@@ -361,3 +361,36 @@ are genuinely not resident anywhere, i.e. a machine whose PHYSICAL RAM cannot ho
 Implication: the 16 GiB/8 GiB product target cannot be faithfully reproduced with a process cap
 on this box. A real test needs a VM with 16 GiB RAM (or a cold-cache / limited-page-cache harness).
 Until then, treat the pool as unproven on its target and keep it off by default (as it is).
+
+## 17. Model triage + ROCmFPX PR #42 + kraken expert index
+
+### Dense vs MoE (checked against raw tensors, not the planner's metadata)
+| model | arch | FFN tensors | verdict |
+|---|---|---|---|
+| Qwen3.8-27B-WebGGUF-Q4_0 | qwen35, 65L | ffn_gate/up/down.weight + ssm_* | **dense** hybrid (attn+SSM), 0 experts |
+| Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp | qwen35, 65L | ffn_* .weight + nextn.* | **dense** + embedded MTP head |
+| Muse-Glimmer-30B-UD-Q8_K_XL | muse-glimmer, 52L | ffn_* .weight | **dense** |
+| Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX | qwen35moe, 41L | ffn_*_exps.weight + gate_inp | **MoE (256e)** but expert types 107/102 = ROCmFPX custom, NOT in pinned ggml enum -> **unloadable by our pin** |
+| Qwen3-30B-A3B-abliterated-erotic.i1-Q2_K | qwen3moe | ffn_*_exps.weight Q2_K + gate_inp | **MoE, loadable** |
+| Qwen2.5-Coder-32B-Instruct-3MPER0RR | qwen2, 32L | ffn_gate/up/down.weight | **dense** |
+
+Note: a real MoE has `ffn_{gate,up,down}_exps.weight` (3D, [hid,inter,n_exp]) AND a router
+`ffn_gate_inp.weight`. Dense has only the `ffn_*.weight` triple. `qwen35` (65L, ssm_*) is a
+dense hybrid; the MoE sibling is `qwen35moe`.
+
+### ROCmFPX PR #42 (charlie12345) - "vulkan: add ROCmFP2 Q8_1 decode kernels"
+- Lesson: ROCmFP2 was SMALLER than ROCmFP4 (2.628 vs 4.293 BPW) but did NOT decode faster until
+  the **routed (MUL_MAT_ID) Q8_1 integer-dot matrix-vector** path was added; decode had fallen
+  back to dequantize-and-dot. After: ROCmFP2 90.3 tok/s vs ROCmFP4 76.2 (Strix Halo, +18.5%).
+- Borrow: (1) for the DISK tier, a smaller expert format (ROCmFP2 ~2.6 BPW vs our MXFP4 4.25)
+  reduces bytes per miss ~1.6x; (2) for DECODE, a dedicated ROUTED mmvq (MUL_MAT_ID) with
+  integer dot is the unlock - generic dequant+dot is the slow fallback. Applies to our engine
+  (ggml mmvq exists; the routed specialization is the lever).
+
+### kraken expert index (sidecar `<model>.gguf.krakenexperts.json`)
+- kind "kraken-expert-index", mode "full-forward": per layer, per expert `mass` + `hits`
+  (activation mass + routing count), 40 layers x 256 experts, 502 positions scanned.
+- This is EXACTLY the routing-frequency file we wanted (ninfer write_routing_counts / our
+  E0_POOL_STATS): a precomputed hot-expert ranking. Seeds the pool hot-set and the prerouter.
+- The file we have is for the ROCmFPX model (unloadable), but the format is what our stats dump
+  should emit/consume.
