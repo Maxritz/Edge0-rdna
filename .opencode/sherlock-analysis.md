@@ -636,3 +636,29 @@ llama-bench p32/n256 (r=3): n16 31.37+-0.26, n20 **37.60+-0.47**, n24 33.69+-0.4
 - [ ] T3 pool-on-<=20-GB-RAM validation.
 - [ ] T4 batch-1 GEMV dispatch/instruction trap (needs rocprof; not installed).
 - [ ] H4 q6_K tilelang GEMM A/B; phase-scope perf sampler to the decode window.
+
+## [RUN-015] 2026-10-10 - MODE: HIGH - session close: resource peaks + remaining-item status
+
+### DONE THIS SESSION
+- RUN-011 fix: RAM-aware pool default (17.1 -> 28.8 tok/s, +68%).
+- RUN-013 fix: measured n_cpu_moe autotune (26 -> 20, +18%; new `autotune.rs`).
+- RUN-014 fix: RAM-resident `--load-mode none` (pp2048 434 -> 772 tok/s, 1.78x).
+- This run: perf report now carries window-peak cpu/gpu/vram (fixed the 15.5% false
+  util reading that misled RUN-010). All 21 lib tests pass; full release build clean.
+
+### VERIFY (final RDNA2 trace_demo, all fixes active)
+- decode 26.0 ms/tok = 38.5 tok/s (was 58.6 ms/tok at session start - >2x).
+- engine log: no mmap warning; [autotune] n_cpu_moe 26 -> 20; no POOL2 lines.
+- resources: gpu_util_max 64.2, cpu_pct_max 54.5 (peak, not last sample).
+
+### REMAINING (honest status)
+| item | status | blocker |
+|---|---|---|
+| T2 ROCmFP4/TurboQuant HIP port | NOT DONE | multi-stage kernel work + format-matched fixtures |
+| T3 pool on <=20 GB RAM box | NOT DONE | no such machine; process cap is not a RAM cap |
+| T4 batch-1 GEMV dispatch trap | BLOCKED | rocprof absent on both boxes (rechecked) |
+| H4 q6_K tilelang GEMM A/B | NOT DONE | tilelang kernel work |
+
+### NOTE
+- T4 cannot be executed without rocprof; per-kernel counters are unavailable. The util/latency
+  evidence (RUN-012) stands in for it until a profiler is present.
