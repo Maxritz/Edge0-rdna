@@ -274,3 +274,31 @@ Zero mismatches -> eviction + refill serve correct bytes.
   matters, and eviction increases them.
 - Conclusion: eviction is correct and necessary for RAM-constrained machines, but must be
   tuned (or off by default) where RAM is plentiful. Needs a real 32 GiB test to justify.
+
+## [RUN-007] 2026-10-10 - MODE: HIGH - split-precision FP32 GEMM (tilelang, gfx1201)
+
+BASELINE: 1.5 TF @ 1024x1024x2048 (incl H2D+D2H); ggml ROCm0 f16 = 96.3 TF, f32 = 12.4 TF
+FINDINGS:
+| Rank | Component | Cost | Evidence | Status |
+| 1 | occupancy | dominant | 6 shared buf = 64 KB/block (2 fp32 + 4 fp16) -> ~1 CTA/SM on RDNA4 | CONFIRMED |
+| 2 | 3x MMA count | 3x FLOPs | hi*hi+hi*lo+lo*hi by design | CONFIRMED (inherent) |
+| 3 | vectorization | minor | "T.vectorized extent 8 lowered as serial" | SUSPECTED |
+VERDICT: even fixed, 3x-MMA caps at ~32 TF (96/3); only worthwhile if fp32-accurate prefill is
+required AND occupancy is restored. ggml f32 already 12.4 TF -> max upside ~2.6x prefill, not free.
+Separately the kernel is WRONG (abs err 39.9 vs f64, plain fp16 0.024) - prime suspect the
+swizzled-Ah residual read-back (gen_split.py); PROBE NEEDED, see ponytail-diag.
+
+## [RUN-008] 2026-10-10 - MODE: HIGH - MTP self-speculative decode
+
+WORKLOAD: Tiel-Coder-35B-A3B-MTP-APEX (qwen35moe, Q5_K, embedded MTP head, 26.7 GB),
+-ngl 99 --n-cpu-moe 24 -c 4096 -fa auto, 160 decode tokens, greedy. Pin flags present:
+--spec-type draft-mtp, --spec-draft-n-max, --spec-draft-p-min, --spec-draft-ngl.
+DATA:
+| variant | acceptance | mean len | decode tok/s |
+| baseline (no MTP) | - | - | 20.74 |
+| MTP n-max 6, p-min 0.6 | 0.696 | 2.84 | 8.82 |
+| MTP n-max 4, p-min 0.5, draft-ngl 99 | 0.639 | 3.00 | 17.39 |
+FINDING: MTP works but is net-negative (-16% best case) on expert-offloaded MoE. With experts
+on CPU the verification batch CPU matmul scales with batch, so extra tokens are NOT free in the
+target; spec decode only wins when the target is GPU-resident/bandwidth-bound. --spec-draft-ngl 99
+mattered (8.82 -> 17.39). Not a lever for the CPU-expert regime.

@@ -169,3 +169,20 @@ with `--n-cpu-moe`. Two regimes:
 gpt-oss-120b thread sweep (n_cpu_moe 32): t=8 59.2 pp / 13.0 tg, t=16 56.5 / 12.9,
 t=24 56.5 / 12.7 — thread count barely matters; ~8 threads is fine.
 
+
+## 12. MTP self-speculative decode (Tiel-Coder-35B-A3B-MTP-APEX)
+
+`qwen35moe` Q5_K, embedded MTP head, `-ngl 99 --n-cpu-moe 24 -c 4096 -fa auto`, 160 greedy
+tokens, llama-server. Flags: `--spec-type draft-mtp --spec-draft-n-max N --spec-draft-p-min P
+[--spec-draft-ngl 99]`.
+
+| variant | draft acceptance | mean accepted len | decode tok/s |
+|---|---:|---:|---:|
+| baseline (no MTP) | - | - | **20.74** |
+| MTP n-max 6, p-min 0.60 | 0.696 | 2.84 | 8.82 |
+| MTP n-max 4, p-min 0.50, draft-ngl 99 | 0.639 | 3.00 | 17.39 |
+
+MTP is correct and accepts well, but is **net-negative** for expert-offloaded MoE: the
+verification batch's CPU matmul cost scales with batch size, so the extra verified tokens are
+not free. Spec decode only pays when the target is GPU-resident (weights read once per batch).
+`--spec-draft-ngl 99` (GPU draft) recovers most of the loss but not to baseline.
