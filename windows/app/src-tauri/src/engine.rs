@@ -303,6 +303,22 @@ pub fn start(sink: &Arc<dyn Sink>, state: &EngineState, tier: &str) -> Result<Va
     )
 }
 
+/// Model loading mode for a local GGUF. With CPU-offloaded tensors, mmap demand-pages
+/// the CPU-resident expert weights from disk during prefill; a RAM-resident copy avoids
+/// that. When the model fits in RAM, `--load-mode none` is a large prefill win on RDNA2
+/// (434 -> 772 tok/s at p2048) with no decode cost. When it does not fit, mmap's demand
+/// paging is required, so no flag is emitted.
+pub fn load_mode_for_gguf(path: &str) -> Option<&'static str> {
+    let file_gb = std::fs::metadata(path).map(|m| m.len() as f64 / 1_000_000_000.0).unwrap_or(0.0);
+    let ram_gb = phys_mem_gb() as f64;
+    const HEADROOM_GB: f64 = 4.0;
+    if file_gb > 0.0 && file_gb + HEADROOM_GB <= ram_gb {
+        Some("none")
+    } else {
+        None
+    }
+}
+
 /// Load a local GGUF file through the same engine. gguf_tool.py plans the expert offload
 /// for the GPU the engine reports; the engine starts only when that plan fits.
 pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u32) -> Result<Value, String> {
@@ -325,6 +341,12 @@ pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u3
     // but decode peaks below it. Prefer a cached measurement, else sweep once if enabled.
     let gpu_id = info["gpu"]["id"].as_str().unwrap_or("gpu").to_string();
     apply_tuned_ncpu_moe(&mut args, path, ctx, &gpu_id, &info);
+    // RAM-resident load when the model fits: avoids mmap page faults on the CPU-expert
+    // prefill path (large p2048 prefill win, no decode cost).
+    if let Some(mode) = load_mode_for_gguf(path) {
+        args.push("--load-mode".into());
+        args.push(mode.into());
+    }
     let tail: Vec<OsString> = vec![
         "--ctx-size".into(),
         ctx.to_string().into(),
@@ -480,20 +502,22 @@ mod tests {
     }
 
     #[test]
-    fn pool_default_is_ram_aware_and_overridable() {
+    fn ram_derived_defaults_are_ram_aware_and_overridable() {
         let small = temp_file_with_len(10_000_000); // 0.01 GB
         let sp = small.to_str().unwrap();
 
-        // Default: pool off when the model + headroom fits physical RAM.
+        // Model + headroom fits physical RAM: pool off, RAM-resident load on.
         std::env::remove_var("E0_POOL_MB");
         std::env::set_var("EDGE0_PHYS_MEM_GB", "48");
         assert_eq!(pool_for_gguf(sp), 0, "model << RAM must leave the pool off");
+        assert_eq!(load_mode_for_gguf(sp), Some("none"), "model << RAM must load into RAM");
 
-        // Default: pool on when the model cannot fit in RAM.
+        // Model cannot fit in RAM: pool on, mmap demand-paging required.
         std::env::set_var("EDGE0_PHYS_MEM_GB", "1");
         assert!(pool_for_gguf(sp) > 0, "model > RAM must enable the pool");
+        assert_eq!(load_mode_for_gguf(sp), None, "model > RAM must stay on mmap");
 
-        // Explicit override wins in both directions.
+        // Explicit pool override wins in both directions.
         std::env::set_var("EDGE0_PHYS_MEM_GB", "48");
         std::env::set_var("E0_POOL_MB", "3072");
         assert_eq!(pool_for_gguf(sp), 3072);

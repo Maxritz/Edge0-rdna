@@ -602,3 +602,37 @@ llama-bench p32/n256 (r=3): n16 31.37+-0.26, n20 **37.60+-0.47**, n24 33.69+-0.4
 - [ ] T3 pool-on-<=20-GB-RAM validation.
 - [ ] T4 batch-1 GEMV dispatch/instruction trap (needs rocprof; not installed).
 - [ ] RUN-001 H2 `--load-mode none` A/B; H4 q6_K tilelang GEMM A/B; phase-scope perf sampler.
+
+## [RUN-014] 2026-10-10 - MODE: HIGH - --load-mode none vs mmap (fixes RUN-001 H2)
+
+### BASELINE
+- RDNA2 box, Qwen3.5-35B-A3B Q4_K, n_cpu_moe 20. Engine warns:
+  "tensor overrides to CPU are used with mmap enabled - consider using --load-mode none".
+
+### DATA (llama-bench, r=3)
+| test | mmap (default) | --load-mode none | delta |
+|---|---:|---:|---:|
+| pp32 | 34.88 | 152.26 | 4.4x |
+| tg256 | 37.63 | 38.40 | +2% |
+| pp2048 (realistic) | 433.89 | 772.43 | 1.78x |
+
+### FINDING
+| Rank | Component | Cost / evidence | Status |
+| 1 | mmap demand-pages CPU-expert weights during prefill | pp2048 434 -> 772 tok/s with RAM-resident load | CONFIRMED |
+| 2 | prefill (not just pp32) gains in absolute terms | +338 tok/s at p2048 | CONFIRMED |
+| 3 | decode unaffected | 37.6 -> 38.4 within noise | CONFIRMED |
+
+### FIX
+- `engine::load_mode_for_gguf(path)`: `--load-mode none` when model + 4 GiB <= RAM, else None
+  (mmap needed to demand-page). Wired into `start_gguf`.
+- Unit test folded into `ram_derived_defaults_are_ram_aware_and_overridable`.
+
+### VERIFY (RDNA2, real trace_demo run, cache + load-mode both on)
+- Newest engine log: **no mmap warning** (flag applied). decode 27.9 ms/tok = 35.8 tok/s.
+- Both RAM-derived defaults (pool off, load-mode none) now active together.
+
+### TODOS (remaining, honest)
+- [ ] T2 ROCmFP4/TurboQuant HIP port (gfx1201 wmma iu4/iu8; gfx1031 v_dot/dp4a).
+- [ ] T3 pool-on-<=20-GB-RAM validation.
+- [ ] T4 batch-1 GEMV dispatch/instruction trap (needs rocprof; not installed).
+- [ ] H4 q6_K tilelang GEMM A/B; phase-scope perf sampler to the decode window.
