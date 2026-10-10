@@ -442,3 +442,25 @@ a length guard.
 - Portable to us as PRINCIPLE: a dedicated ROUTED mmvq (MUL_MAT_ID) with native packed
   decode + integer dot. We run HIP, not Vulkan, so the GLSL is not reusable, but the same
   specialization applied to ggml-cuda (HIP) mmvq would be.
+
+## 19. ik_llama.cpp (H:\LLAMA-bins\ik_llama.cpp) - NOT ROCmFPX; it is IQK
+
+Checked: no ROCmFPX anywhere in H:\LLAMA-bins (recursive *rocmfp* = none). ik_llama.cpp's ggml
+enum custom types: Q4_0_4_4(31), Q4_0_4_8(32), Q4_0_8_8(33), I2_S(36), MXFP4(39),
+Q1_0_G128(41), Q6_0(133). No SPARK arch (the "spark" hits were "DSpark"/DeepSeek4). So the
+ROCmFPX models (types 100-107,142) load ONLY in charlie12345's fork.
+
+What ik_llama.cpp IS useful for: **IQK**, the hand-optimized quantized GEMM/GEMV family for
+AMD, built for HIP (`build-rocm/` present):
+  ggml/src/iqk/iqk_gemm_{kquants,iquants,iqk_quants,ktquants,1bit,floats,legacy_quants}.cpp
+  ggml/src/iqk/iqk_mul_mat.cpp (+ iqk_topk_moe), iqk_flash_attn.cpp, iqk_kda.cpp
+  custom 4x4 / 8x8 matmul layouts (Q4_0_4_4/4_8/8_8)
+
+Relevance: this is the AMD/HIP analogue of what ROCmFPX PR#42 added on Vulkan - a dedicated,
+hand-tuned quantized matmul (incl. routed/MoE topk) rather than generic dequant-and-dot. For
+our engine's MoE decode on gfx1201/gfx1031, IQK is the reference to mine (kernel structure,
+packed layouts, expert handling), not the ROCmFPX GLSL.
+
+Decision: ROCmFPX = charlie's fork only (not portable, Vulkan here). IQK = study for a fast
+routed quantized matmul in our HIP engine; its 4x4/8x8 layouts are the analog of the
+"dedicated routed mmvq" idea.
