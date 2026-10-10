@@ -83,16 +83,27 @@ pub fn pool_for(tier: &str) -> u32 {
     base.min(cap).max(512)
 }
 
-/// Pool size for a local GGUF load. `E0_POOL_MB` overrides (0 disables); otherwise the
-/// same RAM-clamped default as the tiers, so local GGUF experts stream through the L1
-/// pool instead of mmap page-faults.
-pub fn pool_for_gguf() -> u32 {
+/// Pool size for a local GGUF load. `E0_POOL_MB` overrides (0 disables). Otherwise the
+/// pool is enabled only when the model does not comfortably fit in physical RAM: when
+/// the weights already live in the mmap page cache the prefetch pool thrashes and is
+/// measured net-negative (a 19.7 GB model on a 48 GB box: 17.1 tok/s pooled vs 28.8
+/// mmap). The pool earns its keep streaming experts a machine cannot hold in RAM.
+pub fn pool_for_gguf(model_path: &str) -> u32 {
     if let Ok(v) = std::env::var("E0_POOL_MB") {
         if let Ok(n) = v.trim().parse::<u32>() {
             return n;
         }
     }
-    pool_for("")
+    let file_gb = std::fs::metadata(model_path)
+        .map(|m| m.len() as f64 / 1_000_000_000.0)
+        .unwrap_or(0.0);
+    let ram_gb = phys_mem_gb() as f64;
+    const HEADROOM_GB: f64 = 4.0;
+    if file_gb > 0.0 && file_gb + HEADROOM_GB <= ram_gb {
+        0 // model + KV headroom fits in RAM: mmap page cache wins
+    } else {
+        pool_for("")
+    }
 }
 
 // Job Object safety net: llama-server is assigned to a job created with
@@ -322,7 +333,7 @@ pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u3
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let pool = pool_for_gguf();
+    let pool = pool_for_gguf(path);
     launch(
         sink,
         state,
@@ -387,4 +398,42 @@ pub fn pool_telemetry(log_path: &str) -> Option<String> {
     std::fs::read_to_string(log_path).ok().and_then(|s| {
         s.lines().rev().find(|l| l.contains("POOL2 init")).map(|l| l.trim().to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_file_with_len(len: u64) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("edge0-pooltest-{}-{len}", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(len).unwrap();
+        p
+    }
+
+    #[test]
+    fn pool_default_is_ram_aware_and_overridable() {
+        let small = temp_file_with_len(10_000_000); // 0.01 GB
+        let sp = small.to_str().unwrap();
+
+        // Default: pool off when the model + headroom fits physical RAM.
+        std::env::remove_var("E0_POOL_MB");
+        std::env::set_var("EDGE0_PHYS_MEM_GB", "48");
+        assert_eq!(pool_for_gguf(sp), 0, "model << RAM must leave the pool off");
+
+        // Default: pool on when the model cannot fit in RAM.
+        std::env::set_var("EDGE0_PHYS_MEM_GB", "1");
+        assert!(pool_for_gguf(sp) > 0, "model > RAM must enable the pool");
+
+        // Explicit override wins in both directions.
+        std::env::set_var("EDGE0_PHYS_MEM_GB", "48");
+        std::env::set_var("E0_POOL_MB", "3072");
+        assert_eq!(pool_for_gguf(sp), 3072);
+        std::env::set_var("E0_POOL_MB", "0");
+        assert_eq!(pool_for_gguf(sp), 0);
+
+        std::env::remove_var("E0_POOL_MB");
+        std::env::remove_var("EDGE0_PHYS_MEM_GB");
+        let _ = std::fs::remove_file(&small);
+    }
 }

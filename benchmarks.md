@@ -238,3 +238,16 @@ Qwen3.5-35B-A3B Q4_K (18.32 GiB) `--n-cpu-moe` sweep:
 Other MoE (n_cpu_moe 16): Laguna-XS.2 IQ4_XS 461 pp / **46.21** tg; GLM-4.7-Flash-APEX (deepseek2, Q6_K) 215 pp / 29.25 tg; L3.2-8X3B (llama arch, Q8_0) 466 pp / 11.90 tg.
 
 RDNA2 vs RDNA4 (Qwen3.5-35B): decode peak 34.6 vs 44.1 (0.79x); prefill 435 vs 760 (0.57x). The 12 GiB ceiling shifts the decode optimum from `n_cpu_moe` 8 (RDNA4, 16 GiB) to 24 (RDNA2, 12 GiB). Best RDNA2 config measured: Laguna-XS.2 IQ4_XS at 46.2 tok/s.
+
+### 19b. RDNA2 app trace + pool-default regression (RUN-011)
+
+Traced the real app path (`trace_demo` -> `engine::start_gguf`) on the gfx1031 box (ctx 32768, n_slots 4, threads 6, Qwen3.5-35B-A3B Q4_K, n_cpu_moe 26):
+
+| metric | pool default 2048 (buggy) | RAM-aware default (fixed) | manual mmap |
+|---|---:|---:|---:|
+| decode ms/tok | 58.6 | 34.8 | 35.2 |
+| decode tok/s | 17.1 | 28.8 | 28.4 |
+| prompt ms/tok | 82.3 | 51.6 | 49.8 |
+| VRAM | 9.59/11.98 GiB | 9.60/11.98 GiB | - |
+
+Root cause: `pool_for_gguf()` defaulted `--pool-mb 2048`, so the app always used the expert prefetch pool. On this 47.9 GiB box the 19.69 GB model fits in RAM, so the pool thrashed (`bypass=176229 evict=12896`) while mmap page cache stayed hot. Fix: `pool_for_gguf(model)` enables the pool only when `model_bytes + 4 GB > RAM`; `E0_POOL_MB` still overrides. Verified: +68% decode on RDNA2, matches llama-bench. This extends the RUN-006 correction (mmap beats the pool at every budget when RAM holds the weights).

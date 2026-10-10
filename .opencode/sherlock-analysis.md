@@ -406,3 +406,72 @@ Other MoE (RDNA2, n_cpu_moe 16): Laguna-XS.2 IQ4_XS 461 pp / **46.21** tg; GLM-4
 ### NEXT RUN
 - Execute the Dispatch trap (rocprof) on both GPUs to convert rank-1 from
   "14-20% BW" to the named kernel + occupancy number.
+
+## [RUN-011] 2026-10-10 - MODE: FULL (trace) - RDNA2 (gfx1031) app trace + pool-default regression
+
+### BASELINE
+- Hardware: RX 6700 XT gfx1031, 11.98 GiB VRAM, 47.9 GiB RAM, ROCm D:\Rocm10, ReBAR off.
+- Engine: our patch band built on the box (D:\edge0\wt\win\build-hip\bin), ctx 32768,
+  n_slots 4, threads 6, model C:\x\Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf (19.69 GB).
+- Tool: `trace_demo.exe` built on the box (cargo, 4m56s), EDGE0_BIN_DIR -> RDNA2 engine.
+
+### TRACE (component table, pool DEFAULT on = buggy path)
+| component | scope | ops | %dev | dev us | host us |
+|---|---|---:|---:|---:|---:|
+| engine.decode | engine | 128 | 83.5% | 58635.23 | 0.00 |
+| engine.prompt-eval | engine | 18 | 16.5% | 82263.33 | 0.00 |
+| engine.launch | app | 1 | - | - | 9785168.00 |
+| engine.start_gguf | app | 1 | - | - | 11907057.00 |
+| engine.wait_ready | app | 1 | - | - | 9699499.00 |
+| gguf.detect_gpu | app | 2 | - | - | 1571786.50 |
+| gguf.inspect_for_gpu | app | 1 | - | - | 2121841.00 |
+- instrumentation floor: 0.86 us host each (256 empty ops).
+- decode 58.6 ms/tok = 17.06 tok/s; prompt 82.26 ms/tok. resources: gpu 15.5%, vram 9.59/11.98, cpu 44%.
+
+### INVESTIGATE - why 17 tok/s when llama-bench got 31-34 at the same n_cpu_moe
+True/false tests (all back-to-back, same box, ctx 32768, n_cpu_moe 26):
+| test | claim | result |
+|---|---|---|
+| T1 threads | server uses fewer threads than bench | FALSE - bench -t 6 == default (31.85 vs 31.93) |
+| T2 sampling | sampling dominates server decode | FALSE - temp 0.2 (30.53) vs greedy (28.44) = ~6% |
+| T3 ctx size | 32768 vs 8192 is slower | FALSE - 8192/16384/32768 all ~28.3 tok/s |
+| T4 warmup/clocks | cold GPU on first run | FALSE - reproduces warm (17.4, 17.9) |
+| T5 spawn method | CREATE_NO_WINDOW / job / cwd | FALSE - spawn_probe plain/nowin/job/full/nocwd all 27.9-28.8 |
+| T6 pool default | app passes --pool-mb, bench does not | **TRUE** |
+
+A/B/A (identical exe + args): manual 28.26, 28.39, 28.49 vs trace_demo 16.92, 15.6, 17.4 tok/s.
+Slow log is full of `[pref-trace] POOL2 ... bypass=176229 evict=12896 wait=80556`; fast log has none.
+`start_gguf` -> `pool_for_gguf()` defaulted 2048 MB (`--pool-mb 2048`).
+
+### FINDINGS
+| Rank | Component | Cost / evidence | Status |
+| 1 | app default `--pool-mb 2048` for local GGUF | 58.6 vs 34.8 ms/tok decode (1.69x); pool counters show thrash | CONFIRMED |
+| 2 | pool is net-negative when the model fits in RAM | 19.69 GB model << 47.9 GB RAM; mmap page cache wins | CONFIRMED |
+| 3 | decode still op-bound (not BW) at 28.8 tok/s | 34.8 ms/tok at n_cpu_moe 26 | CONFIRMED |
+
+### HYPOTHESES
+| ID | Claim | For | Against | Test | Cost | Status |
+| H1 | RAM-aware pool default removes the regression | E0_POOL_MB=0 -> 28.8 tok/s | none | change default, re-trace | low | **CONFIRMED** |
+| H2 | pool helps only when model > RAM | theory + 96 GB finding (RUN-006) | not measured on a <=20 GB box | low-RAM box test | med | PENDING |
+
+### OPTIMISE
+`pool_for_gguf(model_path)`: enable the pool only when `model_bytes + 4 GB headroom >`
+physical RAM; `E0_POOL_MB` remains an explicit override. Unit test
+`engine::tests::pool_default_is_ram_aware_and_overridable` covers both directions + override.
+
+### VERIFY (RDNA2, same box, same model, rebuilt)
+| metric | before (pool 2048) | after (RAM-aware off) | delta |
+|---|---:|---:|---:|
+| decode ms/tok | 58.6 | 34.8 | -40.6% |
+| decode tok/s | 17.1 | 28.8 | +68% (1.69x) |
+| prompt ms/tok | 82.3 | 51.6 | -37% |
+- Matches the manual mmap baseline (28.4). Reproduced across runs. `cargo test --lib` 13/13.
+
+### ACTIONS
+- [x] Implement RAM-aware pool default (H1) + unit test.
+- [x] Rebuild + re-trace on RDNA2 -> decode restored to 28.8 tok/s.
+- [ ] Test H2 on a <=20 GB RAM machine (pool expected to help only there).
+
+### NEXT RUN
+- If a <=20 GB RAM box is available, validate H2; otherwise next-highest gap is the
+  batch-1 GEMV efficiency (RUN-010) via a dispatch/instruction trap.
