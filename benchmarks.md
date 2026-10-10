@@ -219,3 +219,22 @@ IQ3_S-mtp file carries an embedded MTP head (`blk.N.nextn.eh_proj/enorm/hnorm/sh
   worst case (the pool/streaming target; not faithfully reproducible on this host, see section 15).
 - 12 GiB VRAM / 16 GiB RAM: same class; dense 27B needs ~full residency, so it runs at the
   ngl=48-ish rates above (~5-7 tok/s), MoE offloads experts.
+
+## 19. RDNA2 (gfx1031, RX 6700 XT 12 GiB) - cross-machine
+
+Our patch-band engine, build eb0ef8074, ROCm at D:\Rocm10, models on C:\x, `llama-bench -p 512 -n 128 -ngl 99 -fa auto`.
+
+Qwen3.5-35B-A3B Q4_K (18.32 GiB) `--n-cpu-moe` sweep:
+
+| n_cpu_moe | pp512 | tg128 |
+|---:|---:|---:|
+| 0 | 435 | 26.75 |
+| 8 | 292 | 28.86 |
+| 16 | 245 | 31.36 |
+| 24 | 319 | 34.64 |
+| 31 | 259 | 29.27 |
+| 40 | 210 | 24.20 |
+
+Other MoE (n_cpu_moe 16): Laguna-XS.2 IQ4_XS 461 pp / **46.21** tg; GLM-4.7-Flash-APEX (deepseek2, Q6_K) 215 pp / 29.25 tg; L3.2-8X3B (llama arch, Q8_0) 466 pp / 11.90 tg.
+
+RDNA2 vs RDNA4 (Qwen3.5-35B): decode peak 34.6 vs 44.1 (0.79x); prefill 435 vs 760 (0.57x). The 12 GiB ceiling shifts the decode optimum from `n_cpu_moe` 8 (RDNA4, 16 GiB) to 24 (RDNA2, 12 GiB). Best RDNA2 config measured: Laguna-XS.2 IQ4_XS at 46.2 tok/s.

@@ -302,3 +302,45 @@ FINDING: MTP works but is net-negative (-16% best case) on expert-offloaded MoE.
 on CPU the verification batch CPU matmul scales with batch, so extra tokens are NOT free in the
 target; spec decode only wins when the target is GPU-resident/bandwidth-bound. --spec-draft-ngl 99
 mattered (8.82 -> 17.39). Not a lever for the CPU-expert regime.
+
+## [RUN-009] 2026-10-10 - MODE: FULL - RDNA2 (gfx1031) vs RDNA4 (gfx1201)
+
+### BASELINE
+- Hardware A: RX 6700 XT, gfx1031 (RDNA2), 12 GiB VRAM, ~320 GB/s.
+- Hardware B: RX 9070 XT, gfx1201 (RDNA4), 16 GiB VRAM, ~640 GB/s (RUN-003).
+- Engine (A): our patch band built on the remote box, `D:\edge0\wt\win\build-hip\bin`,
+  build eb0ef8074, ROCm at D:\Rocm10. Same `llama-bench -p 512 -n 128 -ngl 99 -fa auto`.
+- Models on C:\x (fast disk; D: is slow). VRAM: 12272 MiB reported.
+
+### DATA - Qwen3.5-35B-A3B Q4_K (18.32 GiB) `--n-cpu-moe` sweep
+| n_cpu_moe | RDNA2 pp512 | RDNA2 tg128 | RDNA4 pp512 | RDNA4 tg128 |
+|---:|---:|---:|---:|---:|
+| 0  | 435 | 26.75 | 760 | 33.8 |
+| 8  | 292 | 28.86 | 430 | 44.1 |
+| 16 | 245 | 31.36 | 481 | 40.7 |
+| 24 | 319 | **34.64** | 340 | 30.4 |
+| 31 | 259 | 29.27 | 267 | 25.8 |
+| 40 | 210 | 24.20 | 219 | 21.9 |
+
+Other MoE (RDNA2, n_cpu_moe 16): Laguna-XS.2 IQ4_XS 461 pp / **46.21** tg; GLM-4.7-Flash-APEX
+215 pp / 29.25 tg; L3.2-8X3B (llama arch) Q8_0 466 pp / **11.90** tg.
+
+### FINDINGS
+| Rank | Component | Cost / evidence | Status |
+| 1 | VRAM ceiling (12 GiB) shifts the decode optimum | RDNA4 peaks at n_cpu_moe 8 (44.1); RDNA2 peaks at 24 (34.6). At 0 the 18.32 GiB model+KV exceeds 12 GiB -> spills -> 26.75. | CONFIRMED |
+| 2 | RDNA2 decode = 0.79x RDNA4, prefill = 0.57x | decode peak 34.6 vs 44.1; prefill 435 vs 760 (matches ~0.5 bandwidth + no WMMA on RDNA2 -> DP4A) | CONFIRMED |
+| 3 | Best RDNA2 config | Laguna-XS.2 IQ4_XS 16.84 GiB, 46.2 tok/s (fits fully, GDN/hybrid) | CONFIRMED |
+| 4 | Q8_0 MoE is bandwidth-bound | L3.2-8X3B Q8_0 18.21 GiB -> 11.9 tok/s (8.5 bpw) | CONFIRMED |
+
+### ANALYSIS
+- "Uses all 12 GB": at n_cpu_moe 0 the model does not fit; the optimum is the smallest
+  n_cpu_moe that keeps VRAM near-full (24 here) -> decode 34.6. Same shape as the 16 GiB box
+  (which fits at 8). VRAM capacity, not just bandwidth, sets the decode sweet spot.
+- RDNA2 vs RDNA4 decode gap (0.79x) is smaller than the prefill gap (0.57x): decode is
+  bandwidth-bound (weights read once) so it tracks the ~0.5 BW ratio plus CPU-expert share;
+  prefill is compute-bound and RDNA2 lacks WMMA (DP4A path).
+- Disk (D:) is slow on this box; models moved to C:\x. Engine binary stays on D: (small).
+
+### ACTIONS
+- [ ] Record RDNA2 numbers in benchmarks.md (done below).
+- [ ] Fixed cross-machine comparison captured for the pcie/bandwidth model.
