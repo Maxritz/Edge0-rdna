@@ -1,4 +1,4 @@
-From cc61ec09fb4d99a325045fd29ef00f19d2679773 Mon Sep 17 00:00:00 2001
+From cece86731c9c9dcd902e3850d0b667b018429fd2 Mon Sep 17 00:00:00 2001
 From: edge0 <edge0@local>
 Date: Sat, 10 Oct 2026 17:36:59 +0530
 Subject: [PATCH] edge0 private: ROCmFPX low-bit weight types (types
@@ -12,14 +12,14 @@ Subject: [PATCH] edge0 private: ROCmFPX low-bit weight types (types
  ggml/src/ggml-cpu/quants.h      |  21 +++
  ggml/src/ggml-cuda/common.cuh   |  16 ++
  ggml/src/ggml-cuda/convert.cu   | 151 +++++++++++++++
- ggml/src/ggml-cuda/ggml-cuda.cu |  50 ++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 156 +++++++++++++++-
  ggml/src/ggml-cuda/mmvq.cu      |  33 ++++
  ggml/src/ggml-cuda/vecdotq.cuh  |  43 ++++-
  ggml/src/ggml-quants.c          | 321 ++++++++++++++++++++++++++++++++
  ggml/src/ggml-quants.h          |  14 ++
  ggml/src/ggml.c                 |  50 ++++-
  ggml/src/gguf.cpp               |  12 ++
- 14 files changed, 826 insertions(+), 12 deletions(-)
+ 14 files changed, 931 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 224bdef92..49f87898c 100644
@@ -450,7 +450,7 @@ index 0619f4760..ffa3405a5 100644
              return convert_unary_cont_cuda<half>;
          case GGML_TYPE_BF16:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a9038f1f4..033df8d1d 100644
+index a9038f1f4..6d41c365d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1796,6 +1796,17 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
@@ -527,7 +527,159 @@ index a9038f1f4..033df8d1d 100644
                  if (GGML_CUDA_CC_IS_AMD(cc)) {
                      ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                      return;
-@@ -5156,6 +5184,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -4182,6 +4210,94 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
++// Edge0 (private): opt-in per-op device timing (EDGE0_CUDA_OP_TIMING=1). Records a CUDA
++// event pair around every graph node, aggregates device time by op name, and prints the
++// sherlock-style component table. CUDA graphs are disabled while this is on.
++#include <unordered_map>
++#include <vector>
++#include <string>
++#include <algorithm>
++#include <cstdio>
++
++namespace {
++struct edge0_op_timer {
++    bool enabled = false;
++    bool ready   = false;
++    static constexpr int MAX_SPANS = 1024;
++    std::vector<void *> ev;                      // 2*MAX_SPANS events
++    std::vector<int>    span_ev;                 // span index -> base
++    std::vector<std::string> span_name;          // span index -> label
++    std::unordered_map<std::string, double> agg_ms;
++    std::unordered_map<std::string, long long> agg_n;
++    int calls = 0;
++
++    void init() {
++        if (ready) return;
++        ready = true;
++        enabled = getenv("EDGE0_CUDA_OP_TIMING") != nullptr && atoi(getenv("EDGE0_CUDA_OP_TIMING"));
++        if (!enabled) return;
++        // Per-op events conflict with CUDA-graph capture and the MoE fusion path it
++        // enables; disable fusion while profiling so the engine stays stable.
++#ifdef _WIN32
++        _putenv_s("GGML_CUDA_DISABLE_FUSION", "1");
++#else
++        setenv("GGML_CUDA_DISABLE_FUSION", "1", 1);
++#endif
++        ev.resize(2 * MAX_SPANS, nullptr);
++        for (auto & e : ev) {
++            cudaEvent_t h = nullptr;
++            if (cudaEventCreateWithFlags(&h, 0) != cudaSuccess) { // 0 = timing enabled (needed for elapsed time)
++                enabled = false; // no event handles available; stay silent rather than crash
++                return;
++            }
++            e = (void *) h;
++        }
++        span_ev.reserve(MAX_SPANS);
++        span_name.reserve(MAX_SPANS);
++    }
++
++    int start(cudaStream_t s) {
++        if (span_ev.size() >= (size_t) MAX_SPANS) return -1;
++        const int i = (int) span_ev.size();
++        span_ev.push_back(i);
++        span_name.push_back("");
++        cudaEventRecord((cudaEvent_t) ev[2 * i], s);
++        return i;
++    }
++    void stop(int i, const char * name, cudaStream_t s) {
++        if (i < 0) return;
++        cudaEventRecord((cudaEvent_t) ev[2 * i + 1], s);
++        span_name[i] = name ? name : "?";
++    }
++    void finish(cudaStream_t s) {
++        cudaStreamSynchronize(s);
++        for (size_t i = 0; i < span_ev.size(); ++i) {
++            float ms = 0.0f;
++            hipEventElapsedTime(&ms, (hipEvent_t) ev[2 * i], (hipEvent_t) ev[2 * i + 1]);
++            agg_ms[span_name[i]] += ms;
++            agg_n[span_name[i]] += 1;
++        }
++        span_ev.clear();
++        span_name.clear();
++        calls++;
++        if (calls % 8 == 0 || calls == 1) print();
++    }
++    void print() {
++        double total = 0;
++        for (auto & kv : agg_ms) total += kv.second;
++        std::vector<std::pair<std::string, double>> rows(agg_ms.begin(), agg_ms.end());
++        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
++        fprintf(stderr, "\n[edge0-op-timing] graph calls=%d  total_dev=%.1f ms\n", calls, total);
++        fprintf(stderr, "  %-22s %8s %12s %10s\n", "component", "ops", "dev ms", "%dev");
++        for (auto & r : rows) {
++            fprintf(stderr, "  %-22s %8lld %12.2f %9.1f%%\n", r.first.c_str(), agg_n[r.first], r.second,
++                    total > 0 ? 100.0 * r.second / total : 0.0);
++        }
++    }
++};
++static edge0_op_timer g_op_timer;
++} // namespace
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+@@ -4280,6 +4396,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 stream_ctx.concurrent_events.clear();
+             }
+ 
++            g_op_timer.init();
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+                 if (is_concurrent_event_active) {
+@@ -4322,6 +4439,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                int ti = -1;
++                if (g_op_timer.enabled) {
++                    ti = g_op_timer.start(cuda_ctx->stream());
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
+@@ -4357,10 +4479,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 }
+                 GGML_ASSERT(ok);
+ 
++                if (g_op_timer.enabled) {
++                    g_op_timer.stop(ti, ggml_op_name(node->op), cuda_ctx->stream());
++                }
++
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+                }
+             }
++
++            if (g_op_timer.enabled) {
++                g_op_timer.finish(cuda_ctx->stream());
++            }
+         }
+ 
+ #ifdef USE_CUDA_GRAPH
+@@ -4422,6 +4552,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    g_op_timer.init();
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+@@ -4432,7 +4564,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    if (graph->is_enabled() && !g_op_timer.enabled) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+@@ -5156,6 +5288,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_Q8_0:
                      case GGML_TYPE_MXFP4:
                      case GGML_TYPE_NVFP4:
