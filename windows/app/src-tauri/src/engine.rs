@@ -347,6 +347,17 @@ pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u3
         args.push("--load-mode".into());
         args.push(mode.into());
     }
+    // CPU-expert MoE: prefill streams prompt tokens through the CPU-resident experts. A
+    // larger prompt batch makes GPU-offload prefill worth the weight copy and raises the
+    // GPU-offload threshold (measured +15% pp512 at -b/-ub 4096 with the threshold lifted).
+    // Only for CPU-expert plans: a fully-GPU model already prefills fast and the big batch
+    // would grow the compute buffer for no gain.
+    if plan["mode"].as_str() == Some("cpu-experts") {
+        args.push("-b".into());
+        args.push("4096".into());
+        args.push("-ub".into());
+        args.push("4096".into());
+    }
     let tail: Vec<OsString> = vec![
         "--ctx-size".into(),
         ctx.to_string().into(),
