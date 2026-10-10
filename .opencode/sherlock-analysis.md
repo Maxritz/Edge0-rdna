@@ -816,3 +816,41 @@ llama-bench p32/n256 (r=3): n16 31.37+-0.26, n20 **37.60+-0.47**, n24 33.69+-0.4
 - [ ] fp6/fp3 MMVQ (custom bit-unpack vec_dot).
 - [ ] Long-ctx KV-quant sweep at 32k/128k.
 - [ ] Wire b/ub + offload-min-batch into the app's launch defaults.
+
+## [RUN-020] 2026-10-10 - MODE: FULL - fp6/fp3 MMVQ + app prefill lever + turbo3/4 scope
+
+### fp6/fp3 NATIVE MMVQ (the ornith-35b gap)
+- Added vec_dot_rocmfp3_q8_1 and vec_dot_rocmfp6_q8_1 (qi=8, vdr=2, one dp4a per 4 values),
+  type traits, get_vec_dot_q_cuda/get_vdr_mmvq/min-batch tables, and ncols_dst instantiation.
+  Removed fp3/fp6 from the "no kernel" exclusion lists (only fp8/fp2 still fall back).
+- BUG CAUGHT BY TEST (not shipped): first attempt used bit = group*3 in rocmfp3_get4; each
+  group is 4 values * 3 bits = 12 bits, so it must be group*12. Wrong version gave garbage
+  output at 29.7 tok/s; fixed -> coherent.
+- VERIFY (gfx1031, ornith-1.0-35B MoE, types 101/102/104):
+  | metric | before | after |
+  |---|---:|---:|
+  | decode tok/s | 3.92 | 29.86 | (7.6x)
+  | output | coherent | coherent |
+
+### APP PREFILL LEVER
+- `start_gguf` now adds `-b 4096 -ub 4096` when the plan mode is cpu-experts (measured
+  +6.5% pp512 alone, +15.4% cumulative with GGML_OP_OFFLOAD_MIN_BATCH=512, RUN-019).
+  Not applied to fully-GPU models (would grow the compute buffer for no gain). Built.
+
+### turbo3 / turbo4 KV - SCOPE (honest: NOT done)
+- These are KV-cache formats, not weight formats. Adding them means: new KV ggml types +
+  block structs, a KV write path that FWHT-rotates + quantizes 128-value chunks, a
+  matching dequant + inverse-FWHT on the attention read path, and flash-attention kernel
+  support for the type. That is a new subsystem reached through flash-attn, not a
+  vec_dot-style kernel.
+- Not implemented: a partial version either fails to load or silently degrades attention
+  quality. Correctly scoped as a multi-session effort, not shipped half-verified.
+
+### RECOMMENDED LONG-CONTEXT CONFIG (from RUN-019)
+`-ctk q8_0 -ctv q4_0` + n_cpu_moe recomputed against the quantized KV budget: +24% decode
+at 32k vs the f16 default (26.68 -> 33.10 tok/s). The `-b/-ub 4096` lever stacks on top.
+
+### REMAINING
+- turbo3/turbo4 KV (above).
+- fp8(103)/fp2(107) MMVQ kernels if a fixture needs them.
+- GGML_OP_OFFLOAD_MIN_BATCH wiring into the app (needs per-box VRAM testing).
