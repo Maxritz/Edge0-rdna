@@ -662,3 +662,45 @@ llama-bench p32/n256 (r=3): n16 31.37+-0.26, n20 **37.60+-0.47**, n24 33.69+-0.4
 ### NOTE
 - T4 cannot be executed without rocprof; per-kernel counters are unavailable. The util/latency
   evidence (RUN-012) stands in for it until a profiler is present.
+
+## [RUN-016] 2026-10-10 - MODE: FULL - ROCmFPX type bring-up (T2 stage 1) on gfx1031
+
+### BASELINE
+- Fixtures: ornith-1.0-9b-ROCmFPX-STRIX_LEAN (qwen35, types 100/101), gemma-4-E2B
+  ROCMFP4 (gemma4, type 100), ornith-1.0-35B-Q3_0 (qwen35moe, types 101/102/104).
+- Before: all three "failed to load model" (unknown tensor types).
+
+### CHANGE (patch 0007, replayed into wt/win)
+- ggml types ROCMFP4/4_FAST/6/8/3/2 (enum 43..48, COUNT 49); block structs + traits;
+  CPU dequant/quant + generic vec_dot; CUDA dequant to_fp32/to_fp16; GGUF code remap
+  (100/101/102/103/104/107 -> the new ids; 105/106 turbo are KV, excluded).
+- Routing so the types take dequant-to-f16 + cuBLAS: added to supports_op MUL_MAT gate,
+  and excluded in should_use_mmvq + should_fuse_mul_mat_vec_q (else dispatch aborts).
+
+### FINDINGS (each a real defect caught by testing, not assumed)
+| Rank | Component | Evidence | Status |
+| 1 | load path | three fixtures now load + generate (were hard-fail) | FIXED |
+| 2 | cpu vec_dot rounded the scaled weight | gemma-E2B output `<unusedN>`; roundf(0.5)=0 | FIXED (float accumulate) |
+| 3 | prototypes in wrong header | remote build error: 12 undeclared in ggml-cpu.c | FIXED (quants.h) |
+| 4 | MMVQ dispatch abort | `mmvq.cu:1428 fatal error` on generate | FIXED (should_use_mmvq + fuse guard) |
+| 5 | build band strips wt/win edits | git reset --hard wipes direct edits | NOTE (use patches/) |
+
+### VERIFY (ornith-9B, gfx1031)
+| metric | before | after |
+|---|---:|---:|
+| load | fails | loads, ready ~4 s |
+| output | n/a | coherent ("Thinking Process: ...") |
+| decode tok/s | 2.30 (bad vec_dot) | 4.02 |
+| prefill tok/s | 2.72 | 14.63 |
+
+### REMAINING (honest)
+- Decode 4 tok/s is far below native: the dequant-to-f16 path reloads f16 from
+  ggml-common each token. Needs a real ROCmFPX MMVQ kernel (dequant inline, dp4a on
+  RDNA2 / wmma iu4 on RDNA4) -> stage 2.
+- turbo3/turbo4 KV not implemented.
+
+### ACTIONS
+- [ ] Stage 2: ROCmFPX MMVQ kernel (gfx1031 dp4a; gfx1201 iu4 wmma).
+- [ ] Test all three fixtures incl. the 35B MoE (types 101/102/104) end to end.
+- [ ] Autotune/lb/ub + GGML_OP_OFFLOAD_MIN_BATCH prefill levers (MoE offload guide).
+- [ ] Research digest written: docs/research-references.md (DFlash, MoE-Infinity, guide).
