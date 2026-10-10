@@ -421,6 +421,22 @@ def plan_offload(
     for i in range(layers - 1, -1, -1):
         suffix[i] = suffix[i + 1] + per_layer[i]
 
+    # Slow-CPU expert formats: the ROCmFPX low-bit types (quant "typeNNN", ids 100-107)
+    # have no fast CPU vec_dot, so moving their experts to the CPU costs far more than the
+    # VRAM it frees. Measured on ornith-1.0-35B (fp3/fp6): tg128 falls monotonically with
+    # n_cpu_moe (0->26.0, 4->13.9, 8->8.4, 20->4.97), while the same-size Qwen3.5-35B in
+    # native Q4_K peaks at n=20 (34.8). So when the experts are a slow-CPU format and the
+    # whole model fits in system RAM (the driver serves overflow fast), prefer NO CPU
+    # offload. Native formats keep the fit-based choice (and the measured autotune refines).
+    quant = a.get("quant", "")
+    slow_cpu_experts = isinstance(quant, str) and quant.startswith("type")
+    if slow_cpu_experts and ram_gb is not None and a["tensor_bytes"] <= ram_gb * GIB and dense + suffix[0] > budget:
+        notes.append(
+            f"experts use a slow-CPU format ({quant}); CPU offload measured net-negative, "
+            f"keeping them on the GPU (driver/auto placement) is faster"
+        )
+        return out(True, "gpu", 0, 0, dense + suffix[0], ["-ngl", "99"])
+
     if dense + suffix[0] <= budget:
         return out(True, "gpu", 0, 0, dense + suffix[0], ["-ngl", "99"])
     for n in range(1, layers + 1):

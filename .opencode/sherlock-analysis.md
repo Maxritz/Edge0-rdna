@@ -895,3 +895,45 @@ over-offloads (ornith35b 4.2 at its plan vs 24.8 auto-fit).
 ### PROCESS
 - Removed the copied model artifact and the false "fp2 kernel wrong" conclusion (RUN-020
   correction). Rule going forward: test only models already present in C:\x.
+
+## [RUN-022] 2026-10-10 - MODE: FULL (deep) - planner over-offload defect + fix (/debate-3)
+
+### SYMPTOM
+- ornith-1.0-35B (ROCmFPX fp3/fp6/fp4_fast experts) ran at 4.2-4.97 tok/s with the app's
+  planner but 24-26 tok/s with llama.cpp auto-fit (-ngl 99).
+
+### DECOMPOSE - measured n_cpu_moe curve (tg128, p32/n128, r1)
+| n_cpu_moe | 0 | 4 | 8 | 12 | 16 | 20(planner) | 40 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ornith35b (ROCmFPX) | 26.02 | 13.92 | 8.41 | 5.90 | 5.51 | 4.97 | 2.66 |
+| Qwen3.5-35B (Q4_K) | 26.3 | - | - | - | - | 34.76 | 21.9 |
+- ornith35b is MONOTONIC DECREASING (>5x penalty at n=20); Qwen3.5 peaks mid-range.
+
+### FINDINGS
+| rank | component | evidence | status |
+| 1 | planner picks smallest-fit n_cpu_moe regardless of CPU cost | ornith35b n=20: budget 10.04, gpu_est 9.82, cpu_est 8.12 | CONFIRMED |
+| 2 | ROCmFPX experts have a slow CPU vec_dot | monotonic curve vs Q4_K non-monotonic | CONFIRMED |
+| 3 | fitting != optimal | n=0 fits and runs (auto-fit) at 26.0 | CONFIRMED |
+
+### ROOT CAUSE
+`gguf_tool.py plan_offload` optimizes for memory fit only; it has no term for the CPU-side
+execution cost of the expert quant. For slow-CPU formats (ROCmFPX) every expert moved to CPU
+costs more than the VRAM freed, so the "smallest that fits" pick is the worst pick.
+
+### FIX (/debate-3 converged: Option D + B fallback)
+- plan_offload: if expert quant is a slow-CPU format (quant name starts "type", i.e. ROCmFPX
+  100-107) AND the whole model fits in system RAM, return mode "gpu", n_cpu_moe 0 (let
+  llama.cpp auto-place). Native formats keep the fit-based choice; the measured autotune
+  (autotune.rs) still refines when enabled.
+- VERIFIED: ornith35b -> gpu/n0; Qwen3.5-35B -> cpu-experts n20 (unchanged); dense unaffected.
+
+### VERIFY
+| model | before | after |
+|---|---|---|
+| ornith35b plan | cpu-experts n20 (4.97 tg) | gpu n0 (26.0 tg) |
+| Qwen3.5-35B plan | cpu-experts n20 | cpu-experts n20 (unchanged) |
+| ornith9b | gpu | gpu |
+
+### NOTE
+- -ngl 99 auto-fit stays as the guardrail; no new input needed beyond the existing
+  quant + tensor_bytes (tensor_bytes <= ram_gb*GiB). No estimate fabricated.
