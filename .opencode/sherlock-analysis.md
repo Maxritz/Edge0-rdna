@@ -1072,3 +1072,33 @@ not help. Cost ~7x per-KQ-dot ops for 22% KV memory saving. Recommendation: keep
 (already wired, 4.5 bit) and only go lower if a *measured* long-context OOM forces it.
 **Net:** turbo3 KV is declined on measured value grounds; the expert cache is the real
 lever but is a multi-session GPU-backend project, not a one-pass patch.
+
+## [RUN-026] 2026-10-11 - MODE: FULL - spec-decode (MTP) re-evaluation via /debate-3
+
+### QUESTION
+Re-evaluate RUN-008's negative (MTP on CPU-expert MoE: 20.74 -> 17.39 tok/s; acceptance
+0.64-0.70, tau ~3.0). Fundamental or config artifact?
+
+### DEBATE VERDICT (3 agents, 2 rounds, converged)
+- The negative is **fundamental in the CPU-expert-bound regime**: verify runs gamma+1
+  tokens through the SAME CPU experts that are already the bottleneck (RUN-010/018: ~95%
+  of decode). Drafting saves sequential steps, but verification multiplies expert compute
+  by ~(gamma+1)/tau - a net loss when tau stays ~3 and gamma > 1.
+- It **flips positive only** when the target is GPU-resident (verification parallelizes on
+  the GPU) OR when expert caching makes expert access cheap (the tiered-cache goal).
+- Variants: model-native MTP (no training; checkpoint carries the head) > EAGLE/separate
+  drafter (needs training) > DFlash (llama.cpp PR + checkpoints, but block-diffusion ~= MTP
+  regime). All share the same verify-cost gate.
+
+### DECISION RULE (recorded)
+Enable spec-decode ONLY when ALL hold:
+  1. target GPU-resident, OR effective expert cache (>= ~90% hit);
+  2. measured acceptance >= ~0.75 (GPU) / >= ~0.85 (CPU-expert);
+  3. gamma small (<= 4 CPU-expert, <= 8 GPU-resident);
+  4. net measured tok/s gain > 5% in a load-time autotune probe.
+Otherwise default OFF. This MUST be a measured gate, not a compile-time default.
+
+### IMPLICATION for the tiered-cache goal
+Spec-decode **increases expert activations per step**, raising cache/IO pressure. Enabling
+it before the VRAM hot tier exists is counterproductive. Correct order: build the hot tier
+(T1-T3) first; then spec-decode may pay because verify becomes cheap.
