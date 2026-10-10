@@ -335,3 +335,29 @@ Kept opt-in and documented, not made the default.
   `llama_synchronize`. Different cache level: ninfer caches GPU<->host; we cache disk<->RAM.
 - No predictor in ninfer; we have the prerouter (predict-ahead). The two compose: predict (admit
   early) + decayed frequency (retain).
+
+## 15. RAM-constrained test (--mem-budget-mb): mmap beats the pool
+
+Attempted to reproduce the 16 GB / 8 GB-VRAM product target on this box with the process RAM
+cap (`--mem-budget-mb`). gpt-oss-120b, plan `-ngl 99 --n-cpu-moe 34` (GPU 5.3 GiB, CPU 53.7 GiB),
+120 greedy tokens.
+
+| budget | config | decode tok/s | RSS MB |
+|---|---|---:|---:|
+| 20 GiB | mmap | 8.02 | 20291 |
+| 20 GiB | pool 4 GiB | 4.84 | 20283 |
+| 20 GiB | pool 4 GiB freq | 4.56 | 20281 |
+| 16 GiB | mmap | 5.22 | 16210 |
+| 16 GiB | pool 3 GiB | 3.72 | 16199 |
+| 16 GiB | pool 3 GiB freq | 3.80 | 16197 |
+
+Conclusion: **mmap wins at every budget**, and the pool is net-negative. Reason (now understood):
+`--mem-budget-mb` caps the process WORKING SET, not the OS **file/standby cache**, which is
+system-wide and unbounded. On a 96 GiB host the 63 GB file stays cached in RAM regardless of the
+per-process cap, so mmap faults hit RAM; the pool's explicit `ReadFile` does the same read PLUS a
+copy into private pages, and also thrashes its own arena. The pool only pays off when the weights
+are genuinely not resident anywhere, i.e. a machine whose PHYSICAL RAM cannot hold the file.
+
+Implication: the 16 GiB/8 GiB product target cannot be faithfully reproduced with a process cap
+on this box. A real test needs a VM with 16 GiB RAM (or a cold-cache / limited-page-cache harness).
+Until then, treat the pool as unproven on its target and keep it off by default (as it is).
