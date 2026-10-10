@@ -321,6 +321,10 @@ pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u3
     let model = std::path::PathBuf::from(path);
     let mut args: Vec<OsString> = vec!["-m".into(), model.as_os_str().to_owned()];
     args.extend(flags.into_iter().map(OsString::from));
+    // Measured best n_cpu_moe (opt-in): the planner gives the smallest-fitting offload,
+    // but decode peaks below it. Prefer a cached measurement, else sweep once if enabled.
+    let gpu_id = info["gpu"]["id"].as_str().unwrap_or("gpu").to_string();
+    apply_tuned_ncpu_moe(&mut args, path, ctx, &gpu_id, &info);
     let tail: Vec<OsString> = vec![
         "--ctx-size".into(),
         ctx.to_string().into(),
@@ -346,6 +350,70 @@ pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u3
             log_stem: "engine-gguf".into(),
         },
     )
+}
+
+/// Replace a `--n-cpu-moe N` in `args` with the measured-best N. Off by default: with no
+/// cached value and auto-tune disabled, `args` is left exactly as the planner produced.
+/// With `EDGE0_AUTOTUNE=1`, runs the sweep once, caches the result, and uses it.
+fn apply_tuned_ncpu_moe(args: &mut [OsString], model: &str, ctx: u32, gpu: &str, info: &Value) {
+    // Only meaningful when the planner chose an explicit --n-cpu-moe (MoE cpu-experts).
+    let pos = args
+        .windows(2)
+        .position(|w| w[0] == "--n-cpu-moe" && w[1].to_str().is_some_and(|s| s.parse::<u32>().is_ok()));
+    let pos = match pos {
+        Some(i) => i,
+        None => return,
+    };
+    let planned: u32 = args[pos + 1].to_string_lossy().parse().unwrap_or(0);
+    let layers = info["layers"].as_u64().unwrap_or(0) as u32;
+    let state_dir = paths::state_dir();
+
+    let tuned = if let Some(n) = crate::autotune::cached(&state_dir, model, ctx, gpu) {
+        Some((n, f64::NAN))
+    } else if std::env::var("EDGE0_AUTOTUNE").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        let bench = paths::bin_dir().join("llama-bench.exe");
+        let (best, _all) = crate::autotune::sweep(&bench, model, ctx, planned, layers, 64, 64, 1);
+        best.map(|b| {
+            let _ = crate::autotune::store(&state_dir, model, ctx, gpu, b.n_cpu_moe, b.tg);
+            (b.n_cpu_moe, b.tg)
+        })
+    } else {
+        None
+    };
+
+    if let Some((n, tg)) = tuned {
+        if n <= layers {
+            let _ = crate::perf::scope("engine.autotune");
+            args[pos + 1] = n.to_string().into();
+            eprintln!("[autotune] n_cpu_moe {planned} -> {n} (measured tg={tg:.1} tok/s)");
+        }
+    }
+}
+
+/// Measure the decode-optimal n_cpu_moe for a model and cache it. Returns the plotted
+/// candidate results so the caller can show what was actually measured. Runs the real
+/// benchmark; nothing is estimated. `current` seeds the candidate set.
+pub fn autotune_model(path: &str, ctx: u32) -> Result<Value, String> {
+    let info = gguf::inspect_for_gpu(path, ctx)?;
+    let plan = info.get("plan").cloned().unwrap_or(Value::Null);
+    if plan.is_null() {
+        return Err("E-GPU-MISSING no GPU reported; cannot plan expert offload".into());
+    }
+    let planned = plan["n_cpu_moe"].as_u64().unwrap_or(0) as u32;
+    let layers = info["layers"].as_u64().unwrap_or(0) as u32;
+    let gpu_id = info["gpu"]["id"].as_str().unwrap_or("gpu").to_string();
+    let bench = paths::bin_dir().join("llama-bench.exe");
+    let (best, all) = crate::autotune::sweep(&bench, path, ctx, planned, layers, 64, 64, 1);
+    if let Some(b) = &best {
+        crate::autotune::store(&paths::state_dir(), path, ctx, &gpu_id, b.n_cpu_moe, b.tg)?;
+    }
+    Ok(json!({
+        "planned_n_cpu_moe": planned,
+        "layers": layers,
+        "gpu": gpu_id,
+        "best": best.map(|b| json!({ "n_cpu_moe": b.n_cpu_moe, "tg": b.tg })),
+        "measured": all.iter().map(|r| json!({ "n_cpu_moe": r.n_cpu_moe, "tg": r.tg })).collect::<Vec<_>>(),
+    }))
 }
 
 pub fn stop(state: &EngineState) {

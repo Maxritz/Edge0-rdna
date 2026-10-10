@@ -1,5 +1,6 @@
 // lib.rs — Tauri 2 shell assembly: managed state + command surface + window
 // (created in code at 1100×720, clamped to the primary monitor's work area).
+pub mod autotune;
 pub mod catalog;
 pub mod convert;
 pub mod doctor;
@@ -95,6 +96,15 @@ fn model_unload(st: tauri::State<AppState>) -> Value {
 #[tauri::command]
 fn engine_status(st: tauri::State<AppState>) -> Value {
     engine::status(&st.engine)
+}
+
+/// Measure the decode-optimal n_cpu_moe for a local GGUF and cache it (paid once;
+/// honours the same overrides as a load). CPU-benchmark bound, so it runs off-thread.
+#[tauri::command]
+async fn engine_autotune(path: String, ctx: Option<u32>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || engine::autotune_model(&path, ctx.unwrap_or(8192)))
+        .await
+        .map_err(|e| format!("E-AUTOTUNE-JOIN {e}"))?
 }
 
 /// Toggle performance tracing at runtime ("activate it anytime in run"). Enabling
@@ -212,7 +222,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             catalog_get, app_paths, models_installed,
             download_start, download_status, download_cancel,
-            model_load, model_unload, engine_status,
+            model_load, model_unload, engine_status, engine_autotune,
             doctor_run, model_delete,
             gguf_scan, gguf_inspect, gguf_load,
             perf_set, perf_report, perf_reset

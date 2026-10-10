@@ -475,3 +475,130 @@ physical RAM; `E0_POOL_MB` remains an explicit override. Unit test
 ### NEXT RUN
 - If a <=20 GB RAM box is available, validate H2; otherwise next-highest gap is the
   batch-1 GEMV efficiency (RUN-010) via a dispatch/instruction trap.
+
+## [RUN-012] 2026-10-10 - MODE: FULL (trace) - RDNA2 decode optimum + arch instruction map
+
+### BASELINE
+- Box: Ryzen 5 5600X (6c/12t), 47.9 GiB RAM, RX 6700 XT gfx1031 11.98 GiB, ROCm D:\Rocm10.
+- Model Qwen3.5-35B-A3B Q4_K (19.69 GB), ctx 32768, -fa auto, n_predict 256.
+- Method: llama-server + GPU/CPU PDH sampling during decode, and llama-bench (r=3).
+
+### DATA - decode curve (ctx 32768, llama-server)
+| n_cpu_moe | pp tok/s | tg tok/s |
+|---:|---:|---:|
+| 16 | 23.0 | 32.37 |
+| 20 | 21.9 | **35.05** |
+| 24 | 20.6 | 31.33 |
+| 26 (planner pick) | 19.6 | ~29.5 |
+| 28 | 19.1 | 28.30 |
+| 32 | 18.2 | 25.75 |
+| 36 | 17.6 | 23.55 |
+| 40 | 15.8 | 21.93 |
+
+Decode curve (ctx 8192) with resource sampling:
+| n_cpu_moe | 0 | 4 | 8 | 12 | 16 | 20 | 24 | 28 | 32 | 36 | 40 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| tg tok/s | 26.27 | 26.10 | 26.58 | 28.68 | 30.17 | **34.76** | 31.06 | 27.73 | 25.30 | 23.46 | 21.71 |
+| gpu med % | 95.4 | 83.1 | 71 | 63.7 | 52.9 | 54 | 52.9 | 55.4 | 55.4 | 54.7 | 54.7 |
+| cpu med % | 95.8 | 82.3 | 70.8 | 63.9 | 51.5 | 54.1 | 53 | 56.3 | 55.9 | 55.8 | 55 |
+
+llama-bench p32/n256 (r=3): n16 31.37+-0.26, n20 **37.60+-0.47**, n24 33.69+-0.43.
+
+### FINDINGS
+| Rank | Component | Cost / evidence | Status |
+| 1 | decode is non-monotonic in n_cpu_moe; peak ~20 | 35.05 vs 29.5 at the planner's 26 (+19-21%), reproducible both ctx and bench | CONFIRMED |
+| 2 | planner picks the smallest-fitting n (26), not the fastest (20) | plan args --n-cpu-moe 26; budget_gib 7.85 = vram 11.85 - 1.5 headroom - 2.5 KV | CONFIRMED |
+| 3 | GPU and CPU util move in lockstep | both 95% at n0, both ~54% at n>=20 | CONFIRMED |
+| 4 | neither GPU nor CPU is saturated at the peak | 54%/54% at n20 -> latency, not throughput, bound | CONFIRMED |
+
+### ARCH INSTRUCTION MAP (verified in wt/win/ggml/src/ggml-cuda/common.cuh)
+| feature | gfx1031 RDNA2 | gfx1201 RDNA4 | evidence |
+|---|---|---|---|
+| int8 dot | `__builtin_amdgcn_sdot4(a,b,c,false)` | `__builtin_amdgcn_sudot4(true,a,true,b,c,false)` | common.cuh:722-726 |
+| v_dot2_f32_f16 | yes | yes | common.cuh:769-775 (V_DOT2_F32_F16_AVAILABLE) |
+| WMMA (f16/bf16/iu8/iu4/fp8) | none | yes | common.cuh:279-281 (AMD_WMMA_AVAILABLE = RDNA3/RDNA4) |
+| FP8 e4m3 | no | no (CDNA3 only) | common.cuh:857 |
+- Consequence: RDNA2 prefill runs the DP4A (sdot) path (no tensor cores) -> prefill 0.57x
+  RDNA4 (RUN-009). Decode is weight-streaming bound on both -> 0.79x. Consistent.
+- MMQ/ROCmFP4 port target on gfx1201: `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32_gfx12`
+  (and iu8). On RDNA2 no WMMA exists, so the same quant needs a v_dot/dp4a MMVQ path.
+
+### HYPOTHESES
+| ID | Claim | For | Against | Test | Cost | Status |
+| H3 | optimum is a CPU/GPU balance point (latency-bound) | both ~54% util at peak | - | sweep confirms shape | low | **CONFIRMED** |
+| H5 | planner should target the measured peak, not smallest-fit | +19-21% decode at n20 | risk if model/box differs | planner change + re-verify | med | PENDING |
+| H2 | pool helps only when model > RAM | RAM 47.9 >> model 19.7 -> pool off correct | needs <=20 GB box | low-RAM box test | med | PENDING |
+
+### OPTIMISE / ACTIONS
+- [ ] H5: prefer the decode-optimal n_cpu_moe, not the smallest that fits. Options:
+      (a) planner budget accuracy (it under-counts GPU headroom -> over-offloads), and/or
+      (b) an opt-in measured auto-tune of n_cpu_moe over a small candidate set.
+- [ ] Port plan updated: target wmma ...iu4/iu8 on gfx1201; v_dot/dp4a MMVQ on RDNA2.
+
+### NEXT RUN
+- Decide H5 (planner accuracy vs auto-tune) and verify the chosen n reproduces >=35 tok/s
+  and still fits at ctx 32768.
+
+### RUN-012 QUANT PATH MAP (port target per format)
+| operation | gfx1031 (RDNA2) | gfx1201 (RDNA4) | correctness requirement |
+|---|---|---|---|
+| signed INT4 dot | pack 8 nibbles/32-bit; supported integer-dot (v_dot8/sdot/dp4a) | integer dot or IU4 WMMA | correct sign extension + accumulation |
+| unsigned INT4 dot | packed unsigned dot | IU4 WMMA, unsigned input controls | correct zero-point handling |
+| asymmetric INT4 | integer dot + scale/zero-point correction | IU4 WMMA + scale/zero-point correction | correct zero-point compensation |
+| NVFP4 E2M1 | decode packed FP4, apply block scales, FP32/F16 arithmetic or proven integer approx | decode+scale; test native IU4 WMMA or other native path | preserve NVFP4 exponent/mantissa/scale semantics |
+| custom FP4 (integer-friendly) | custom decoder + packed integer dot | custom decoder + IU4 WMMA | quant/dequant conventions must match |
+| FP8 E4M3 / BF8 E5M2 | software convert + arithmetic fallback | native FP8/BF8 WMMA | match format, scaling, saturation, rounding |
+| two-level / dual-scale FP4 | decode and apply both scales | fuse scale application into the matmul/accumulation kernel | exact scale granularity and rounding |
+
+### RUN-012 TODOS
+- [ ] T1 (H5): stop the planner choosing the slowest-fitting n_cpu_moe. Either fix the
+      budget (it under-counts GPU headroom -> over-offloads to CPU) or add an opt-in
+      measured auto-tune of n_cpu_moe over a small candidate set. Verify the chosen n
+      reproduces >=35 tok/s at ctx 32768 and still fits.
+- [ ] T2 (port): ROCmFP4/TurboQuant HIP kernels. gfx1201: `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32_gfx12`
+      (+iu8). gfx1031: no WMMA -> v_dot8/v_dot4 (dp4a) MMVQ path. Enum+sizes+dequant+MMVQ+MUL_MAT_ID+KV dtype.
+- [ ] T3 (H2): validate the pool on a <=20 GB RAM box (pool should help only there).
+- [ ] T4 (RUN-010): batch-1 GEMV efficiency dispatch/instruction trap (deferred; needs rocprof).
+
+## [RUN-013] 2026-10-10 - MODE: HIGH - autotune n_cpu_moe (fixes RUN-012 T1/H5)
+
+### BASELINE
+- RDNA2 box, Qwen3.5-35B-A3B Q4_K, ctx 32768. Planner picks n_cpu_moe 26 -> decode 28.8 tok/s.
+- RUN-012 measured the true peak at n_cpu_moe 20 (35.05 tok/s).
+
+### CHANGE
+- New `windows/app/src-tauri/src/autotune.rs`: `llama-bench -o json` sweep over a candidate
+  set (planner pick, +/- step, and the ~0.6x peak region), parses `avg_ts` per n_cpu_moe,
+  picks the measured best (tie -> smaller n), caches per (model, size, ctx, gpu) in
+  `state/autotune.json`. No estimates: only `llama-bench` numbers are used.
+- `engine::apply_tuned_ncpu_moe`: rewrites `--n-cpu-moe N` to the cached/swept best.
+  Default OFF; `EDGE0_AUTOTUNE=1` runs the sweep once. New command `engine_autotune`.
+
+### BUG FOUND + FIXED DURING VERIFY
+- First probe returned `measured: []` — `llama-bench` has no `--ctx-size` flag (it sizes KV
+  itself; flags are -fitc/-fit-target). Passing it made every run error. Removed; ctx is now
+  only a cache key. (Compiler-free bug, caught by the empty result, not assumed away.)
+
+### VERIFY (RDNA2, real run)
+| stage | planned | applied | decode ms/tok | tok/s |
+|---|---:|---:|---:|---:|
+| before (planner) | 26 | 26 | 34.7 | 28.8 |
+| autotune sweep measured | 26 | best=20 (tg 35.02) | - | - |
+| app after cache | 26 | **20** | 29.3 | **34.1** |
+- Sweep output: 12->28.99, 16->29.07, 20->35.02, 22->33.15, 26->29.77, 30->27.04.
+- App log: `[autotune] n_cpu_moe 26 -> 20`; decode 34.1 tok/s (+18%), matches bench 35.0.
+- `cargo test --lib` 20/20 (8 new autotune tests).
+
+### ARCH ASYNCCOPY/WAIT NOTE (compiler-verified)
+| builtin | gfx1031 | gfx1201 | evidence |
+|---|---|---|---|
+| `__builtin_amdgcn_s_wait_asynccnt` | REJECTED (`needs gfx1250-insts`) | REJECTED (same) | local compile |
+| `__builtin_amdgcn_sched_barrier(0)` | emits `s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)` | emits `s_wait_loadcnt_dscnt` + granular waits | local compile |
+- Use `sched_barrier(0)` for a coarse drain; `s_wait_vscnt`/`s_wait_dscnt` only at real
+  data-dependency boundaries. `cp.async.wait_group` has no direct AMD equivalent here.
+
+### TODOS (remaining, honest)
+- [ ] T2 ROCmFP4/TurboQuant HIP port (gfx1201 wmma iu4/iu8; gfx1031 v_dot/dp4a).
+- [ ] T3 pool-on-<=20-GB-RAM validation.
+- [ ] T4 batch-1 GEMV dispatch/instruction trap (needs rocprof; not installed).
+- [ ] RUN-001 H2 `--load-mode none` A/B; H4 q6_K tilelang GEMM A/B; phase-scope perf sampler.
