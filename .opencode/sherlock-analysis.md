@@ -344,3 +344,65 @@ Other MoE (RDNA2, n_cpu_moe 16): Laguna-XS.2 IQ4_XS 461 pp / **46.21** tg; GLM-4
 ### ACTIONS
 - [ ] Record RDNA2 numbers in benchmarks.md (done below).
 - [ ] Fixed cross-machine comparison captured for the pcie/bandwidth model.
+
+## [RUN-010] 2026-10-10 - MODE: FULL - decode bottleneck (batch-1 GEMV efficiency)
+
+### BASELINE
+- Model Qwen3.5-35B-A3B Q4_K: 40 layers, 256 experts, top-8, embd 2048.
+  file 19.69 GB; expert bytes 18.04 GB; dense trunk = 19.69 - 18.04 = 1.65 GB;
+  KV 81920 B/token (f16). Per expert 1.76 MB; per layer top-8 = 14.1 MB/token.
+- Decode (tg128) measured: RDNA4 gfx1201 n_cpu_moe 8 = 44.1 tok/s (22.7 ms/tok);
+  RDNA2 gfx1031 n_cpu_moe 24 = 34.6 tok/s (28.9 ms/tok).
+
+### DECOMPOSE - bytes moved per decode token (batch 1)
+| n_cpu_moe | GPU layers | VRAM bytes/token | CPU bytes/token |
+|---:|---:|---:|---:|
+| RDNA4 @ 8 | 32 | dense 1.65 GB + 32*14.1 MB = 2.10 GB | 8*14.1 MB = 113 MB |
+| RDNA2 @ 24 | 16 | dense 1.65 GB + 16*14.1 MB = 1.88 GB | 24*14.1 MB = 338 MB |
+
+### INVESTIGATE - observed vs hardware ceiling
+| GPU | peak VRAM BW | achieved BW (VRAM bytes * tok/s) | utilisation |
+|---|---:|---:|---:|
+| RDNA4 gfx1201 | ~640 GB/s | 2.10 GB * 44.1 = 92.6 GB/s | **14%** |
+| RDNA2 gfx1031 | ~320 GB/s | 1.88 GB * 34.6 = 65.0 GB/s | **20%** |
+
+- Implied ceiling if decode saturated VRAM BW: RDNA4 ~305 tok/s, RDNA2 ~170 tok/s.
+  Measured is 6-7x below that -> decode is NOT bandwidth-bound at the achieved rate.
+- The CPU-expert share of the 22.7 ms: 113 MB from RAM at ~50 GB/s ~= 2.3 ms ~= 10%
+  (RDNA4); the remaining ~90% is GPU time running the MMVQ/GEMV path at ~14% BW.
+
+### FINDINGS
+| Rank | Component | Cost / evidence | Status |
+| 1 | batch-1 GEMV path runs at 14-20% of VRAM BW | achieved 92.6/65.0 GB/s vs ~640/320 peak | CONFIRMED |
+| 2 | decode is op/launch/occupancy-bound, not BW-bound | 6-7x gap to the BW ceiling; earlier test-backend-ops f16 m4096 n1 k14336 = 611 GFLOPS (tiny) | CONFIRMED |
+| 3 | CPU-expert share ~10% at n_cpu_moe 8 | 113 MB/token RAM read | SUSPECTED |
+| 4 | VRAM capacity shifts the optimum | RDNA2 n_cpu_moe 24 vs RDNA4 8 (RUN-009) | CONFIRMED |
+
+### HYPOTHESES
+| ID | Claim | For | Against | Test | Cost | Status |
+| H1 | larger decode batch (spec-decode/verify) lifts BW util | BW-bound only when many rows amortise weight reads | MTP measured net-negative on CPU-expert MoE (RUN-008) | re-measure decode util with n=4/8 rows | low | PENDING |
+| H2 | MMVQ kernel occupancy is the limiter | 14-20% BW at batch 1 | no per-kernel counters yet | rocprof on 1 decode step | low | PENDING |
+| H3 | CPU expert matmul cost dominates at high n_cpu_moe | 338 MB/token + ~3B active CPU GEMM | decode peaks mid-sweep, not at 0 | phase-scoped perf.rs (CPU vs GPU window) | med | PENDING |
+| H4 | GPU-resident dense trunk (1.65 GB) dominates at low n_cpu_moe | 1.65 GB is 79% of the 2.10 GB/token at n_cpu_moe 8 | - | sweep shows decode falls at 0 then rises | low | PENDING |
+
+### ANALYSIS
+- "Bandwidth-bound" was too loose for batch-1. The MMVQ/GEMV path reads each weight
+  row exactly once but processes one activation column, so it saturates well below
+  peak BW unless the batch is wide. The lever is not "read fewer bytes" alone; it is
+  "process more columns per weight read" (verification batches) or a better GEMV kernel.
+- This is consistent across both GPUs (RDNA2 20% > RDNA4 14% because RDNA2 peak BW is
+  lower, so the same op time is a larger fraction).
+- RDNA2's DP4A (no WMMA) affects prefill (0.57x) more than decode (0.79x): decode
+  under-utilises compute so the tensor-core gap is not the decode limit.
+
+### ACTIONS
+- [ ] Trap (Dispatch/Dependency): per-kernel counters with rocprof on one decode step
+      (grid dims, occupancy, BW) to name the exact limiter (H2).
+- [ ] Trap (Transfer): phase-scope perf.rs resource sampler to the decode window to
+      split CPU-expert vs GPU time (H3).
+- [ ] Verify H1 by measuring decode BW util at batch 4-8 (verification-style) vs 1.
+- [ ] Keep the RDNA2 engine for a matched rocprof run (RPCS provider over SSH).
+
+### NEXT RUN
+- Execute the Dispatch trap (rocprof) on both GPUs to convert rank-1 from
+  "14-20% BW" to the named kernel + occupancy number.
