@@ -433,10 +433,11 @@ pub fn report_text() -> String {
     }
     if let Some(r) = &g.last_res {
         out.push_str(&format!(
-            "resources: cpu {}  ram {}  gpu {}  vram {}  rebar {}\n",
+            "resources: cpu {}  ram {}  gpu {} (peak {})  vram {}  rebar {}\n",
             opt_pct(r.cpu_pct),
             opt_gb(r.ram_used_gb, r.ram_total_gb),
             opt_pct(r.gpu_util_pct),
+            opt_pct(max_over(&g.resources, |s| s.gpu_util_pct)),
             opt_gb(r.vram_used_gb, r.vram_total_gb),
             r.rebar.as_ref().map(|(s, _, _)| s.clone()).unwrap_or_else(|| "unavailable".into()),
         ));
@@ -504,15 +505,24 @@ fn res_last_json(g: &Perf) -> Value {
         Some(r) => json!({
             "t_ms": r.t_ms,
             "cpu_pct": r.cpu_pct,
+            "cpu_pct_max": max_over(&g.resources, |s| s.cpu_pct),
             "ram_used_gb": r.ram_used_gb,
             "ram_total_gb": r.ram_total_gb,
             "gpu_util_pct": r.gpu_util_pct,
+            "gpu_util_max": max_over(&g.resources, |s| s.gpu_util_pct),
             "vram_used_gb": r.vram_used_gb,
+            "vram_used_max_gb": max_over(&g.resources, |s| s.vram_used_gb),
             "vram_total_gb": r.vram_total_gb,
             "rebar": r.rebar.as_ref().map(|(s, v, src)| json!({ "state": s, "value": v, "source": src })),
         }),
         None => Value::Null,
     }
+}
+
+/// Peak of one resource field across the whole sampling window (the last sample alone
+/// under-reports util during a burst; the peak is the honest "was it ever busy").
+fn max_over<F: Fn(&ResourceSample) -> Option<f64>>(samples: &[ResourceSample], f: F) -> Option<f64> {
+    samples.iter().filter_map(|s| f(s)).reduce(f64::max)
 }
 
 /// Same table as report_text but on an already-locked guard (used by snapshot_json to
@@ -855,6 +865,19 @@ mod tests {
                 assert!((0.0..=100.5).contains(&c), "cpu pct out of range: {c}");
             }
         }
+    }
+
+    #[test]
+    fn resource_peak_is_the_window_max_not_the_last_sample() {
+        let mk = |cpu: Option<f64>, gpu: Option<f64>| ResourceSample { cpu_pct: cpu, gpu_util_pct: gpu, ..Default::default() };
+        let samples = vec![
+            mk(Some(95.0), Some(88.0)),
+            mk(Some(40.0), Some(12.0)),
+            mk(Some(10.0), Some(2.0)),
+        ];
+        assert_eq!(max_over(&samples, |s| s.cpu_pct), Some(95.0));
+        assert_eq!(max_over(&samples, |s| s.gpu_util_pct), Some(88.0));
+        assert_eq!(max_over(&samples, |s| s.vram_used_gb), None, "absent field stays absent");
     }
 
     #[test]
