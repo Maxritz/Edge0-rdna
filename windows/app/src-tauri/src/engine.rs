@@ -369,6 +369,19 @@ pub fn start_gguf(sink: &Arc<dyn Sink>, state: &EngineState, path: &str, ctx: u3
         args.push("-ub".into());
         args.push("4096".into());
     }
+    // Long-context KV compression: quantize the KV cache to free VRAM for more GPU-expert
+    // layers. Measured +24% decode at 32k (RUN-019) with q8_0 keys / q4_0 values. Opt-in via
+    // EDGE0_KV_TYPE (e.g. "q8_0/q4_0"); default leaves the engine's f16 KV. The app does not
+    // pick this automatically because it trades KV precision and is workload-dependent.
+    if let Ok(kv) = std::env::var("EDGE0_KV_TYPE") {
+        if let Some((k, v)) = kv.split_once('/') {
+            let (k, v) = (k.trim(), v.trim());
+            if !k.is_empty() && !v.is_empty() {
+                args.push("-ctk".into()); args.push(k.into());
+                args.push("-ctv".into()); args.push(v.into());
+            }
+        }
+    }
     let tail: Vec<OsString> = vec![
         "--ctx-size".into(),
         ctx.to_string().into(),
