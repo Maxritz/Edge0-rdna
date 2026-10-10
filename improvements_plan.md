@@ -394,3 +394,33 @@ dense hybrid; the MoE sibling is `qwen35moe`.
   E0_POOL_STATS): a precomputed hot-expert ranking. Seeds the pool hot-set and the prerouter.
 - The file we have is for the ROCmFPX model (unloadable), but the format is what our stats dump
   should emit/consume.
+
+## 18. ROCmFPX models in our folders (custom quant types; unloadable by the pin)
+
+Scanned G:\More-models + H:\OLLAMA-Models\GGUF for custom (non-ggml) quant type ids.
+Custom ids observed: 100, 101, 102, 104, 107 (ROCmFP4/FP2/FP3 family), 142 (ternary/PQ2).
+
+### MoE with ROCmFPX types (both UNLOADABLE by our pinned engine)
+| model | arch | size | custom types |
+|---|---|---:|---|
+| Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf | qwen35moe | 12.3 GB | 102x229, 107x214 |
+| ornith-1.0-35B-Q3_0_ROCMFPX.gguf | qwen35moe | 19.3 GB | 101x2, 102x40, 104x268 |
+
+### Dense with ROCmFPX types (also unloadable)
+granite-4.1-3b-Q4_0_ROCMFP4_COHERENT (100); Spark-X2.5-4B-Q4_0_ROCMFP4_STRIX_LEAN (100,101);
+gemma-4-E2B-it-Q4_0_ROCMFP4_COHERENT (100); Ornith-1.0-9b-ROCmFPX-STRIX_LEAN (100,101);
+Ternary-Bonsai-2-27B-PQ2_0 (142).
+
+### Spark-X2.5-4B (spark2_5), the case that proves the point
+- Q4_0_ROCMFP4_STRIX_LEAN: types 100/101, 2.26 GB -> llama-bench "failed to load model".
+- Q8_0 (standard): loads; pp512 6981 tok/s, tg128 95.9 tok/s (dense 4B, fully on GPU).
+- Card is right: stock/our llama.cpp cannot load the ROCmFP4 file.
+
+### Takeaway
+Any model whose tensors use ROCmFPX quant enums (100-107, 142) needs the ROCmFPX llama.cpp
+fork (or an enum+kernel port into our pin). Our pin tops out at ggml's MXFP4(39)/NVFP4(40).
+The loadable equivalents on disk are the standard-quant siblings (e.g. Spark Q8_0, Q4_K_M).
+
+NOTE: the scanner bug that spiked RAM to 89 GB was a string-array skip in the GGUF KV parser
+(seeked 8*n instead of skipping each length-prefixed string); fixed with a per-element skip and
+a length guard.
