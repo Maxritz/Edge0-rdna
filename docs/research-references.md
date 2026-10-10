@@ -111,3 +111,26 @@ quantization**):
 - **Note on the pasted summary**: specific claims there ("139 tok/s", "200k context",
   "-ctv q6_0") are not in the abstracts I verified; treat them as unverified pointers,
   not measured facts. This repo's `benchmarks.md` records only our own measurements.
+
+## DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression
+arXiv:2609.19969 (DeepSeek-AI, Sep 2026). 552B MoE backbone, 1M-token context, multimodal.
+
+What it does (from the abstract):
+- **FP4 KV caching** combined with **cross-layer KV cache reuse in Compressed Sparse Attention 2
+  (CSA2)**. Global KV (always HBM) = **890 bytes/token**, ~1/4 of DeepSeek-V4-Flash.
+- **SWA Bounded Replay**: caps the *persistent* (SSD/host) KV to ~1/8 of V4-Flash.
+- **Causal Encoder-Decoder (CED)**: activates 16B params/token at **decode** but only 8B at
+  **prefill** - i.e. deliberately asymmetric MoE activation so prefill is cheaper.
+
+Applicability to Edge0:
+- **FP4 KV is the direction, and we already started it.** Our KV-quant lever measured +24%
+  decode at 32k (-ctk q8_0 -ctv q4_0); the turbo3/turbo4 KV types in patch 0007 are the
+  foundation for exactly this. Next step: wire a working FP4/Q4-class KV path (needs the
+  fattn vector-kernel instance, see docs/gpu-expert-cache-research.md staging).
+- **Smaller KV directly feeds the GPU-expert-cache goal**: FP4 KV at ~1/4 the bytes frees
+  HBM for the expert pool, so more model stays GPU-resident. These two levers compose.
+- **CSA2 cross-layer KV reuse / SWA Bounded Replay / CED** are DeepSeek *architecture* and
+  deployment choices baked into the model - not runtime toggles for a llama.cpp fork, so not
+  directly portable to arbitrary GGUFs. Recorded as concepts, not shippable levers.
+- Lesson: the industry is pushing KV to FP4 and below; our KV-compression work (turbo3/4 +
+  q8_0/q4_0) is aligned, not speculative.
