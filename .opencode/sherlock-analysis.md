@@ -867,3 +867,31 @@ at 32k vs the f16 default (26.68 -> 33.10 tok/s). The `-b/-ub 4096` lever stacks
   returns false for both), to be enabled only with a real reference-vs-kernel test.
 - Process lesson: test only against models already present in C:\x; never copy/rename model
   files onto a test box (risk of truncated/corrupt transfers producing false conclusions).
+
+## [RUN-021] 2026-10-10 - MODE: HIGH - turbo3/4 KV foundation + fp8/fp2 status + clean sweep
+
+### TURBO3/TURBO4 KV (foundation)
+- Added ggml types TURBO3=49, TURBO4=50; blocks block_turbo3 (50 B) / block_turbo4 (66 B):
+  QK_TURBO=128, an f16 L2 norm + 3/4-bit codebook codes. FWHT-rotated 128-value chunks.
+- quantize/dequantize implemented (ggml-quants.c): FWHT forward on encode, inverse on
+  decode, x*L2norm after. Codebooks + FWHT taken verbatim from the Rust reference.
+- VERIFIED by gcc round-trip (windows/tools/turbo_kv_test.c):
+  turbo3 max_abs_err 0.352 (tol 0.45), turbo4 0.182 (tol 0.25) -> PASS.
+- Engine builds with the types; ornith-9b regression check: 62.53 tok/s, coherent.
+- NOT wired into -ctk/-ctv: a new KV type must be in ggml_cuda_fattn_kv_type_supported
+  (fattn.cu) or flash attention is unavailable and the model fails to load. Needs the KV
+  write path + a fattn vector-kernel instance for the type. Staged, not shipped half-done.
+
+### fp8(103) / fp2(107) MMVQ
+- No valid C:\x fixture exercises them. Left on the verified dequant-to-f16 fallback.
+  Kernel code exists but is gated off (should_use_mmvq false) until a real fixture clears it.
+
+### CLEAN SWEEP (all 11 C:\x models, auto-fit -ngl 99, nothing copied)
+gemma-e2b 131.4 tg; ornith9b 64.1; Qwen3-30B 115.1; Laguna 33.6; Qwen3.5-35B 25.4;
+ornith35b 24.8; Saluki-27B 21.8; GLM-4.7 17.6; L3.2-8X3B 10.1; Qwen3.6-27B 3.4;
+qwen3.8-reap-288 (78 GiB) exceeds RAM. Finding: the planner's smallest-fit n_cpu_moe
+over-offloads (ornith35b 4.2 at its plan vs 24.8 auto-fit).
+
+### PROCESS
+- Removed the copied model artifact and the false "fp2 kernel wrong" conclusion (RUN-020
+  correction). Rule going forward: test only models already present in C:\x.

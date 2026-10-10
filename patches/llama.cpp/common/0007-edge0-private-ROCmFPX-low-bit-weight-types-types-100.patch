@@ -1,31 +1,31 @@
-From 2a519c8a2729dc1713140a626b4a300d5a3bebb9 Mon Sep 17 00:00:00 2001
+From 49b6cd123888d9270cb7f93c4940e18b7e6cce58 Mon Sep 17 00:00:00 2001
 From: edge0 <edge0@local>
 Date: Sat, 10 Oct 2026 17:36:59 +0530
 Subject: [PATCH] edge0 private: ROCmFPX low-bit weight types (types
  100/101/102/103/104/107)
 
 ---
- ggml/include/ggml.h             |  12 +-
- ggml/src/ggml-common.h          |  40 ++++
- ggml/src/ggml-cpu/ggml-cpu.c    |  69 ++++++-
+ ggml/include/ggml.h             |  16 +-
+ ggml/src/ggml-common.h          |  55 ++++
+ ggml/src/ggml-cpu/ggml-cpu.c    |  69 ++++-
  ggml/src/ggml-cpu/ops.cpp       |   6 +
- ggml/src/ggml-cpu/quants.h      |  21 +++
- ggml/src/ggml-cuda/common.cuh   |  32 ++++
- ggml/src/ggml-cuda/convert.cu   | 151 +++++++++++++++
- ggml/src/ggml-cuda/ggml-cuda.cu | 151 ++++++++++++++-
- ggml/src/ggml-cuda/mmvq.cu      |  52 ++++++
- ggml/src/ggml-cuda/vecdotq.cuh  | 115 +++++++++++-
- ggml/src/ggml-quants.c          | 321 ++++++++++++++++++++++++++++++++
- ggml/src/ggml-quants.h          |  14 ++
- ggml/src/ggml.c                 |  50 ++++-
- ggml/src/gguf.cpp               |  12 ++
- 14 files changed, 1033 insertions(+), 13 deletions(-)
+ ggml/src/ggml-cpu/quants.h      |  21 ++
+ ggml/src/ggml-cuda/common.cuh   |  48 ++++
+ ggml/src/ggml-cuda/convert.cu   | 151 +++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 151 ++++++++++-
+ ggml/src/ggml-cuda/mmvq.cu      |  76 ++++++
+ ggml/src/ggml-cuda/vecdotq.cuh  | 168 ++++++++++++-
+ ggml/src/ggml-quants.c          | 429 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-quants.h          |  20 ++
+ ggml/src/ggml.c                 |  66 ++++-
+ ggml/src/gguf.cpp               |  12 +
+ 14 files changed, 1275 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 224bdef92..49f87898c 100644
+index 224bdef92..82d194c5f 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -430,7 +430,17 @@ extern "C" {
+@@ -430,7 +430,21 @@ extern "C" {
          GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
          GGML_TYPE_Q1_0    = 41,
          GGML_TYPE_Q2_0    = 42,
@@ -40,15 +40,19 @@ index 224bdef92..49f87898c 100644
 +        GGML_TYPE_ROCMFP8      = 46,
 +        GGML_TYPE_ROCMFP3      = 47,
 +        GGML_TYPE_ROCMFP2      = 48,
-+        GGML_TYPE_COUNT   = 49,
++        // Edge0 (private): TurboQuant KV-cache formats (FWHT-rotated, 128-value blocks).
++        // Not weight types; intended for -ctk/-ctv. Foundation only (see ggml-quants.c).
++        GGML_TYPE_TURBO3       = 49,
++        GGML_TYPE_TURBO4       = 50,
++        GGML_TYPE_COUNT   = 51,
      };
  
      // [TAG_GGML_PREC]
 diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
-index 1dbbe326d..138b49e23 100644
+index 1dbbe326d..af96998ad 100644
 --- a/ggml/src/ggml-common.h
 +++ b/ggml/src/ggml-common.h
-@@ -218,6 +218,40 @@ typedef struct {
+@@ -218,6 +218,55 @@ typedef struct {
  } block_mxfp4;
  static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
  
@@ -86,10 +90,25 @@ index 1dbbe326d..138b49e23 100644
 +static_assert(sizeof(block_rocmfp3)      == 14, "wrong rocmfp3 block size");
 +static_assert(sizeof(block_rocmfp2)      == 10, "wrong rocmfp2 block size");
 +
++// Edge0 (private): TurboQuant KV blocks. One 128-value block = an f16 L2 norm plus the
++// 32-value sub-block codes; the FWHT rotation is applied over the whole 128 values. The
++// norm is applied after the inverse FWHT on decode.
++#define QK_TURBO 128
++typedef struct {
++    ggml_half norm;   // L2 norm of the 128-value chunk
++    uint8_t qs[48];   // 128 x 3-bit indices (32 per sub-block, 12 bytes each)
++} block_turbo3;       // 50 B
++typedef struct {
++    ggml_half norm;
++    uint8_t qs[64];   // 128 x 4-bit indices (16 bytes per 32)
++} block_turbo4;       // 66 B
++static_assert(sizeof(block_turbo3) == sizeof(ggml_half) + 48, "wrong turbo3 block size");
++static_assert(sizeof(block_turbo4) == sizeof(ggml_half) + 64, "wrong turbo4 block size");
++
  #define QK_NVFP4 64
  #define QK_NVFP4_SUB 16  // sub-block size for per-group scales
  typedef struct {
-@@ -1128,6 +1162,12 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
+@@ -1128,6 +1177,12 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
  GGML_TABLE_END()
  #define kvalues_mxfp4 kvalues_fp4
  
@@ -247,10 +266,10 @@ index 93ea7eeff..3d387f8eb 100644
  void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 2e78ae4fa..99e848f91 100644
+index 2e78ae4fa..152df915b 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1060,6 +1060,38 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
+@@ -1060,6 +1060,54 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
      static constexpr int bs = sizeof(block_nvfp4);
  };
  
@@ -284,6 +303,22 @@ index 2e78ae4fa..99e848f91 100644
 +    static constexpr int qr = 2;
 +    static constexpr int qi = QK_ROCMFPX / (4 * 1); // 8
 +    static constexpr int bs = sizeof(block_rocmfp6);
++};
++
++template<>
++struct ggml_cuda_type_traits<GGML_TYPE_ROCMFP8> {
++    static constexpr int qk = QK_ROCMFPX;
++    static constexpr int qr = 2;
++    static constexpr int qi = QK_ROCMFPX / (4 * 1); // 8
++    static constexpr int bs = sizeof(block_rocmfp8);
++};
++
++template<>
++struct ggml_cuda_type_traits<GGML_TYPE_ROCMFP2> {
++    static constexpr int qk = QK_ROCMFPX;
++    static constexpr int qr = 2;
++    static constexpr int qi = QK_ROCMFPX / (4 * 1); // 8
++    static constexpr int bs = sizeof(block_rocmfp2);
 +};
 +
  template<>
@@ -466,14 +501,14 @@ index 0619f4760..ffa3405a5 100644
              return convert_unary_cont_cuda<half>;
          case GGML_TYPE_BF16:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a9038f1f4..015d53ade 100644
+index a9038f1f4..97267079e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1796,6 +1796,15 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
      ggml_tensor *       src1 = tensor->src[1];
      const ggml_tensor * dst  = tensor;
  
-+    // Edge0: ROCmFP8/ROCmFP2 have no MMVQ/fusion kernel; fall through to dequant + cuBLAS.
++    // Edge0: ROCmFP8/ROCmFP2 have no verified MMVQ kernel; fall through to dequant + cuBLAS.
 +    switch (src0->type) {
 +        case GGML_TYPE_ROCMFP8:
 +        case GGML_TYPE_ROCMFP2:
@@ -489,7 +524,7 @@ index a9038f1f4..015d53ade 100644
      ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
  }
  
-+// Edge0: ROCmFP8/ROCmFP2 have no native MMVQ kernel (4/5 fall back to dequant + cuBLAS).
++// Edge0: ROCmFP8/ROCmFP2 MMVQ unverified -> dequant fallback. fp4/fp3/fp6 verified.
 +static bool ggml_cuda_is_rocmfpx_type(enum ggml_type type) {
 +    switch (type) {
 +        case GGML_TYPE_ROCMFP8:
@@ -706,10 +741,10 @@ index a9038f1f4..015d53ade 100644
                      case GGML_TYPE_Q3_K:
                      case GGML_TYPE_Q4_K:
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index a85155360..d7b72db8d 100644
+index a85155360..74e2cd845 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -48,6 +48,10 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+@@ -48,6 +48,12 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
          case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
          case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
          case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
@@ -717,10 +752,12 @@ index a85155360..d7b72db8d 100644
 +        case GGML_TYPE_ROCMFP4_FAST: return vec_dot_rocmfp4_fast_q8_1;
 +        case GGML_TYPE_ROCMFP3:      return vec_dot_rocmfp3_q8_1;
 +        case GGML_TYPE_ROCMFP6:      return vec_dot_rocmfp6_q8_1;
++        case GGML_TYPE_ROCMFP8:      return vec_dot_rocmfp8_q8_1;
++        case GGML_TYPE_ROCMFP2:      return vec_dot_rocmfp2_q8_1;
          case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
          case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
          case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
-@@ -77,6 +81,10 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+@@ -77,6 +83,12 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
          case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
          case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
          case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
@@ -728,47 +765,57 @@ index a85155360..d7b72db8d 100644
 +        case GGML_TYPE_ROCMFP4_FAST: return VDR_ROCMFP4_Q8_1_MMVQ;
 +        case GGML_TYPE_ROCMFP3:      return VDR_ROCMFP3_Q8_1_MMVQ;
 +        case GGML_TYPE_ROCMFP6:      return VDR_ROCMFP6_Q8_1_MMVQ;
++        case GGML_TYPE_ROCMFP8:      return VDR_ROCMFP8_Q8_1_MMVQ;
++        case GGML_TYPE_ROCMFP2:      return VDR_ROCMFP2_Q8_1_MMVQ;
          case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
          case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
          case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
-@@ -160,6 +168,10 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
+@@ -160,6 +172,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
          case GGML_TYPE_IQ4_XS:  return 5;
          case GGML_TYPE_MXFP4:   return 4;
          case GGML_TYPE_NVFP4:   return 4;
 +        case GGML_TYPE_ROCMFP4:      return 4;
 +        case GGML_TYPE_ROCMFP4_FAST: return 4;
 +        case GGML_TYPE_ROCMFP3:      return 4;
++        case GGML_TYPE_ROCMFP8:      return 4;
++        case GGML_TYPE_ROCMFP2:      return 4;
 +        case GGML_TYPE_ROCMFP6:      return 4;
          case GGML_TYPE_Q2_K:    return 4;
          case GGML_TYPE_Q3_K:    return 4;
          case GGML_TYPE_Q4_0:    return 6;
-@@ -181,6 +193,10 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
+@@ -181,6 +199,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
          case GGML_TYPE_IQ3_XXS: return 7;
          case GGML_TYPE_MXFP4:   return 7;
          case GGML_TYPE_NVFP4:   return 8;
 +        case GGML_TYPE_ROCMFP4:      return 7;
 +        case GGML_TYPE_ROCMFP4_FAST: return 7;
 +        case GGML_TYPE_ROCMFP3:      return 7;
++        case GGML_TYPE_ROCMFP8:      return 7;
++        case GGML_TYPE_ROCMFP2:      return 7;
 +        case GGML_TYPE_ROCMFP6:      return 7;
          case GGML_TYPE_Q2_K:    return 7;
          case GGML_TYPE_Q3_K:    return 5;
          default:                return MMVQ_MAX_BATCH_SIZE;
-@@ -268,6 +284,10 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -268,6 +292,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
          case GGML_TYPE_IQ4_XS:  return 5;
          case GGML_TYPE_MXFP4:   return 5;
          case GGML_TYPE_NVFP4:   return 5;
 +        case GGML_TYPE_ROCMFP4:      return 5;
 +        case GGML_TYPE_ROCMFP4_FAST: return 5;
 +        case GGML_TYPE_ROCMFP3:      return 5;
++        case GGML_TYPE_ROCMFP8:      return 5;
++        case GGML_TYPE_ROCMFP2:      return 5;
 +        case GGML_TYPE_ROCMFP6:      return 5;
          case GGML_TYPE_Q3_K:    return 4;
          case GGML_TYPE_Q4_0:    return 7;
          case GGML_TYPE_Q4_1:    return 7;
-@@ -319,6 +339,14 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+@@ -319,6 +349,16 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
      if (!ggml_is_quantized(type)) {
          return false;
      }
-+    // Edge0: only ROCmFP8/ROCmFP2 have no MMVQ kernel; the nibble + fp3/fp6 formats do.
++    // Edge0: ROCmFP2/ROCmFP8 MMVQ kernels are not verified (fp2 produced wrong output
++    // vs the CPU path; fp8 has no fixture). Route them to the dequant fallback until a
++    // dedicated reference-vs-kernel harness clears them. fp4/fp3/fp6 are verified.
 +    switch (type) {
 +        case GGML_TYPE_ROCMFP8:
 +        case GGML_TYPE_ROCMFP2:
@@ -779,7 +826,7 @@ index a85155360..d7b72db8d 100644
      // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
      // Only list quant-types MMQ supports, others would fall back to cuBLAS.
      if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
-@@ -1322,6 +1350,30 @@ static void mul_mat_vec_q_switch_type(
+@@ -1322,6 +1362,42 @@ static void mul_mat_vec_q_switch_type(
                   nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                   nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
              break;
@@ -807,14 +854,26 @@ index a85155360..d7b72db8d 100644
 +                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
 +                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 +            break;
++        case GGML_TYPE_ROCMFP8:
++            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ROCMFP8>
++                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            break;
++        case GGML_TYPE_ROCMFP2:
++            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ROCMFP2>
++                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            break;
          case GGML_TYPE_NVFP4:
              mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NVFP4>
                  (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index f2a6f2009..9a5f841f7 100644
+index f2a6f2009..3fd35f527 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
-@@ -328,9 +328,122 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
+@@ -328,9 +328,175 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
      return d * sumi;
  }
  
@@ -892,6 +951,59 @@ index f2a6f2009..9a5f841f7 100644
 +}
 +
 +#define VDR_ROCMFP4_Q8_1_MMVQ 2
++
++// Edge0: ROCmFP8 (block_rocmfp8, 33 B, 1 UE4M3 scale, 32 signed int8 values).
++// qi=8, 4 values/call, natural order -> one dp4a against one q8 word.
++#define VDR_ROCMFP8_Q8_1_MMVQ 2
++
++static __device__ __forceinline__ float vec_dot_rocmfp8_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_rocmfp8 * bq8 = (const block_rocmfp8 *) vbq + kbx;
++    const int * q8 = (const int *) bq8_1->qs;
++
++    int sumi = 0;
++#pragma unroll
++    for (int l = 0; l < VDR_ROCMFP8_Q8_1_MMVQ; ++l) {
++        const int idx = iqs + l;
++        const int packed = (bq8->qs[4*idx+0] & 0xFF) | ((bq8->qs[4*idx+1] & 0xFF) << 8)
++                         | ((bq8->qs[4*idx+2] & 0xFF) << 16) | ((bq8->qs[4*idx+3] & 0xFF) << 24);
++        sumi = ggml_cuda_dp4a(packed, q8[idx], sumi);
++    }
++
++    return ggml_cuda_ue4m3_to_fp32(bq8->d) * __low2float(bq8_1->ds) * sumi;
++}
++
++// Edge0: ROCMFP2 (block_rocmfp2, 10 B, 2 UE4M3 scales, 2-bit codebook {-4,-1,1,4}).
++// 4 codes per byte, LSB-first; qi=8, 4 values/call (one nibble-pair word per thread step).
++#define VDR_ROCMFP2_Q8_1_MMVQ 2
++
++static __device__ __forceinline__ int rocmfp2_val(const int c) {
++    return c == 0 ? -4 : c == 1 ? -1 : c == 2 ? 1 : 4;
++}
++
++static __device__ __forceinline__ float vec_dot_rocmfp2_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_rocmfp2 * bq2 = (const block_rocmfp2 *) vbq + kbx;
++    const int * q8 = (const int *) bq8_1->qs;
++
++    int sumi = 0;
++#pragma unroll
++    for (int l = 0; l < VDR_ROCMFP2_Q8_1_MMVQ; ++l) {
++        const int idx = iqs + l;
++        const uint8_t byte = bq2->qs[idx]; // 4 codes for values 4*idx .. 4*idx+3
++        const int packed = (rocmfp2_val(byte & 3) & 0xFF)
++                         | ((rocmfp2_val((byte >> 2) & 3) & 0xFF) << 8)
++                         | ((rocmfp2_val((byte >> 4) & 3) & 0xFF) << 16)
++                         | ((rocmfp2_val((byte >> 6) & 3) & 0xFF) << 24);
++        sumi = ggml_cuda_dp4a(packed, q8[idx], sumi);
++    }
++
++    const float d = (iqs < 4 ? ggml_cuda_ue4m3_to_fp32(bq2->d[0]) : ggml_cuda_ue4m3_to_fp32(bq2->d[1]))
++                    * __low2float(bq8_1->ds);
++    return d * sumi;
++}
 +// Edge0: ROCmFP4 (block_rocmfp4, 18 B, 2 UE4M3 scales, nibble codebook).
 +static __device__ __forceinline__ float vec_dot_rocmfp4_q8_1(
 +    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
@@ -939,10 +1051,10 @@ index f2a6f2009..9a5f841f7 100644
                                          const void * __restrict__ vbq,
                                          const block_q8_1 * __restrict__ bq8_1,
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 1ebc50a76..ea756a72c 100644
+index 1ebc50a76..c53f6b598 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
-@@ -5325,6 +5325,317 @@ void quantize_row_iq2_s_ref(const float * GGML_RESTRICT x, block_iq2_s * GGML_RE
+@@ -5325,8 +5325,425 @@ void quantize_row_iq2_s_ref(const float * GGML_RESTRICT x, block_iq2_s * GGML_RE
      quantize_iq2_s(x, y, 1, k, NULL);
  }
  
@@ -1257,10 +1369,118 @@ index 1ebc50a76..ea756a72c 100644
 +    }
 +}
 +
++// =============================== TurboQuant KV (Edge0 private)
++// FWHT-rotated, 128-value blocks; a per-chunk L2 norm in f16 plus 3/4-bit codebook
++// codes. Foundation (types + quant/dequant); flashing the attention path is staged.
++static void ggml_fwht_f32(float * x, int n) {
++    for (int h = 1; h < n; h <<= 1) {
++        for (int i = 0; i < n; i += 2*h) {
++            for (int j = i; j < i + h; ++j) {
++                const float a = x[j], b = x[j + h];
++                x[j] = a + b;
++                x[j + h] = a - b;
++            }
++        }
++    }
++    const float s = 1.0f / sqrtf((float) n);
++    for (int i = 0; i < n; ++i) { x[i] *= s; }
++}
++
++static const float ggml_turbo3_cb[8] = {
++    -0.1883972972f, -0.1181399059f, -0.0665857641f, -0.0216044751f,
++     0.0216041461f,  0.0665854520f,  0.1181396281f,  0.1883970748f,
++};
++static const float ggml_turbo4_cb[16] = {
++    -0.2376389871f, -0.1808080141f, -0.1417777640f, -0.1102646123f,
++    -0.0828112376f, -0.0577640422f, -0.0341540905f, -0.0113168380f,
++     0.0112761586f,  0.0341139667f,  0.0577250301f,  0.0827738972f,
++     0.1102295202f,  0.1417455465f,  0.1807794468f,  0.2376153882f,
++};
++
++static uint8_t ggml_turbo_nearest(const float * cb, int n, float v) {
++    uint8_t best = 0; float bd = fabsf(cb[0] - v);
++    for (int i = 1; i < n; ++i) { const float d = fabsf(cb[i] - v); if (d < bd) { bd = d; best = (uint8_t) i; } }
++    return best;
++}
++
++void dequantize_row_turbo3(const block_turbo3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    const int nb = k / QK_TURBO;
++    float t[QK_TURBO];
++    for (int i = 0; i < nb; i++) {
++        for (int c = 0; c < 128; ++c) {
++            const int bit = c * 3, by = bit >> 3, sh = bit & 7;
++            int idx = x[i].qs[by] >> sh;
++            if (sh > 5 && by + 1 < 48) { idx |= (x[i].qs[by + 1] << (8 - sh)); }
++            t[c] = ggml_turbo3_cb[idx & 7];
++        }
++        ggml_fwht_f32(t, QK_TURBO);
++        const float nrm = GGML_FP16_TO_FP32(x[i].norm);
++        for (int c = 0; c < 128; ++c) { y[i*QK_TURBO + c] = t[c] * nrm; }
++    }
++}
++
++void dequantize_row_turbo4(const block_turbo4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    const int nb = k / QK_TURBO;
++    float t[QK_TURBO];
++    for (int i = 0; i < nb; i++) {
++        for (int c = 0; c < 128; ++c) {
++            const uint8_t byte = x[i].qs[c >> 1];
++            const int idx = (c & 1) ? (byte >> 4) : (byte & 0x0f);
++            t[c] = ggml_turbo4_cb[idx];
++        }
++        ggml_fwht_f32(t, QK_TURBO);
++        const float nrm = GGML_FP16_TO_FP32(x[i].norm);
++        for (int c = 0; c < 128; ++c) { y[i*QK_TURBO + c] = t[c] * nrm; }
++    }
++}
++
++void quantize_row_turbo3_ref(const float * GGML_RESTRICT x, block_turbo3 * GGML_RESTRICT y, int64_t k) {
++    const int nb = k / QK_TURBO;
++    for (int i = 0; i < nb; i++) {
++        const float * xs = x + i*QK_TURBO;
++        float nrm = 0.0f; for (int c = 0; c < QK_TURBO; ++c) { nrm += xs[c]*xs[c]; }
++        nrm = sqrtf(nrm);
++        y[i].norm = GGML_FP32_TO_FP16(nrm);
++        const float inv = nrm > 1e-10f ? 1.0f / nrm : 0.0f;
++        float t[QK_TURBO];
++        for (int c = 0; c < QK_TURBO; ++c) { t[c] = xs[c] * inv; }
++        ggml_fwht_f32(t, QK_TURBO);
++        memset(y[i].qs, 0, sizeof(y[i].qs));
++        for (int c = 0; c < QK_TURBO; ++c) {
++            const int idx = ggml_turbo_nearest(ggml_turbo3_cb, 8, t[c]);
++            const int bit = c*3, by = bit >> 3, sh = bit & 7;
++            y[i].qs[by] |= (uint8_t)(idx << sh);
++            if (sh > 5 && by + 1 < 48) { y[i].qs[by + 1] |= (uint8_t)(idx >> (8 - sh)); }
++        }
++    }
++}
++
++void quantize_row_turbo4_ref(const float * GGML_RESTRICT x, block_turbo4 * GGML_RESTRICT y, int64_t k) {
++    const int nb = k / QK_TURBO;
++    for (int i = 0; i < nb; i++) {
++        const float * xs = x + i*QK_TURBO;
++        float nrm = 0.0f; for (int c = 0; c < QK_TURBO; ++c) { nrm += xs[c]*xs[c]; }
++        nrm = sqrtf(nrm);
++        y[i].norm = GGML_FP32_TO_FP16(nrm);
++        const float inv = nrm > 1e-10f ? 1.0f / nrm : 0.0f;
++        float t[QK_TURBO];
++        for (int c = 0; c < QK_TURBO; ++c) { t[c] = xs[c] * inv; }
++        ggml_fwht_f32(t, QK_TURBO);
++        memset(y[i].qs, 0, sizeof(y[i].qs));
++        for (int c = 0; c < QK_TURBO; ++c) {
++            const int idx = ggml_turbo_nearest(ggml_turbo4_cb, 16, t[c]);
++            if (c & 1) { y[i].qs[c >> 1] |= (uint8_t)(idx << 4); } else { y[i].qs[c >> 1] |= (uint8_t) idx; }
++        }
++    }
++}
++
  // =============================== data validation
  
++
  static bool validate_float(float f, size_t i) {
-@@ -5656,6 +5967,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+     if (isinf(f)) {
+         fprintf(stderr, "ggml_validate_row_data: found inf value at block %zu\n", i);
+@@ -5656,6 +6073,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
          case GGML_TYPE_I64:
              // nothing to validate
              break;
@@ -1270,7 +1490,9 @@ index 1ebc50a76..ea756a72c 100644
 +        case GGML_TYPE_ROCMFP8:
 +        case GGML_TYPE_ROCMFP3:
 +        case GGML_TYPE_ROCMFP2:
-+            // UE4M3 scales and packed codes: every byte value is valid
++        case GGML_TYPE_TURBO3:
++        case GGML_TYPE_TURBO4:
++            // packed codes + f16/UE4M3 scales: every byte value is valid
 +            GGML_UNUSED(data);
 +            GGML_UNUSED(nb);
 +            break;
@@ -1278,10 +1500,10 @@ index 1ebc50a76..ea756a72c 100644
              {
                  fprintf(stderr, "%s: invalid type %d\n", __func__, type);
 diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
-index 75188f1af..e6fa29210 100644
+index 75188f1af..901c4cdef 100644
 --- a/ggml/src/ggml-quants.h
 +++ b/ggml/src/ggml-quants.h
-@@ -55,6 +55,20 @@ GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GG
+@@ -55,6 +55,26 @@ GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GG
  GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  GGML_API void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  
@@ -1299,14 +1521,20 @@ index 75188f1af..e6fa29210 100644
 +GGML_API void quantize_row_rocmfp3_ref(const float * GGML_RESTRICT x, block_rocmfp3 * GGML_RESTRICT y, int64_t k);
 +GGML_API void quantize_row_rocmfp2_ref(const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k);
 +
++// Edge0 (private): TurboQuant KV formats (FWHT-rotated, 128-value blocks)
++GGML_API void dequantize_row_turbo3(const block_turbo3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++GGML_API void dequantize_row_turbo4(const block_turbo4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++GGML_API void quantize_row_turbo3_ref(const float * GGML_RESTRICT x, block_turbo3 * GGML_RESTRICT y, int64_t k);
++GGML_API void quantize_row_turbo4_ref(const float * GGML_RESTRICT x, block_turbo4 * GGML_RESTRICT y, int64_t k);
++
  GGML_API void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  GGML_API void dequantize_row_q3_K(const block_q3_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  GGML_API void dequantize_row_q4_K(const block_q4_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index a286083b9..8a8b86858 100644
+index a286083b9..544f9c537 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -763,7 +763,55 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+@@ -763,7 +763,71 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
          .type_size                = sizeof(block_nvfp4),
          .is_quantized             = true,
          .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
@@ -1360,6 +1588,22 @@ index a286083b9..8a8b86858 100644
 +        .is_quantized             = true,
 +        .to_float                 = (ggml_to_float_t) dequantize_row_rocmfp2,
 +        .from_float_ref           = (ggml_from_float_t) quantize_row_rocmfp2_ref,
++    },
++    [GGML_TYPE_TURBO3] = {
++        .type_name                = "turbo3",
++        .blck_size                = QK_TURBO,
++        .type_size                = sizeof(block_turbo3),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_turbo3,
++        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_ref,
++    },
++    [GGML_TYPE_TURBO4] = {
++        .type_name                = "turbo4",
++        .blck_size                = QK_TURBO,
++        .type_size                = sizeof(block_turbo4),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4,
++        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_ref,
      },
      [GGML_TYPE_Q2_K] = {
          .type_name                = "q2_K",
