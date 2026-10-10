@@ -98,6 +98,37 @@ are co-located with each checkpoint and load automatically, so
   and that model's adapters; upgrading adapters swaps adapter
   files only — the base stays read-only and is never merged.
 
+### Benchmark: Windows / RDNA2 (llama.cpp-derived engine)
+
+Measured by us on a single **RX 6700 XT (gfx1031, RDNA2, 12 GB)** + 48 GB RAM,
+Windows ROCm, with the Windows engine in this repo (`windows/`). Command:
+`llama-bench -ngl 99 -fa auto -p 512 -n 128 -r 2`, expert offload chosen by the
+repo's planner (`gguf_tool.py`). Rendered tokens are correct in every row.
+
+| Model | arch | MoE | L | E / topK | offload (n_cpu_moe) | pp512 | tg128 |
+|---|---|---|--:|--:|--:|--:|--:|
+| gemma-4-E2B-it Q4_0 ROCMFP4 | gemma4 | no | 35 | - | full GPU | 1643.9 | 131.3 |
+| ornith-1.0-9b ROCmFPX | qwen35 | no | 32 | - | full GPU | 438.4 | 64.1 |
+| Qwen3-30B-A3B-abliterated i1-Q2_K | qwen3moe | yes | 48 | 128/8 | cpu-experts 7/48 | 272.1 | 69.6 |
+| Laguna-XS.2 IQ4_XS | laguna | yes | 40 | 256/8 | cpu-experts 21/40 | 389.2 | 39.9 |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | qwen35moe | yes | 40 | 256/8 | cpu-experts 22/40 | 323.6 | 33.7 |
+| GLM-4.7-Flash-APEX-I | deepseek2 | yes | 47 | 64/4 | cpu-experts 27/47 | 357.6 | 24.9 |
+| Underdog-Saluki-27B IQ2-mix-MTP | qwen35 | no | 65 | - | full GPU | 178.4 | 21.8 |
+| L3.2-8X3B-MOE Q8_0 | llama | yes | 28 | 8/2 | cpu-experts 16/28 | 423.0 | 11.3 |
+| qwen3.8-flash-next-reap-288 Q4_K_M | qwen4exp | yes | 48 | 288/10 | 78 GiB, all experts CPU | 60.1 | 10.4 |
+| ornith-1.0-35B Q3_0 ROCmFPX | qwen35moe | yes | 40 | 256/8 | cpu-experts 22/40 | 207.6 | 3.6 |
+| Qwen3.6-27B-AEON BF16-MTP Q5_K_M | qwen35 | no | 65 | - | VRAM over budget | 97.2 | 2.8 |
+
+ROCmFPX rows use the low-bit weight formats added in this fork: **ornith-9b
+(types 100/101) decodes at 64.1 tok/s** via the native MMVQ dp4a kernel;
+**ornith-35b (types 101/102/104)** is slower because only the fp4 layers have the
+native kernel while fp6/fp3 still take the dequant fallback.
+
+Findings from the sweep: on every **CPU-expert MoE** prefill is the weak axis
+(200-430 pp512 while the dense 9B hits 438 on far fewer bytes), because prompt
+tokens stream experts through the CPU; and `tg128` tracks how much of the model
+stays in VRAM.
+
 ### Quality
 
 All benchmarks were run by us with [OpenCompass](https://github.com/open-compass/opencompass)
