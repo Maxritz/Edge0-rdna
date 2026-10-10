@@ -186,3 +186,36 @@ MTP is correct and accepts well, but is **net-negative** for expert-offloaded Mo
 verification batch's CPU matmul cost scales with batch size, so the extra verified tokens are
 not free. Spec decode only pays when the target is GPU-resident (weights read once per batch).
 `--spec-draft-ngl 99` (GPU draft) recovers most of the loss but not to baseline.
+
+## 16. Dense Qwen3.8-27B (qwen35) + MoE engine-path runs (RX 9070 XT 16 GiB)
+
+Correction: `Qwen3.8-27B-WebGGUF-Q4_0` and `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp` are **dense**
+(`qwen35`, 65 layers, 0 experts, 27.32B) - not MoE. `Muse-Glimmer-30B-UD-Q8_K_XL` is also
+**dense** (`muse-glimmer`, 0 experts, 32.3 GB). The MoE Qwen3.8s are `qwen4exp` (Flash-Next).
+
+### Dense 27B, full offload vs `-ngl` sweep (llama-bench, `-p 512 -n 128 -fa auto -t 16`)
+| model | size | ngl=0 (iGPU/CPU) | ngl=32 (~8 GiB) | ngl=48 (~12 GiB) | ngl=99 (full) |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.8-27B WebGGUF Q4_0 | 14.63 GiB | 1.68 / 47 | 3.21 / 64 | 5.42 / 150 | **11.09 / 249** |
+| Qwen3.8-27B GSQ-RCO IQ3_S-mtp | 11.28 GiB | 2.10 / 42 | 3.49 / 66 | 6.55 / 130 | **29.81 / 755** |
+
+(tg128 tok/s / pp512 tok/s). Dense 27B is memory-bound and needs near-full GPU residency to be
+usable; the smaller IQ3_S (11.3 GiB) fits cleanly and is ~2.7x the Q4_0 (14.6 GiB, spill). The
+IQ3_S-mtp file carries an embedded MTP head (`blk.N.nextn.eh_proj/enorm/hnorm/shared_head_norm`).
+
+### MoE through the ENGINE path (llama-server + planner n_cpu_moe + --pool-mb 2048 + --flash-attn auto)
+| model | arch | experts | quant | n_cpu_moe | decode |
+|---|---|---:|---|---:|---:|
+| Tiel-Coder-35B-A3B-MTP-APEX | qwen35moe | 256 | Q5_K | 20 | 10.03 |
+| Unsloth-Ornith-1.5-35B-A3B-UD-Q4_K_XL | qwen35moe | 256 | Q4_K | 15 | 11.09 |
+| ornith-35b-Q8_0 | qwen35moe | 256 | Q8_0 | 26 | 6.98 |
+
+(128 greedy tokens, single run.) These carry the 2 GB pool, which is a net loss on this 96 GiB box
+(page-cache-resident mmap is faster than explicit pool reads), so they read below the bare sweeps.
+
+### Simulated memory targets (planner, ctx 4096)
+- 8 GiB VRAM / 16 GiB RAM: gpt-oss-120b -> `n_cpu_moe 34` (GPU 5.3, CPU 53.7 GiB).
+- 8 GiB VRAM / 10 GiB RAM: `n_cpu_moe` unschedulable; CPU needs ~54 GiB > 10 GiB -> disk-bound
+  worst case (the pool/streaming target; not faithfully reproducible on this host, see section 15).
+- 12 GiB VRAM / 16 GiB RAM: same class; dense 27B needs ~full residency, so it runs at the
+  ngl=48-ish rates above (~5-7 tok/s), MoE offloads experts.
