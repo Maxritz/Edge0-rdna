@@ -1,4 +1,4 @@
-From 89ca54d3f8934d7dc820071f5374b56f5e7a8e53 Mon Sep 17 00:00:00 2001
+From 6936a4f2d2e81689c6d70467f5523b3aa0b1e669 Mon Sep 17 00:00:00 2001
 From: edge0 <edge0@local>
 Date: Sat, 10 Oct 2026 17:36:59 +0530
 Subject: [PATCH] edge0 private: ROCmFPX low-bit weight types (types

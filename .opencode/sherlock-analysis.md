@@ -1006,3 +1006,69 @@ costs more than the VRAM freed, so the "smallest that fits" pick is the worst pi
 ### EVIDENCE GAP
 - The llama-server "KV self size" line was not captured (server invocation timed out); the
   block-size arithmetic above is from ggml-common.h struct layouts and is exact.
+
+## [RUN-025] 2026-10-11 - MODE: FULL - GPU expert cache reachability (definitive) + path decision
+
+### EVIDENCE - used-expert copy branch (ggml-backend.cpp:1693) reachability
+Probe added at the branch head (E0_EXPERT_PROBE). Six configs tested, NONE fired:
+| config | fired |
+|---|---|
+| -ngl 99 --n-cpu-moe 20, p32 (decode) | no |
+| -ngl 99 --n-cpu-moe 20, p2048 | no |
+| -ngl 99 --n-cpu-moe 20, p512, GGML_OP_OFFLOAD_MIN_BATCH=8192 | no |
+| -ngl 99 --n-cpu-moe 30, p512, GGML_OP_OFFLOAD_MIN_BATCH=1 | no |
+| -ngl 99 -ot "exps=CPU", p512 | no |
+| -ngl 99 all-GPU, p32 | no |
+- op_offload IS enabled by default (common.cpp:1747 op_offload = !no_op_offload; no_op_offload=false),
+  so the scheduler gate is open, yet the branch body still never runs.
+- Conclusion: the `used-expert copy` path requires a specific placement (expert weights in
+  a HOST buffer AND MUL_MAT_ID scheduled on the GPU device) that our single-GPU AMD
+  configuration does not produce for these models. The fork-side residency hook is therefore
+  not a viable lever here. Probe reverted (no dead code).
+
+### WHY (root cause of unreachability)
+`ggml_backend_sched_backend_from_buffer` returns a backend for a weight's buffer; the
+op-offload branch runs only when `src_backend_id == n_backends-1` (the weight is on the LAST
+backend, i.e. CPU when present) AND a higher-prio backend both supports and wants to offload
+the op. With one AMD GPU + CPU, MoE expert tensors placed via --n-cpu-moe/-ot end up with the
+op assigned to CPU (no GPU offload), so no host->GPU expert copy happens. The path is for the
+multi-backend case where a GPU outranks the CPU backend that holds the weights.
+
+### IMPLICATION for "run it all on GPU"
+- A VRAM expert cache must be implemented at the **CUDA/HIP backend level** (own the expert
+  tensor storage + a device-side cache + D2D copy), NOT at the scheduler copy branch. That is
+  the FATE design and is a substantial, GPU-backend change.
+- Alternatively, keep the model fully GPU-resident by shrinking it: **expert pruning (REAP)**
+  to drop cold experts, or a smaller quant. That reduces total size below VRAM and needs no
+  cache at all.
+
+### CROSS-LAYER KV REUSE (the DeepSeek trick) - assessment
+- DeepSeek-V4.1-Flash's 890 B/token comes from **CSA2**: sharing KV across layers (compressed
+  sparse attention) + CED (fewer active params at prefill). Per-layer KV is not independent;
+  a shared/compressed latent is stored once and reused.
+- Porting that to a llama.cpp fork for arbitrary GGUFs is an architectural change (the model
+  must be trained for its KV-sharing topology), so NOT a runtime lever we can add.
+- A weaker, model-agnostic cousin that IS implementable: KV **prefix/radix caching** across
+  requests (reuse the prefill KV of a shared prompt) - big for agent loops, no architecture
+  change. llama.cpp already has prompt cache; extend it in the app layer.
+
+### DECISION / NEXT
+- Expert cache: viable only as a GPU-backend implementation (large) or avoided via REAP
+  pruning (model-side). Not a fork-scheduler patch.
+- Cross-layer KV: architecture-only (not portable); prompt/prefix cache reuse is the
+  implementable win.
+
+### DEBATE VERDICT (/debate-3, 3 agents, 2 rounds)
+**Problem A (expert cache) — worth it, but GPU-backend work.** The scheduler branch is
+unreachable; the fix is a **CUDA/HIP-side expert cache** (custom idea: intercept where the
+backend stores expert tensors, keep a device pool + residency bitmap, D2D copy on first
+touch) — NOT a scheduler patch. The agents' code was pseudocode with invented APIs
+(`ggml_cuda_expert_cache`, custom buffer type), so it is NOT shipped; it needs a real,
+staged CUDA-backend implementation with device tests. Verdict: real 2x-class lever, large
+effort.
+**Problem B (turbo3 KV) — NOT worth it.** 3 agents converged: turbo3 needs an FWHT basis
+change on K or Q; the existing `attn_rot_k/v` is RoPE-style rotation, NOT FWHT, so it does
+not help. Cost ~7x per-KQ-dot ops for 22% KV memory saving. Recommendation: keep **q4_0 KV**
+(already wired, 4.5 bit) and only go lower if a *measured* long-context OOM forces it.
+**Net:** turbo3 KV is declined on measured value grounds; the expert cache is the real
+lever but is a multi-session GPU-backend project, not a one-pass patch.
