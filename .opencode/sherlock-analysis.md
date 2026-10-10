@@ -704,3 +704,57 @@ llama-bench p32/n256 (r=3): n16 31.37+-0.26, n20 **37.60+-0.47**, n24 33.69+-0.4
 - [ ] Test all three fixtures incl. the 35B MoE (types 101/102/104) end to end.
 - [ ] Autotune/lb/ub + GGML_OP_OFFLOAD_MIN_BATCH prefill levers (MoE offload guide).
 - [ ] Research digest written: docs/research-references.md (DFlash, MoE-Infinity, guide).
+
+## [RUN-018] 2026-10-10 - MODE: FULL (trace) - per-op device timing + all-model sweep
+
+### BASELINE
+- gfx1031, all 11 models in C:\x, engine = this fork. Plan chosen by gguf_tool.py.
+- New: EDGE0_CUDA_OP_TIMING=1 -> per-node HIP event pairs in ggml_backend_cuda_graph_compute,
+  aggregated by ggml_op_name (disables CUDA graphs + MoE fusion while profiling).
+
+### PER-OP COMPONENT TABLE (Qwen3.5-35B-A3B, n_cpu_moe 22, decode window)
+| component | ops | dev ms | %dev |
+|---|---:|---:|---:|
+| MUL_MAT | 25963 | 1906.75 | 32.5% |
+| ADD | 28538 | 704.99 | 12.0% |
+| MUL | 18661 | 596.16 | 10.1% |
+| RMS_NORM | 12689 | 437.69 | 7.4% |
+| UNARY | 11294 | 388.74 | 6.6% |
+| GET_ROWS | 6709 | 248.96 | 4.2% |
+| MUL_MAT_ID | 3561 | 215.17 | 3.7% |
+| CPY | 3988 | 168.82 | 2.9% |
+| SCALE | 4168 | 156.63 | 2.7% |
+| ARGSORT/SOFT_MAX/CLAMP/SUM_ROWS/DIV/GATED_DELTA_NET/SSM_CONV/ROPE/FLASH_ATTN_EXT | - | <2% each | - |
+
+### FINDINGS
+| rank | component | evidence | status |
+| 1 | device time is NOT the decode wall | total_dev 5875 ms over 1536 graphs ~= 3.8 ms/graph, but decode is ~130 ms/token | CONFIRMED |
+| 2 | MUL_MAT dominates device time (dense projections) | 32.5%; MUL_MAT_ID (experts) only 3.7% because most experts run on CPU | CONFIRMED |
+| 3 | decode is CPU-expert + scheduling bound, not GPU-kernel bound | device 3.8 ms/graph vs 130 ms/token: >95% is outside the timed op window | CONFIRMED |
+| 4 | Qwen3.5 MoE already uses hybrid linear attention | GATED_DELTA_NET + SSM_CONV present in the graph | CONFIRMED |
+
+### IMPLICATION
+- Per-op GPU timing alone cannot see the CPU-expert cost; the wall is the CPU-side
+  MUL_MAT_ID for offloaded experts + per-graph scheduling. To move decode, cut bytes read
+  per token (KV quant frees VRAM -> more experts on GPU) or cut CPU expert work.
+- Next lever: asymmetric KV (-ctk q8_0 -ctv q4_0) frees VRAM for more GPU experts.
+
+### ALL-MODEL SWEEP (llama-bench -p512 -n128 -r2, RDNA2)
+| model | arch | MoE | offload | pp512 | tg128 |
+|---|---|---|---:|---:|---:|
+| gemma-4-E2B ROCMFP4 | gemma4 | no | full GPU | 1643.9 | 131.3 |
+| ornith-9b ROCmFPX | qwen35 | no | full GPU | 438.4 | 64.1 |
+| Qwen3-30B i1-Q2_K | qwen3moe | yes | cpu-exp 7/48 | 272.1 | 69.6 |
+| Laguna-XS.2 IQ4_XS | laguna | yes | cpu-exp 21/40 | 389.2 | 39.9 |
+| Qwen3.5-35B Q4_K | qwen35moe | yes | cpu-exp 22/40 | 323.6 | 33.7 |
+| GLM-4.7-Flash | deepseek2 | yes | cpu-exp 27/47 | 357.6 | 24.9 |
+| Saluki-27B IQ2-mix-MTP | qwen35 | no | full GPU | 178.4 | 21.8 |
+| L3.2-8X3B Q8_0 | llama | yes | cpu-exp 16/28 | 423.0 | 11.3 |
+| qwen3.8 reap-288 Q4_K | qwen4exp | yes | all-CPU | 60.1 | 10.4 |
+| ornith-35b ROCmFPX | qwen35moe | yes | cpu-exp 22/40 | 207.6 | 3.6 |
+| Qwen3.6-27B BF16-MTP Q5_K | qwen35 | no | over-budget | 97.2 | 2.8 |
+
+### ACTIONS
+- [ ] Test asymmetric KV (-ctk q8_0 -ctv q4_0) on the 35B; measure decode + context.
+- [ ] fp6/fp3 native MMVQ (finish ornith-35b fast path).
+- [ ] Long-context (>=118k) sweep with quantized KV.

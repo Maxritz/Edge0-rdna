@@ -74,3 +74,40 @@ Applicability to Edge0:
 - Confirms our `--n-cpu-moe` approach. We do NOT currently tune `-b/-ub` or
   `GGML_OP_OFFLOAD_MIN_BATCH` -> concrete, cheap prefill levers to test.
 - NUMA matters only on multi-socket; our boxes are single-socket.
+
+## KV-cache papers (DeepSeek-V2/MLA, PiKV, TransMLA, KV survey)
+
+Verified: DeepSeek-V2 arXiv:2405.04434, PiKV arXiv:2508.06526, TransMLA
+arXiv:2502.07864, KV survey arXiv:2603.20397. All resolve on arXiv.
+
+**DeepSeek-V2 / MLA** (arXiv:2405.04434). Multi-head Latent Attention compresses the
+KV cache into a low-rank latent vector: -93.3% KV vs DeepSeek 67B, up to 5.76x
+generation throughput. This is an *architecture* choice baked into DeepSeek-family
+weights, not a runtime toggle. Our engine already handles `deepseek2` (GLM-4.7) via the
+engine's MLA KV path.
+
+**TransMLA** (arXiv:2502.07864). Converts a GQA pretrained model into MLA post-training
+(93% KV compression, 10.6x speedup @8K on LLaMA-2-7B), then fine-tune ~6B tokens to
+recover quality. Requires retraining per model; needs a target model we control.
+
+**PiKV** (arXiv:2508.06526). Expert-sharded KV storage + MoE-routing-aware KV partition
+across GPUs. Targets multi-GPU datacenter serving; single-GPU laptop is out of scope.
+
+**KV Cache Optimization Strategies** survey (arXiv:2603.20397). Taxonomy of eviction,
+compression, hybrid memory, attention variants, combinations; maps techniques to
+deployment scenarios including edge devices. Good menu; no new mechanism.
+
+Applicability to Edge0 (verdict: **use the survey as a menu; the portable lever is KV
+quantization**):
+- **KV quantization is the immediately actionable one.** Our per-op trace (RUN-018)
+  shows decode is CPU-expert bound while VRAM holds KV. Asymmetric quantization
+  (`-ctk q8_0 -ctv q4_0` / `-ctv q6_0`) shrinks the KV bytes/token, freeing VRAM to move
+  more expert layers onto the GPU -> directly raises the decode-favorable `n_cpu_moe`.
+  Already cheaply testable on our engine.
+- **MLA/TransMLA**: only for DeepSeek-family weights (MLA native) or a GQA model we are
+  willing to retrain. Not a runtime toggle.
+- **PiKV / streaming-eviction (H2O/StreamingLLM)**: multi-GPU or endless-agent-loop
+  concerns; not our current bottleneck.
+- **Note on the pasted summary**: specific claims there ("139 tok/s", "200k context",
+  "-ctv q6_0") are not in the abstracts I verified; treat them as unverified pointers,
+  not measured facts. This repo's `benchmarks.md` records only our own measurements.
