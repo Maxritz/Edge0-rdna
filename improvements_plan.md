@@ -528,3 +528,47 @@ path + (for KV) KV-cache dtype integration. Our vendor tree is never patched in 
 Note: our pool's tt_bytes already defers to ggml_type_size, so registering the enum+sizes makes
 the pool SIZE these experts automatically; the kernels are what actually run them. For the KV
 lever specifically (Stage A) no MoE kernel is needed - it is a KV cache dtype + dequant.
+
+## 21. ROCmFPX codes (fetched) - the actual recipes
+
+Source: charlie12345/ROCmFPX, `ggml/rocmfpx/{rocmfpx.h,rocmfpx.c,rocmfp2_reference.h}` + `ggml/src/ggml-common.h`.
+
+### Scale: UE4M3 (finite unsigned E4M3), one byte per group
+    valid bytes 0x00..0x7e (0x7f invalid -> value 0)
+    e==0 -> mant * 2^-10 ; else (8+mant) * 2^(exp-11)     [exp=e>>3, mant=e&7]
+    127-entry table rocmfpx_scale_table[]; nearest = binary search; byte 0 = zero scale.
+
+### Block layouts (byte-exact)
+    block_rocmfp2 { uint8_t qs[8];  uint8_t e[2]; }  = 10 B / 32 vals (2.50 bpw, dual scale, S40 codebook)
+    block_rocmfp3 { uint8_t qs[12]; uint8_t e[2]; }  = 14 B / 32 vals (3.50 bpw)
+    block_rocmfp6 { uint8_t qs[24]; uint8_t e[2]; }  = 26 B / 32 vals (6.50 bpw)
+    block_rocmfp8 { int8_t  qs[32]; uint8_t e;   }  = 33 B / 32 vals (8.25 bpw)
+    block_rocmi4  { uint8_t qs[16]; uint8_t e;   }  = 17 B / 32 vals (signed int4, no codebook)
+    Q4_0_ROCMFP4 (types 100/101) layout = 17 B (qs[16]+e), 10-level codebook (see note)
+
+### Codebooks (decode)
+    FP2 S40 (frozen MORD): values[4] = {-4,-1,+1,+4};  2-bit code (code&3)
+    FP3: mag[4]={0,1,2,4}; value = (code&4)? -mag[code&3] : mag[code&3];  3-bit
+    FP6: mag = code&31; value = (code&32)? -(mag==0?32:mag) : mag;  signed range [-32,31]; 6-bit
+    FP8: value = (int8_t)qs;  * scale ;  range [-127,127];  8-bit
+
+### Dequant (exact)
+    val = codebook_decode(code) * scale
+    FP2: for half in 0,1: scale=e[half]; for j in 0..15: code=(qs[half*4 + j/4] >> (2*(j%4))) & 3
+    FP3: 8 codes packed 3 bytes: c0..c7 (see rocmfpx_fp3_unpack8); scale per half
+    FP6: 4 codes packed 3 bytes: c0..c3 (rocmfpx_fp6_unpack4); scale per half
+    FP8: y[i] = qs[i]*scale (single scale)
+
+### The two files I still need to grab (NOT in rocmfpx/*)
+- **TurboQuant dequant/codebook (types 105 TURBO3_0 / 106 TURBO4_0).** Block structs ARE in
+  ggml-common.h (have them): block_turbo3_0 {ggml_half d; uint8_t qs[12]} = 14 B / 32 vals;
+  block_turbo4_0 {ggml_half d; uint8_t qs[16]} = 18 B / 32 vals. d = FP16 L2-norm. The codebook
+  + dequant live in ggml/src/ggml-quants.c (237 KB).
+- **ROCmFP4 (types 100/101) block struct + dequant + the 10-level codebook ("Codebook10")** also
+  in ggml/src/ggml-quants.c (the rocmfpx.h comment references rocmfp4_scale_ue4m3_half "in
+  rocmfp4.c" but no such file is in ggml/rocmfpx/).
+
+Both remaining items are in `ggml/src/ggml-quants.c` (raw:
+https://raw.githubusercontent.com/charlie12345/ROCmFPX/main/ggml/src/ggml-quants.c). That file is
+237 KB and will truncate a single fetch; grab it with a range/grep (offset around the
+`turbo` / `rocmfp4` symbols) rather than whole.
