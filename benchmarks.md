@@ -268,3 +268,20 @@ KV cache at n_cpu_moe 20 (llama-bench, short ctx): f16 37.9 tg vs q8_0/q4_0 37.2
 ROCmFPX ornith-1.0-35B byte breakdown (why 3.6 tok/s): fp3=8.95 GB, Q5_K=5.17 GB,
 fp6=4.38 GB, fp4_fast=0.54 GB. The native MMVQ kernel covers fp4_fast only (0.54 GB);
 fp3+fp6 = 13.3 GB run the dequant-to-f16 fallback. fp6/fp3 MMVQ is the next kernel.
+
+## 21. Long-context KV lever validated (RDNA2, 35B, ctx 32768)
+
+`llama-server --ctx-size 32768`, Qwen3.5-35B-A3B Q4_K, decode (n=128):
+
+| KV | n_cpu_moe | decode tok/s |
+|---|---:|---:|
+| f16 | 26 (planner fit) | 26.68 |
+| q8_0/q4_0 | 26 | 28.17 |
+| q8_0/q4_0 | 20 | **33.10** |
+| q8_0/q4_0 | 16 | 27.12 (spills) |
+
+At 32k the f16 KV is ~2.7 GB vs ~0.7 GB quantized (q8_0/q4_0). Freeing that VRAM lets
+`n_cpu_moe` drop 26 -> 20 (6 more expert layers on the GPU), lifting decode +24%
+(26.68 -> 33.10 tok/s). n16 regresses: the model spills. So the recommended long-context
+config is **`-ctk q8_0 -ctv q4_0` with n_cpu_moe from the planner recomputed against the
+quantized KV budget**. The KV quant itself (same n) is +5.6%.
