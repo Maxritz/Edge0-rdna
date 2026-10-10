@@ -424,3 +424,21 @@ The loadable equivalents on disk are the standard-quant siblings (e.g. Spark Q8_
 NOTE: the scanner bug that spiked RAM to 89 GB was a string-array skip in the GGUF KV parser
 (seeked 8*n instead of skipping each length-prefixed string); fixed with a per-element skip and
 a length guard.
+
+## 17b. ROCmFPX PR #42 diff (Vulkan-only) - specifics
+
+- Scope: `ggml-vulkan.cpp` pipeline registration + GLSL shaders ONLY. PR states "no HIP,
+  CUDA, GGUF, or quantizer-format change". So NOT portable to our HIP build as-is.
+- Adds `GGML_TYPE_Q2_0_ROCMFPX` (FP2) to: `matmul` (prefill), `matmul_id` (routed/MoE),
+  `mul_mat_vec_*` (MMVQ), and `mul_mat_vec_id_*` (routed MMVQ), each with a Q8_1 integer-dot
+  variant. Decode only sped up once the ROUTED `mul_mat_vec_id` + Q8_1 path existed; before
+  that decode fell back to dequantize-and-dot.
+- Key trick: branchless SWAR codebook unpack (exhaustively tested over all 256 packed bytes):
+    codes = (packed | packed<<12) & 0x000f000f;
+    codes = (codes | codes<<6)    & 0x03030303;
+    high  = (codes >> 1)          & 0x01010101;
+    lanes = 0xfcfcfcfc + 3*codes - high - (high<<8);   // -> {-4,-1,1,4}
+  No table lookup, no branches: expands a packed byte to the codebook in-register.
+- Portable to us as PRINCIPLE: a dedicated ROUTED mmvq (MUL_MAT_ID) with native packed
+  decode + integer dot. We run HIP, not Vulkan, so the GLSL is not reusable, but the same
+  specialization applied to ggml-cuda (HIP) mmvq would be.
