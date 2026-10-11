@@ -143,7 +143,8 @@ struct Slot {
 
 struct Pool {
     bool        on = false;
-    int         mode_arc = 1;      // 1 = ARC (default), 0 = legacy freq eviction
+    int         mode_evict = 1;   // 1 = ARC (default), 0 = legacy freq, 2 = RAND (null model for A/B)
+    uint64_t    rng = 0x9E3779B97F4A7C15ULL;   // only touched by mode_evict==2, under g.mtx
     void *      dev = nullptr;
     size_t      cap = 0;
     size_t      slot_bytes = 0;
@@ -250,7 +251,7 @@ int e0_take_slot() {
 
 void e0_insert(int s, int tid, int64_t id, bool promote_t2) {
     const uint64_t k = e0_key(tid, id);
-    if (g.mode_arc) {
+    if (g.mode_evict == 1) {
         e0_list_del(g.b1, k); e0_list_del(g.b2, k);
         if (promote_t2) { g.t2.push_back(k); g.slots[s].list = LIST_T2; }
         else            { g.t1.push_back(k); g.slots[s].list = LIST_T1; }
@@ -278,6 +279,31 @@ void e0_freq_prune() {
             auto it = g.index.find(g.slots[cand[i].slot].key);
             if (it != g.index.end()) { e0_free_slot(it->second); g.index.erase(it); ++g.evicts; g.evict_bytes += g.slot_bytes; }
         }
+    }
+}
+
+// ── RANDOM eviction (E0_VRAM_EVICT=rand) ──
+// The null model. Picks victims uniformly from the evictable set, with no reference to
+// recency or frequency. If ARC does not beat this at equal pool size, the policy is
+// contributing nothing and the size is the only variable that matters.
+void e0_rand_prune() {
+    std::vector<int> cand;
+    for (auto & kv : g.index) {
+        int s = kv.second;
+        if (g.slots[s].list == LIST_PIN) continue;
+        if (g.step - g.slots[s].ts <= (uint64_t) g.keep_steps) continue;
+        cand.push_back(s);
+    }
+    size_t cap = e0_min<size_t>((size_t) g.max_swaps, cand.size());
+    if (!cap) return;
+    for (size_t i = 0; i < cap; ++i) {                             // partial Fisher-Yates
+        size_t j = i + (size_t) ((g.rng = g.rng * 6364136223846793005ULL + 1442695040888963407ULL) >> 33) % (cand.size() - i);
+        int tmp = cand[i]; cand[i] = cand[j]; cand[j] = tmp;
+    }
+    for (size_t i = 0; i < cap; ++i) {
+        auto it = g.index.find(g.slots[cand[i]].key);
+        if (it == g.index.end()) continue;
+        e0_free_slot(it->second); g.index.erase(it); ++g.evicts; g.evict_bytes += g.slot_bytes;
     }
 }
 
@@ -330,7 +356,7 @@ const void * e0_vram_base_cb(const ggml_tensor * src0, int64_t id, size_t nb02) 
         int s = rit->second;
         g.slots[s].ts = g.step;
         if (g.hot_n > 0) g.slots[s].freq += 1.0;
-        if (g.mode_arc) {
+        if (g.mode_evict == 1) {
             if (g.slots[s].list == LIST_T1) { e0_list_del(g.t1, k); g.t2.push_back(k); g.slots[s].list = LIST_T2; }
             else if (g.slots[s].list == LIST_T2) { e0_list_del(g.t2, k); g.t2.push_back(k); }
         }
@@ -339,7 +365,7 @@ const void * e0_vram_base_cb(const ggml_tensor * src0, int64_t id, size_t nb02) 
     }
 
     bool promote_t2 = false;
-    if (g.mode_arc) {                                            // ghost hit adapts the T1 target
+    if (g.mode_evict == 1) {                                       // ghost hit adapts the T1 target
         auto in_b1 = std::find(g.b1.begin(), g.b1.end(), k) != g.b1.end();
         auto in_b2 = std::find(g.b2.begin(), g.b2.end(), k) != g.b2.end();
         if (in_b1) { int d = (int) e0_max<size_t>(1, g.b2.size() / e0_max<size_t>(1, g.b1.size())); g.p = e0_min(g.c, g.p + d); e0_list_del(g.b1, k); promote_t2 = true; }
@@ -376,8 +402,12 @@ bool init(int mb, const e0_vram_tensor * tensors, size_t n, void * gguf) {
     }
     if (ts.empty()) return false;
 
-    g.mode_arc = 1;
-    if (const char * ev = getenv("E0_VRAM_EVICT")) g.mode_arc = (strcmp(ev, "freq") != 0);
+    g.mode_evict = 1;
+    if (const char * ev = getenv("E0_VRAM_EVICT")) {
+        if      (!strcmp(ev, "freq")) g.mode_evict = 0;
+        else if (!strcmp(ev, "rand")) g.mode_evict = 2;
+        else if (!strcmp(ev, "arc"))  g.mode_evict = 1;
+    }
     if (const char * hn = getenv("E0_VRAM_HOT_N")) g.hot_n = atoi(hn);
     if (const char * hd = getenv("E0_VRAM_HOT_DECAY")) { double d = atof(hd); if (d > 0.0 && d < 1.0) g.hot_decay = d; }
     if (const char * hu = getenv("E0_VRAM_HOT_UPDATE")) { int v = atoi(hu); if (v > 0) g.hot_update = v; }
@@ -412,8 +442,9 @@ bool init(int mb, const e0_vram_tensor * tensors, size_t n, void * gguf) {
 
     ggml_edge0_set_vram_hooks(e0_vram_base_cb, e0_vram_has_cb);   // attach to patch surface #8
 
+    const char * evn = g.mode_evict == 1 ? "arc" : (g.mode_evict == 0 ? "freq" : "rand");
     fprintf(stderr, "[vram-trace] INIT: slots=%d slotB=%zu poolMB=%zu tensors=%zu evict=%s hotN=%d hotDecay=%.3f hotUpd=%d keep=%d\n",
-            g.nslots, g.slot_bytes, want >> 20, g.tens.size(), g.mode_arc ? "arc" : "freq",
+            g.nslots, g.slot_bytes, want >> 20, g.tens.size(), evn,
             g.hot_n, g.hot_decay, g.hot_update, g.keep_steps);
     fflush(stderr);
     return true;
@@ -427,7 +458,8 @@ void step() {
         for (auto & cv : g.counts) for (auto & c : cv) c *= g.hot_decay;   // decayed counts (LayerOptions.hot_decay)
         e0_hot_update();
     }
-    if (!g.mode_arc) e0_freq_prune();
+    if (!g.mode_evict) e0_freq_prune();
+    else if (g.mode_evict == 2) e0_rand_prune();
     else {
         // Idle ARC entries are released in bounded batches so the next accesses can
         // repopulate; the scan runs only here, never on the compute path.

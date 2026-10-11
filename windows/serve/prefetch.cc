@@ -986,6 +986,9 @@ bool edge0_pref_init(llama_model * model, llama_context * ctx, int pool_mb, cons
     const char * gg   = (gguf_path && *gguf_path) ? gguf_path : getenv("E0_GGUF");   // primary CLI channel = model path
     if (pool_mb > 0) g.pool_mb = pool_mb;                                        // --pool-mb formal CLI
     else if (const char * pmb = getenv("E0_POOL_MB")) g.pool_mb = atoll(pmb);    // env fallback (harness/debug); runnable without the sidecar
+    // Must be parsed HERE, not at its later use site: the early return below tests g.vram_mb, so
+    // reading it after the gate made E0_VRAM_MB alone a no-op (the tier only came up with --pool-mb).
+    if (const char * vm = getenv("E0_VRAM_MB")) g.vram_mb = atoll(vm);
     g.xlayer = getenv("E0_XLAYER") != nullptr;                                   // FATE (T3): training-free cross-layer gate prefetch
     if (const char * xp = getenv("E0_XLAYER_PCT")) { float v = (float) atof(xp); if (v > 0.f && v < 1.f) g.x_pct = v; }
     if (const char * xe = getenv("E0_XLAYER_EXT_MAX")) { int v = atoi(xe); if (v > 0) g.x_ext_max = v; }
@@ -1082,7 +1085,6 @@ bool edge0_pref_init(llama_model * model, llama_context * ctx, int pool_mb, cons
     if (const char * pm = getenv("E0_PIN_MAX_MB")) g.pin_cap = (size_t) atoll(pm) << 20;
     // Device-resident hot-expert tier (L0). Independent of the RAM pool and the head: it
     // pools every *.ffn_*_exps.weight and is served by the HIP backend hook (patch #8).
-    if (const char * vm = getenv("E0_VRAM_MB")) g.vram_mb = atoll(vm);
     if (g.vram_mb > 0) {
         // Its own read handle (falls back to g.fh when the RAM pool shares one).
         HANDLE vh = g.fh;
