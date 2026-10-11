@@ -1102,3 +1102,75 @@ Otherwise default OFF. This MUST be a measured gate, not a compile-time default.
 Spec-decode **increases expert activations per step**, raising cache/IO pressure. Enabling
 it before the VRAM hot tier exists is counterproductive. Correct order: build the hot tier
 (T1-T3) first; then spec-decode may pay because verify becomes cheap.
+
+## [RUN-027] 2026-10-11 - MODE: BUILD - VRAM hot-expert tier (T1+T2) + profiling unblock
+
+### T1+T2 IMPLEMENTED AND BUILD-VERIFIED (compile only, no GPU run)
+New: `windows/serve/vram_pool.{h,cc}` (501 lines) - device L0 expert pool.
+New: `patches/llama.cpp/common/0008-edge0-private-surface-8-vram-hot-expert-base-hook.patch` - HIP per-expert base hook.
+Edited: `windows/serve/prefetch.{h,cc}`.
+
+What it does:
+- Bounded device pool (`hipMalloc`, auto-shrinks to free VRAM), `E0_VRAM_MB` (default 0 = OFF).
+- Hit returns the DEVICE base (D2D, no PCIe/NVMe). Miss fills one slot (H2D) from the RAM L1 pool or a whole-block GGUF read.
+- Hot top-N per layer with decayed counts (`E0_VRAM_HOT_N`, `E0_VRAM_HOT_DECAY`, `E0_VRAM_HOT_UPDATE`), pinned, never evicted.
+- ARC eviction (T1/T2 recent-frequent + B1/B2 ghosts, adaptive target p). `E0_VRAM_EVICT=freq` keeps legacy recency/freq for A/B.
+- On-step reduce: only touches slots used last step (cheap); frequency decay only at `hot_update_interval` boundaries.
+
+Where it attaches - NOT the patch-#7 resolver. `ggml_edge0_mmid_base` is called only by
+`ggml/src/ggml-cpu/*` and its `const char*` return is dereferenced by CPU vec_dot as a HOST
+pointer; a device pointer is unusable there. The HIP backend never calls it - it computes each
+expert base itself (`src0->data + i02*nb02`). So the VRAM tier hooks the HIP per-expert
+`mul_mat_id` fallback instead (the FATE path, and the only host-side per-expert base site).
+`ggml_edge0_set_vram_hooks(base_fn, has_fn)`; a pooled tensor forces the fallback via
+`ggml_cuda_mul_mat_id_needs_sync -> true` (also disgraph-captured).
+
+VERIFIED:
+- `windows\scripts\vendor-build.ps1 -Backend hip` (reset to PIN, `git am` all 8 patches, rebuild):
+  493/493, `llama-server.exe` linked, ZERO compiler errors.
+- `ggml_edge0_set_vram_hooks` really exports: `GGML_BACKEND_BUILD` is defined PRIVATE for
+  backend targets (ggml/src/CMakeLists.txt), so the macro resolves to `__declspec(dllexport)`
+  from ggml-hip.dll; the DLL links clean (would be LNK2001 otherwise).
+- No stubs/TODOs/placeholders in vram_pool.{h,cc} or patch 0008.
+- Default OFF: hooks default null, zero behavior change.
+
+HONEST LIMITATIONS (not measured - GPU box untouched this session):
+1. Compile-verified only. No runtime/throughput number taken.
+2. Requires experts to run on the GPU; with all experts on CPU (`--n-cpu-moe` full) the HIP
+   backend never sees them and the pool stays bypassed.
+3. Per-expert fallback is slower than the fused MMVQ path - intended for decode hot residency.
+4. `src/edge0/*.cc` is UNITY-built (one TU) - internals isolated in `namespace e0_vram_impl`,
+   and `min`/`max` from windows.h are undef'd. Load-bearing; the first unity build failed.
+
+### PROFILING UNBLOCK (correction to "rocprof absent = Dispatch trap blocked")
+`rocprof`/`rocprofiler` are absent on the box, but we DO have working GPU profilers:
+- `G:\AMD-Ai\hip_tracer\build\hip_tracer_launcher.exe` - an amdhip64 proxy DLL shim
+  (amdhip64_7.dll / amdhip64_7_real.dll) that interposes HIP and writes CSVs
+  (test_trace.csv .. test_trace8.csv already produced). This gives per-HIP-call and
+  per-kernel timings WITHOUT rocprof.
+- `G:\AMD-Ai\AMD-AI-COMPASS` - user's own port of AMD perf tracing.
+=> The Dispatch trap (RUN-012) is NOT blocked; it needs hip_tracer wiring, not rocprof.
+Use it on the remote box to get the per-kernel counters we have been missing.
+
+### T4 (turbo3 KV) - CORRECTION to "not viable, declined"
+Verified in `wt/win/src/llama-kv-cache.cpp` (upstream `attn_rot_*`, PR #21038 family):
+- Line 321-325: `attn_rot_k = !disable && n_embd_head_k_all>0 && ggml_is_quantized(type_k) && n_embd_head_k()%64==0`
+- Line 334-338: same for V.
+- Line 344-349: precomputed HADAMARD matrices `attn_rot_hadamard[n]` in HOST memory for
+  n = 64,128,256,... up to max(n_embd_head_k_all, n_embd_head_v_all).
+- Line 1437-1456: `build_input_k_rot()` builds an nrot x nrot F32 "attn_inp_k_rot" input;
+  nrot = smallest power of 2 >= 64 dividing n_embd_head_k_all.
+- Gated off by `LLAMA_ATTN_ROT_DISABLE`.
+=> The fork ALREADY applies an orthonormal Hadamard rotation to quantized K and V. TurboQuant's
+transform is FWHT = fast Walsh-Hadamard, i.e. the same family. So the FORWARD rotation
+infrastructure already exists; turbo3 would need (a) the inverse Hadamard in its dequant and
+(b) Q rotated into the same basis, which `attn_inp_k_rot` already feeds into the graph.
+This materially softens the earlier "declined" verdict. NOT yet re-measured; re-open as T4.
+
+### RAM-capped pool validation - READY TO RUN
+User can pull 32 GiB to land on 16 GiB SYS RAM. Measured model sizes from C:\x (remote):
+ornith35b 18.29, Qwen3.5-35B-A3B-Q4_K_XL 18.63, Qwen3.6-27B-AEON-Q5_K_M 18.21,
+L3.2-8X3B-Q8_0 18.21, GLM-4.7-Flash-APEX 17.89, Laguna-XS.2-IQ4_XS 16.84 GiB.
+Every one overruns 16 GiB, so the RAM L1 pool + NVMe cold tier are forced to engage
+(unreachable at 48 GiB, where the whole model sits in page cache). 24 GiB would prove
+nothing (ornith35b and Qwen3.5-35B both fit).

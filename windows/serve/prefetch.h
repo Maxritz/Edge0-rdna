@@ -23,6 +23,15 @@
 //   E0_PIN_MAX_MB=<n>                                      hot-zone byte cap (default 3072)
 //   E0_POOL_WSHEAD_MB=<n>                                  headroom for the working-set hard cap
 //                                                          (cap = base + hot + obs + headroom; default 1024)
+//   E0_XLAYER=1                                            FATE cross-layer gate prefetch (T3,
+//                                                          arXiv:2502.12224): predict consumer layer c from
+//                                                          owner c-1's captured gate input (no training, no
+//                                                          sidecar); replaces the head. Needs the F32 gate +
+//                                                          the layer-inp capture channel (patch 0002).
+//   E0_XLAYER_PCT=<f>                                       confidence percentile cutoff (default 0.75)
+//   E0_XLAYER_EXT_MAX=<n>                                   cap on the percentile prefetch set (default 64)
+//   E0_XLAYER_PF_TOK=<n>                                    prefill ubatch tokens aggregated for popularity (default 64)
+//   E0_XLAYER_PF_TOK_MAX=<n>                                prefill per-layer popularity cap (default 96)
 // [pref-trace] prints head/sticky/random accounting = proof the mechanism is live.
 #pragma once
 

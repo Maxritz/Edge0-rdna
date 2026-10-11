@@ -5,11 +5,11 @@ Source: `/completeness audit` (2026-10-11). Goal: three-tier expert residency
 (`windows/serve/`) has RAM+NVMe; the hot tier and predictor are missing.
 
 ## MISSING (Windows/HIP engine)
-- [ ] **T1 — VRAM hot-expert tier.** Port the MLX `hot`/`staged` design
+- [x] **T1 — VRAM hot-expert tier.** Port the MLX `hot`/`staged` design
       (`python/src/edge0/streaming/`, `docs/streaming.md`) into `windows/serve/prefetch.cc`:
       a VRAM (device) expert pool with residency bitmap, D2D/H2D fill, served via the
       patch-#7 `ggml_edge0_mmid_base` resolver. Owner: agent-pool.
-- [ ] **T2 — Hot top-N residency + adaptive eviction.** Decayed-count top-N per layer
+- [x] **T2 — Hot top-N residency + adaptive eviction.** Decayed-count top-N per layer
       (`hot_per_layer`, `hot_window`), ARC (recency+frequency) instead of plain
       recency/freq. Owner: agent-pool.
 - [ ] **T3 — Intelligent cross-layer-gate prefetch.** Predict layer i+1 experts from

@@ -1,0 +1,81 @@
+From c5fb9d87268c40b33e238ceaad8d6abb833d2a3e Mon Sep 17 00:00:00 2001
+From: edge0 <edge0@edge0.ai>
+Date: Sun, 11 Oct 2026 06:47:25 +0530
+Subject: [PATCH] edge0 private surface #8: VRAM hot-expert base hook (device
+ L0 tier)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 48 +++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 97267079e..22ede3b52 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1898,10 +1898,50 @@ static bool ggml_cuda_is_rocmfpx_type(enum ggml_type type) {
+ 
+ // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
+ // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
++// edge0 private surface #8 - VRAM hot-expert base hook (device L0 tier).
++// The CPU-side L1 pool (serve/prefetch.cc) uses patch #7's host resolver, which cannot
++// return a device pointer. The GPU backend computes each expert base itself, so the
++// VRAM tier installs these hooks: vram_base returns a pointer into a device pool for a
++// resident expert, or null to fall through to src0->data. vram_has reports whether a
++// tensor is pooled, so the fallback path (the only host-side per-expert base site) is
++// taken and CUDA/HIP graph capture is disabled for it. Both default null = no change.
++typedef const void * (*ggml_edge0_vram_base_fn)(const struct ggml_tensor * src0, int64_t id, size_t nb02);
++typedef bool         (*ggml_edge0_vram_has_fn)(const struct ggml_tensor * src0);
++static ggml_edge0_vram_base_fn g_edge0_vram_base_fn = nullptr;
++static ggml_edge0_vram_has_fn  g_edge0_vram_has_fn  = nullptr;
++
++#if defined(_WIN32)
++#  ifdef GGML_BACKEND_BUILD
++#    define EDGE0_VRAM_HOOK_API __declspec(dllexport)
++#  else
++#    define EDGE0_VRAM_HOOK_API __declspec(dllimport)
++#  endif
++#else
++#  define EDGE0_VRAM_HOOK_API
++#endif
++extern "C" EDGE0_VRAM_HOOK_API void ggml_edge0_set_vram_hooks(ggml_edge0_vram_base_fn base_fn, ggml_edge0_vram_has_fn has_fn) {
++    g_edge0_vram_base_fn = base_fn;
++    g_edge0_vram_has_fn  = has_fn;
++}
++
++static bool ggml_edge0_vram_has(const ggml_tensor * src0) {
++    return g_edge0_vram_has_fn && g_edge0_vram_has_fn(src0);
++}
++
++static const void * ggml_edge0_vram_base(const ggml_tensor * src0, int64_t id, size_t nb02) {
++    return g_edge0_vram_base_fn ? g_edge0_vram_base_fn(src0, id, nb02) : nullptr;
++}
++
+ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
++    // edge0: a pooled expert tensor must take the per-expert fallback, where the device
++    // base can be substituted (and which is never graph-captured).
++    if (ggml_edge0_vram_has(src0)) {
++        return true;
++    }
++
+     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+         return true;
+     }
+@@ -2044,7 +2084,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         src0_slice.nb[3]    = src0_slice.nb[2];
+         src0_slice.op       = GGML_OP_VIEW;
+         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
++        // edge0 VRAM tier: use the resident device copy when present (D2D), else the
++        // original model bytes. The pooled base is only ever read here (a view slice).
+         src0_slice.data     = (char *) src0->data + i02*nb02;
++        if (ggml_edge0_vram_has(src0)) {
++            const void * vram_base = ggml_edge0_vram_base(src0, i02, nb02);
++            if (vram_base) {
++                src0_slice.data = const_cast<char *>((const char *) vram_base);
++            }
++        }
+ 
+         ggml_tensor src1_slice;
+         memset(&src1_slice, 0, sizeof(src1_slice));

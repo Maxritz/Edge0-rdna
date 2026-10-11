@@ -35,6 +35,12 @@
 #include "llama.h"
 #include "llama-ext.h"
 
+// Device-resident hot-expert tier (E0_VRAM_MB). The RAM pool above serves the CPU
+// matmul through patch #7; this tier serves the GPU matmul through the HIP backend hook
+// (patch #8). Its fill source callback below promotes experts already resident in the
+// RAM L1 pool, so a VRAM fill can skip the file read when the RAM tier has the block.
+#include "vram_pool.h"
+
 
 namespace {
 
@@ -179,6 +185,7 @@ struct Pref {
     std::map<int, EXP> exps;
     std::map<int, Hist> hist;                         // layers 6..39 (39 keeps teacher onehot only)
     std::map<int, std::vector<int>> pred_prev;        // consumer → previous-step head top-K
+    std::map<int, std::vector<int>> pred_ext_prev;    // consumer → previous-step FATE percentile set
     std::map<int, std::vector<int>> exec_prev;        // consumer → previous-step teacher (sticky)
     uint64_t data_base = 0;
     HANDLE fh = INVALID_HANDLE_VALUE, mh = NULL;
@@ -209,6 +216,21 @@ struct Pref {
     std::thread worker;
     long hits = 0, sticky = 0, rnd = 0, total = 0, steps = 0;
     long long pool_mb = 0;                        // private-page pool hot-zone MB (>0 enables; E0_POOL_MB)
+    long long vram_mb = 0;                        // device hot-expert pool MB (>0 enables; E0_VRAM_MB)
+    // ── FATE cross-layer gate prefetch (T3, arXiv:2502.12224) ──
+    // Training-free: layer c's routing is predicted by feeding the previous layer's captured
+    // input through c's own gate matrix. CPU-only, runs on the existing worker thread.
+    bool  xlayer = false;          // E0_XLAYER=1 enables the FATE predictor (replaces the head)
+    float x_pct = 0.75f;           // E0_XLAYER_PCT: confidence percentile cutoff (paper: 75th)
+    int   x_ext_max = 64;          // E0_XLAYER_EXT_MAX: cap on the percentile set (25% of E = 64)
+    int   x_pf_cap = 96;           // E0_XLAYER_PF_TOK_MAX: per-layer popularity cap during prefill
+    int   x_pf_tok = 64;           // E0_XLAYER_PF_TOK: tokens aggregated per prefill ubatch
+    bool  prefill = false;         // current worker snapshot is a multi-token (prefill) ubatch
+    int   pf_tok = 0;              // tokens captured in the prefill snapshot
+    std::vector<float> snap_pf;    // prefill snapshot: pf_tok*(NH+1)*HH floats (token-major)
+    long  x_hits = 0, x_tot = 0;   // FATE top-K overlap vs teacher (accuracy proof)
+    long  x_ext_hits = 0;          // FATE percentile-set overlap vs teacher (per-K)
+    long  x_issued = 0, x_res = 0; // FATE experts issued / already resident (pool check)
     uint32_t lcg = 2463534242u;
     uint32_t next() { lcg ^= lcg << 13; lcg ^= lcg >> 17; lcg ^= lcg << 5; return lcg; }
     ~Pref() {
@@ -220,7 +242,11 @@ struct Pref {
         fprintf(stderr, "[pref-trace] random overlap = %ld/%ld = %.1f%%\n", rnd, total, 100.0 * rnd / total);
         fprintf(stderr, "[pref-trace] head−sticky = %.1f pp | head−random = %.1f pp\n",
                 100.0 * (hits - sticky) / total, 100.0 * (hits - rnd) / total);
+        if (x_tot)
+            fprintf(stderr, "[pref-trace] FATE cross-layer: top-K overlap = %ld/%ld = %.2f%% | ext-set = %ld/%ld = %.2f%% | issued=%ld resident=%ld\n",
+                    x_hits, x_tot, 100.0 * x_hits / x_tot, x_ext_hits, x_tot, 100.0 * x_ext_hits / x_tot, x_issued, x_res);
         e0_pool_trace_final();
+        edge0_vram_trace_final();
         if (pool)
             fprintf(stderr, "[pref-trace] POOL(%s) hit = %ld/%ld = %.1f%% | pins hot=%lluMB obs=%lluMB (cap %llu/%llu) evict=%ld lockfail=%ld shrink=%ld\n",
                     pool == 2 ? "sticky+obs" : "sticky", pool_hit, pool_tot, pool_tot ? 100.0 * pool_hit / pool_tot : 0.0,
@@ -247,6 +273,20 @@ void topk(const float * v, int n, int k, std::vector<int> & out) {
         if (best < 0) break;
         used[best] = 1; out.push_back(best);
     }
+}
+// FATE (arXiv:2502.12224 §4.2): gate logits are compared positionally (Gate_in_{i+1} fed to
+// layer i+1's gate), never normalized - softmax is monotonic so top-K is identical, and the
+// percentile keeps its positional meaning on the raw logits. The "confidence score" cutoff is
+// a percentile over the E logits, so it selects E*(1-pct) experts regardless of scale (never a
+// fixed threshold, which is the paper's point when it uses a distribution-relative cutoff).
+void topk_pct_cut(const float * v, int n, float pct, int kmax, std::vector<int> & out, float & thr) {
+    std::vector<float> s(v, v + n);
+    std::sort(s.begin(), s.end());
+    int ord = (int) std::lround((double) pct * (n - 1));
+    if (ord < 0) ord = 0; if (ord > n - 1) ord = n - 1;
+    thr = s[ord];
+    out.clear();
+    for (int i = 0; i < n && (int) out.size() < kmax; ++i) if (v[i] >= thr) out.push_back(i);
 }
 int ovlp(const std::vector<int> & a, const std::vector<int> & b) {
     int n = 0;
@@ -403,8 +443,7 @@ static const char * e0_mmid_base_res(const ggml_tensor * s, int64_t id, size_t n
 }
 
 // Worker prefill (teacher=hot / head=obs): called outside the resolver path; same per-slot CAS pattern.
-static void e0_pool_prefill(int c, const std::vector<int> & ids, int reg) {
-    auto it = g_ptt_by_c.find(c);
+static void e0_pool_prefill(int c, const std::vector<int> & ids, int reg) {    auto it = g_ptt_by_c.find(c);
     if (it == g_ptt_by_c.end()) return;
     for (PoolTT * pt : it->second)
         for (int id : ids) {
@@ -432,6 +471,65 @@ static void e0_pool_prefill(int c, const std::vector<int> & ids, int reg) {
             WakeAllConditionVariable(&pt->cv[id]);
             LeaveCriticalSection(&lk);
         }
+}
+
+// ── FATE prefetch issue: pool-aware (pool path skips re-filling committed slots) ──
+// Resident check: pool mode asks the slot table (st==2 = the expert is in the private pages);
+// the advisory path asks the pin table (already in the touch set, no PVM entry needed).
+static bool e0_pool_expert_resident(int c, int e) {
+    auto it = g_ptt_by_c.find(c);
+    if (it == g_ptt_by_c.end()) return false;
+    for (PoolTT * pt : it->second) if (e >= 0 && (size_t) e < pt->nexps && pt->st[e] == 2) return true;
+    return false;
+}
+static bool e0_adv_expert_resident(int c, int e) {
+    auto it = g.pins.find(c);
+    if (it == g.pins.end()) return false;
+    for (const auto & p : it->second) {
+        auto pc = g.exps.find(c);
+        if (pc == g.exps.end()) return false;
+        for (const TT & tt : pc->second.t) {
+            const size_t per = tt_bytes(tt) / EK;
+            if (p.off == (size_t) g.data_base + tt.off + (size_t) e * per) return true;
+        }
+    }
+    return false;
+}
+static bool e0_expert_resident(int c, int e, int reg) {
+    if (g_pool_on) return reg == 1 ? false : e0_pool_expert_resident(c, e);   // obs has no residency table in this build
+    return e0_adv_expert_resident(c, e);
+}
+// FATE issue: pool prefill (skips committed slots) or, in advisory mode, PVM warm-up over the
+// non-resident predicted ranges. Miss = latency only: this only warms pages.
+static void e0_issue_xlayer(int c, const std::vector<int> & ids, int reg) {
+    if (ids.empty()) return;
+    auto pc = g.exps.find(c);
+    if (pc == g.exps.end()) return;
+    if (g_pool_on) {
+        std::vector<int> miss;
+        for (int e : ids) if (!e0_expert_resident(c, e, reg)) miss.push_back(e);
+        g.x_res += (long) (ids.size() - miss.size());
+        e0_pool_prefill(c, miss, reg);
+        return;
+    }
+    if (!g.view) return;
+    static WIN32_MEMORY_RANGE_ENTRY win[3 * EK];
+    int nw = 0;
+    for (const TT & tt : pc->second.t) {
+        const size_t per = tt_bytes(tt) / EK;
+        for (int e : ids) {
+            if (nw == 3 * EK) break;
+            if (e0_expert_resident(c, e, reg)) continue;
+            win[nw].VirtualAddress = (PVOID) ((char *) g.view + g.data_base + tt.off + (size_t) e * per);
+            win[nw].NumberOfBytes  = per;
+            ++nw;
+        }
+    }
+    if (nw) {
+        static decltype(&PrefetchVirtualMemory) pvm =
+            (decltype(&PrefetchVirtualMemory)) GetProcAddress(GetModuleHandleA("kernel32"), "PrefetchVirtualMemory");
+        if (pvm) pvm(GetCurrentProcess(), nw, win, 0);
+    }
 }
 
 static void e0_pool_trace_final() {
@@ -574,6 +672,19 @@ static void e0_pool_scan(const std::map<std::string, TT> & tinfo) {   // pool al
             g_ptt_by_name.size(), (unsigned long long) (g_pool_cap[0] >> 20),
             (unsigned long long) (g_pool_cap[1] >> 20), g_pool_on ? "on" : "FAIL");
     fflush(stderr);
+}
+
+// L1 -> L0 fill source for the VRAM tier: if the RAM pool currently holds expert `id`
+// of tensor `name`, hand its bytes to the VRAM tier so the fill skips the file read.
+// Called on the compute thread from the backend resolver; a slot is only read once its
+// state is 2 (ready) and slots are never overwritten in this pool, so the read is safe.
+static const void * e0_vram_host_src(void * /*user*/, const char * name, int64_t id, size_t * len) {
+    auto it = g_ptt_by_name.find(name ? name : "");
+    if (it == g_ptt_by_name.end()) return nullptr;
+    PoolTT * pt = it->second;
+    if (!pt || (size_t) id >= pt->nexps || pt->st[id] != 2) return nullptr;
+    *len = pt->per;
+    return (const char *) (pt->arena + (size_t) id * pt->stride);
 }
 
 }  // namespace
@@ -738,12 +849,17 @@ static void e0_full_step(const float * rows) {
         topk(tl.data(), EK, KDIM, teacher[c]);
     }
     // Three-way settlement: pred copy (short lock) vs teacher @ this snapshot.
-    std::map<int, std::vector<int>> preds_copy;
-    { std::lock_guard<std::mutex> lk(g.wmtx); preds_copy = g.pred_prev; }
+    std::map<int, std::vector<int>> preds_copy, ext_copy;
+    { std::lock_guard<std::mutex> lk(g.wmtx); preds_copy = g.pred_prev; ext_copy = g.pred_ext_prev; }
     for (int c : consumers) {
         auto pp = preds_copy.find(c);
         if (pp != preds_copy.end()) {
             g.hits += ovlp(pp->second, teacher[c]); g.total += KDIM;
+            if (g.xlayer) {
+                g.x_hits += ovlp(pp->second, teacher[c]); g.x_tot += KDIM;
+                auto xe = ext_copy.find(c);
+                if (xe != ext_copy.end()) g.x_ext_hits += ovlp(xe->second, teacher[c]);
+            }
             auto sp = g.exec_prev.find(c);
             if (sp != g.exec_prev.end()) g.sticky += ovlp(sp->second, teacher[c]);
             std::vector<int> r;
@@ -759,6 +875,26 @@ static void e0_full_step(const float * rows) {
     if (g_pool_on) for (auto & kv : g.exec_prev) e0_pool_prefill(kv.first, kv.second, 0);   // teacher → hot zone
     // head: owner o features = [m_in|cur_oh|prev_oh] → new pred (consumer = o+1)
     std::map<int, std::vector<int>> new_preds;
+    std::map<int, std::vector<int>> new_ext;
+    if (g.xlayer) {
+        // FATE: predict consumer c from owner o = c-1's captured gate input. Gate_in_{o+1} is
+        // used to predict layer o+1, the paper's exact scheme; c == o+1 here.
+        for (int o = OWNER0; o < OWNER0 + NH; ++o) {
+            const int c = o + 1;
+            const float * x = rows + (size_t) (o - OWNER0) * HH;
+            const float * gw = g.gate[c].data();
+            std::vector<float> lg(EK);
+            for (int e = 0; e < EK; ++e) lg[e] = dotf(gw + (size_t) e * HH, x, HH);
+            std::vector<int> tk, ext;
+            topk(lg.data(), EK, KDIM, tk);
+            float thr;
+            topk_pct_cut(lg.data(), EK, g.x_pct, g.x_ext_max, ext, thr);
+            new_preds[c] = tk;                                    // top-K: contract for pred_prev/accounting
+            new_ext[c]   = ext;
+            e0_issue_xlayer(c, ext, g_pool_cap[1] ? 1 : 0);       // top-K + percentile set
+            g.x_issued += (long) ext.size();
+        }
+    } else {
     std::vector<float> feat(FE), act(512), lg(EK);
     for (int o = OWNER0; o < OWNER0 + NH; ++o) {
         const int c = o + 1;
@@ -773,8 +909,9 @@ static void e0_full_step(const float * rows) {
                   + dotf(hd.lin.data() + (size_t) e * FE, feat.data(), FE);
         topk(lg.data(), EK, KDIM, new_preds[c]);
     }
+    }
     if (g_pool_on && g_pool_cap[1]) for (auto & kv : new_preds) e0_pool_prefill(kv.first, kv.second, 1);  // head → observation zone
-    { std::lock_guard<std::mutex> lk(g.wmtx); g.pred_prev = std::move(new_preds); }
+    { std::lock_guard<std::mutex> lk(g.wmtx); g.pred_prev = std::move(new_preds); g.pred_ext_prev = std::move(new_ext); }
     // roll the onehot history (teacher→cur, cur→prev)
     for (auto & kv : g.hist) {
         auto t = teacher.find(kv.first);
@@ -797,6 +934,36 @@ static void e0_full_step(const float * rows) {
     }
 }
 
+// FATE prefill (arXiv:2502.12224 §4.2/§4.3): a prefill ubatch activates many experts per
+// layer. Aggregate token->expert assignments and issue in descending popularity, so the
+// experts serving the most tokens become visible to the OS first. Popularity = the number of
+// tokens that select the expert in their top-K (the paper's frequency count).
+static void e0_xlayer_prefill() {
+    if (g.pf_tok <= 0) return;
+    for (int o = OWNER0; o < OWNER0 + NH; ++o) {
+        const int c = o + 1;
+        const float * gw = g.gate[c].data();
+        auto & ss = g.snap_pf;
+        std::vector<int> cnt(EK, 0);
+        for (int t = 0; t < g.pf_tok; ++t) {
+            const float * x = ss.data() + ((size_t) t * (NH + 1) + (size_t) (o - OWNER0)) * HH;
+            std::vector<float> lg(EK);
+            for (int e = 0; e < EK; ++e) lg[e] = dotf(gw + (size_t) e * HH, x, HH);
+            std::vector<int> tk;
+            topk(lg.data(), EK, KDIM, tk);
+            for (int e : tk) cnt[e] += 1;
+        }
+        std::vector<float> pop(EK);
+        for (int e = 0; e < EK; ++e) pop[e] = (float) cnt[e];
+        int k = g.pf_tok * KDIM; if (k > EK) k = EK; if (g.x_pf_cap < k) k = g.x_pf_cap;
+        std::vector<int> ids;
+        topk(pop.data(), EK, k, ids);
+        e0_issue_xlayer(c, ids, 0);
+        g.x_issued += (long) ids.size();
+    }
+    g.pf_tok = 0;
+}
+
 static void e0_worker() {
     for (;;) {
         {
@@ -805,7 +972,8 @@ static void e0_worker() {
             if (g.quit) return;
         }
         if (g.busy.load()) {
-            e0_full_step(g.snap.data());
+            if (g.prefill) e0_xlayer_prefill();
+            else           e0_full_step(g.snap.data());
             g.busy = false;
         }
     }
@@ -818,8 +986,15 @@ bool edge0_pref_init(llama_model * model, llama_context * ctx, int pool_mb, cons
     const char * gg   = (gguf_path && *gguf_path) ? gguf_path : getenv("E0_GGUF");   // primary CLI channel = model path
     if (pool_mb > 0) g.pool_mb = pool_mb;                                        // --pool-mb formal CLI
     else if (const char * pmb = getenv("E0_POOL_MB")) g.pool_mb = atoll(pmb);    // env fallback (harness/debug); runnable without the sidecar
-    const bool headson = side && *side;
-    if ((!headson && !g.pool_mb) || !gg || !*gg) return false;
+    g.xlayer = getenv("E0_XLAYER") != nullptr;                                   // FATE (T3): training-free cross-layer gate prefetch
+    if (const char * xp = getenv("E0_XLAYER_PCT")) { float v = (float) atof(xp); if (v > 0.f && v < 1.f) g.x_pct = v; }
+    if (const char * xe = getenv("E0_XLAYER_EXT_MAX")) { int v = atoi(xe); if (v > 0) g.x_ext_max = v; }
+    if (const char * xc = getenv("E0_XLAYER_PF_TOK_MAX")) { int v = atoi(xc); if (v > 0) g.x_pf_cap = v; }
+    if (const char * xt = getenv("E0_XLAYER_PF_TOK")) { int v = atoi(xt); if (v > 0) g.x_pf_tok = v; }
+    // FATE needs the F32 gate + the layer-inp capture, exactly like the sidecar head, but without
+    // the safetensors heads. treat gate-mode as "headson" for the plumbing and skip the sidecar below.
+    const bool headson = (side && *side) || g.xlayer;
+    if ((!headson && !g.pool_mb && !g.vram_mb) || !gg || !*gg) return false;
 
     if (consumers.empty()) for (int c = OWNER0 + 1; c <= OWNER0 + NH; ++c) consumers.push_back(c);  // 7..39
 
@@ -857,6 +1032,10 @@ bool edge0_pref_init(llama_model * model, llama_context * ctx, int pool_mb, cons
             fclose(f); fprintf(stderr, "[pref-trace] gate missing/bad type c=%d => dormant\n", c); return false;
         }
         const TT & gt = it->second;
+        if ((uint64_t) gt.dim[0] != (uint64_t) HH || (uint64_t) gt.dim[1] != (uint64_t) EK) {
+            fclose(f); fprintf(stderr, "[pref-trace] gate dims %llux%llu != %dx%d c=%d => dormant\n",
+                               (unsigned long long) gt.dim[0], (unsigned long long) gt.dim[1], HH, EK, c); return false;
+        }
         size_t nb = tt_bytes(gt);
         std::vector<float> buf(nb / 4);
         _fseeki64(f, (long long) (g.data_base + gt.off), SEEK_SET);
@@ -865,8 +1044,8 @@ bool edge0_pref_init(llama_model * model, llama_context * ctx, int pool_mb, cons
     }
     fclose(f);
 
-    // sidecar head weights (head mode only)
-    if (headson) {
+    // sidecar head weights (sidecar mode only; FATE has no trained heads)
+    if (side && *side) {
     std::map<std::string, SEnt> st;
     if (!st_load(side, st)) { fprintf(stderr, "[pref-trace] sidecar parse failed => dormant\n"); return false; }
     FILE * sf = fopen(side, "rb");
@@ -901,6 +1080,39 @@ bool edge0_pref_init(llama_model * model, llama_context * ctx, int pool_mb, cons
     g.async = !(an && *an == '0');                     // async is the default; =0 falls back to synchronous (tax isolation)
     g.do_pin = getenv("E0_PREF_PIN") != nullptr;
     if (const char * pm = getenv("E0_PIN_MAX_MB")) g.pin_cap = (size_t) atoll(pm) << 20;
+    // Device-resident hot-expert tier (L0). Independent of the RAM pool and the head: it
+    // pools every *.ffn_*_exps.weight and is served by the HIP backend hook (patch #8).
+    if (const char * vm = getenv("E0_VRAM_MB")) g.vram_mb = atoll(vm);
+    if (g.vram_mb > 0) {
+        // Its own read handle (falls back to g.fh when the RAM pool shares one).
+        HANDLE vh = g.fh;
+        if (vh == INVALID_HANDLE_VALUE)
+            vh = CreateFileA(gg, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        // Inventory every *_exps.weight whose last dim is the expert count (mirrors e0_pool_scan).
+        std::vector<e0_vram_tensor> vt;
+        std::vector<std::string> names;   // stable storage; names[i].c_str() assigned below
+        for (auto & kv : tinfo) {
+            const std::string & nm = kv.first;
+            const TT & tt = kv.second;
+            auto rsuf = [&](const char * sfx) { size_t len = strlen(sfx), k = nm.rfind(sfx); return k != std::string::npos && k + len == nm.size(); };
+            if (!rsuf(".ffn_up_exps.weight") && !rsuf(".ffn_gate_exps.weight") && !rsuf(".ffn_down_exps.weight")) continue;
+            if (tt.dim[2] < 2 || tt.dim[2] > 4096) continue;
+            size_t per = tt_bytes(tt) / (size_t) tt.dim[2];
+            if (!per) continue;
+            int layer = -1;
+            { int blk = -1; if (sscanf(nm.c_str(), "blk.%d.", &blk) == 1) layer = blk; }
+            names.push_back(nm);
+            vt.push_back({ nullptr, g.data_base + tt.off, per, (size_t) tt.dim[2], layer });
+        }
+        for (size_t i = 0; i < vt.size(); ++i) vt[i].name = names[i].c_str();   // names is final here (no realloc)
+        // Prefer the handle the RAM pool opened; else a private one.
+        if (vh == INVALID_HANDLE_VALUE) { fprintf(stderr, "[vram-trace] no GGUF handle => tier off\n"); }
+        else {
+            edge0_vram_set_host_src(e0_vram_host_src, nullptr);   // L1 -> L0 promotion (no-op until the pool is live)
+            edge0_vram_init((int) g.vram_mb, vt.data(), vt.size(), (void *) vh, gg);
+        }
+    }
     if (const char * pl = getenv("E0_POOL")) {                      // sticky=zone1  obs=zone1+2
         if (!strcmp(pl, "obs")) g.pool = 2;
         else if (*pl && strcmp(pl, "0")) g.pool = 1;
@@ -952,19 +1164,25 @@ bool edge0_pref_init(llama_model * model, llama_context * ctx, int pool_mb, cons
                 if (it != g_ptt_by_name.end()) g_ptt_by_c[c].push_back(it->second);
             }
     }
-    g.active = headson || g_pool_on;
+    g.active = headson || g_pool_on || edge0_vram_active();
+    if (g.async) g.snap_pf.assign((size_t) g.x_pf_tok * (NH + 1) * HH, 0.f);   // FATE prefill snapshot
     if (g.active && !headson) { g.async = false; }        // pool-only mode: no worker (demand is self-sufficient)
     if (g.active && headson && g.async) g.worker = std::thread(e0_worker);
-    fprintf(stderr, "[pref-trace] INIT ok: heads=%zu gates=%zu exps=%zu map=%s prefetch=%s pin=%s(async=%d) stride=%d K=%d E=%d pool=%d(hot=%lluMB obs=%lluMB)\n",
+    fprintf(stderr, "[pref-trace] INIT ok: heads=%zu gates=%zu exps=%zu map=%s prefetch=%s pin=%s(async=%d) stride=%d K=%d E=%d pool=%d(hot=%lluMB obs=%lluMB) vram=%s\n",
             g.heads.size(), g.gate.size(), g.exps.size(), g.view ? "ok" : "FAIL",
             g.do_prefetch ? "on" : "off", g.do_pin ? "on" : "off", (int) g.async, g.stride, KDIM, EK,
-            (int) g_pool_on, (unsigned long long) (g_pool_cap[0] >> 20), (unsigned long long) (g_pool_cap[1] >> 20));
+            (int) g_pool_on, (unsigned long long) (g_pool_cap[0] >> 20), (unsigned long long) (g_pool_cap[1] >> 20),
+            edge0_vram_active() ? "on" : "off");
     return g.active;
 }
 
 void edge0_pref_on_step(llama_context * ctx, int64_t last_row) {
     if (!g.active) return;
-    if (g_pool_on) { llama_synchronize(ctx); e0_pool_step(); }  // sync first: decommit must not race in-flight expert reads
+    // Step boundary: the GPU work for this step has completed. The RAM pool decommit and
+    // the VRAM ARC/hot-pin maintenance both recycle memory the GPU may have read, so they
+    // run only here, after a synchronize, and never on the compute path.
+    if (g_pool_on) { llama_synchronize(ctx); e0_pool_step(); }
+    if (edge0_vram_active()) { llama_synchronize(ctx); edge0_vram_step(); }
     if (g.gate.empty()) return;                 // pool-only mode: no capture channel, nothing to account — demand is autonomous
     llama_synchronize(ctx);
     ++g.steps;
@@ -973,13 +1191,31 @@ void edge0_pref_on_step(llama_context * ctx, int64_t last_row) {
         if (!g.async && !g.pool) e0_issue();            // async=worker already issued on cadence; pool=skipped steps neither age nor evict
         return;
     }
+    // The capture buffer holds one row per ubatch token; the wire-up passes last_row =
+    // batch_view.n_tokens - 1, so n_tokens = last_row + 1 (multi-token => prefill).
+    const size_t ntok = (size_t) (last_row + 1);
+    const bool is_prefill = g.xlayer && ntok > 1;
     if (g.async) {
         if (g.busy.load()) return;                     // worker busy: drop this snapshot (preds already valid, lossless)
-        float * dst = g.snap.data();
-        for (int L = OWNER0; L <= OWNER0 + NH; ++L, dst += HH) {
-            float * buf = llama_get_embeddings_layer_inp(ctx, (uint32_t) L);
-            if (!buf) return;                          // channel not ready
-            memcpy(dst, buf + last_row * HH, (size_t) HH * 4);
+        if (is_prefill) {
+            int take = (int) ntok; if (take > g.x_pf_tok) take = g.x_pf_tok;
+            for (int t = 0; t < take; ++t) {
+                float * dst = g.snap_pf.data() + (size_t) t * (NH + 1) * HH;
+                for (int L = OWNER0; L <= OWNER0 + NH; ++L, dst += HH) {
+                    float * buf = llama_get_embeddings_layer_inp(ctx, (uint32_t) L);
+                    if (!buf) return;
+                    memcpy(dst, buf + (size_t) t * HH, (size_t) HH * 4);
+                }
+            }
+            g.pf_tok = take; g.prefill = true;
+        } else {
+            float * dst = g.snap.data();
+            for (int L = OWNER0; L <= OWNER0 + NH; ++L, dst += HH) {
+                float * buf = llama_get_embeddings_layer_inp(ctx, (uint32_t) L);
+                if (!buf) return;                      // channel not ready
+                memcpy(dst, buf + (size_t) last_row * HH, (size_t) HH * 4);
+            }
+            g.prefill = false;
         }
         { std::lock_guard<std::mutex> lk(g.wmtx); g.busy = true; }
         g.cv.notify_one();
