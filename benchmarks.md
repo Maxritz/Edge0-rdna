@@ -285,3 +285,89 @@ At 32k the f16 KV is ~2.7 GB vs ~0.7 GB quantized (q8_0/q4_0). Freeing that VRAM
 (26.68 -> 33.10 tok/s). n16 regresses: the model spills. So the recommended long-context
 config is **`-ctk q8_0 -ctv q4_0` with n_cpu_moe from the planner recomputed against the
 quantized KV budget**. The KV quant itself (same n) is +5.6%.
+
+## 22. RAM-capped benchmark - tiered expert residency is dead as wired (RDNA2, 16 GiB SYS RAM)
+
+**Box:** RX 6700 XT gfx1031, 12 GiB VRAM, **16,305 MB (~15.9 GiB) SYS RAM** (user pulled 32 GiB
+from 48), ROCm 10 at `C:\Rocm10\bin`, build-hip, patch band 0001-0009.
+
+**Model:** `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf` (18.63 GiB - overruns 15.9 GiB RAM by 2.7 GiB).
+`-ngl 99 --n-cpu-moe 20 -fa auto --ctx-size 4096`, 48 decode tokens, thinking off
+(`--reasoning-format none --no-reasoning-preserve`), Qwen3.8 non-thinking sampling.
+
+| arm | env | decode tok/s | ms/tok |
+|---|---|--:|--:|
+| A - no tiers | (none) | **11.55** | 86.61 |
+| B - RAM L1 pool | `--pool-mb 2048` | 8.36 | 119.61 |
+| C - RAM + VRAM hot | `--pool-mb 2048` + `E0_VRAM_MB=1024` | 8.36 | 119.61 |
+
+Arm C trace over the run: `hit=6292 miss=2533 evict=1293 fills L1=0 GGUF=2533` =
+**71.7% hit rate while 28% SLOWER**. Every fill came from the GGUF, never from the resident
+expert tensor.
+
+**Why it cannot pay off:** `ggml_cuda_mul_mat_id` only runs on the GPU backend, so `src0` is
+necessarily already VRAM-resident when the hook fires. The pool duplicates data that is
+already in VRAM and pays NVMe reads + H2D copies + evictions to serve "D2D hits" that
+replace a VRAM read with a VRAM read.
+
+| expert tensor lives in | does the hook fire? | result |
+|---|---|---|
+| host RAM (`-cmoe` / `--n-cpu-moe`) | never - CPU backend runs the matmul | dead |
+| VRAM (`-ngl`) | yes | dead and 28% slower: data already resident |
+
+## 23. 78 GiB 288-expert model - pure cold-tier ceiling (RDNA2, 16 GiB)
+
+`qwen3.8-flash-next-reap-288-Q4_K_M.gguf` (78.06 GiB), `-cmoe` (all experts on host).
+Architecture verified from arXiv:2608.30320: 125B total / **6B activated per token**, and
+"51B parameters of n-gram embedding tables held off the accelerator" that are "prefetched
+from host memory" - the tiered-residency design is built into the model. Token mix is 3 GDN
++ 1 QSA attention per 4; n-gram embedding at Layer 2.
+
+| metric | value |
+|---|---:|
+| load | 76 s |
+| prompt eval (12 tok) | 78,114 ms (0.15 tok/s) |
+| decode (32 tok) | 1,143,445 ms (36,885 ms/tok, **0.03 tok/s**) |
+
+78 GiB demand-paged through a 16 GiB box thrashes the page cache on every expert miss. This
+is the number the VRAM/RAM/NVMe tiering exists to fix, and it is the reason the negative in
+S22 matters.
+
+`-ngl 99` without `-cmoe` on this model cannot load at all:
+`alloc_tensor_range: failed to allocate ROCm buffer of size 48239767808` (48.2 GiB requested
+on 12 GiB VRAM) - llama.cpp offloads expert tensors all-or-nothing per tensor.
+
+## 24. VRAM hot-tier routing defect (fixed) and profiling tooling
+
+Two defects kept the tier from running at all; both fixed in patch 0009:
+
+1. `edge0_pref_init` parsed `E0_VRAM_MB` 88 lines *after* the early-return gate that tests
+   `g.vram_mb` (prefetch.cc:997 vs :1085), so the env var alone was a no-op.
+2. `ggml_cuda_mul_mat_id` takes a fused fast path (`mul_mat_vec_q` at ggml-cuda.cu:1990) and
+   **returns** before reaching the per-expert loop where the base is substituted.
+   `ggml_cuda_mul_mat_id_needs_sync` only feeds an *assert* at line 2015, so patching it
+   changed nothing. Measured proof: `hit=0 miss=0 refused=0 bypass=0` over 4 steps.
+
+After 0009 the hook engages - steps 1 to 4 show hits 12 -> 36 -> 56 -> 77 with `fills GGUF`
+tracking misses. Identification and hot top-N accounting are working.
+
+**Profiling:** rocprof/bprofiler are absent, but the `hip_tracer` proxy DLL from
+`G:\AMD-Ai\hip_tracer` is now wired on the box. Two deployment constraints, both learned the
+hard way:
+
+- Launching via `hip_tracer_launcher.exe` does NOT work. Windows DLL search starts with the
+  directory of the child executable, and `Copy-HipRuntime` already put the real
+  `amdhip64_7.dll` there, so PATH ordering is never consulted. The proxy must be copied
+  INTO `build-hip/bin/` with the real DLL renamed alongside it as `amdhip64_7_real.dll`
+  (the proxy forwards via the PE forwarder mechanism to a file in its own directory).
+- The forward target must be the remote's own ROCm (`C:\Rocm10\bin\amdhip64_7.dll`,
+  identical bytes under `D:\Rocm10\bin`), not a local copy - the two differed
+  (17,503,240 vs 16,577,024 bytes).
+
+Result: clean capture, 12 s load, 9.80 tok/s, 10,290 HIP calls, 934 KB CSV.
+
+**Honest limitation:** kernel names do not resolve for this engine - 99% of the rows come
+back as `stub@ggml-hip.dll` - so it does **not** yet give per-kernel attribution, which was
+the point of wiring it. The memcpy shapes are readable and show the expert traffic (a
+stream of repeated 142.6 MB blocks, plus 10.37 GB and 417 MB transfers).
+
