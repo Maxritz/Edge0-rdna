@@ -15,7 +15,10 @@ Source: `/completeness audit` (2026-10-11). Goal: three-tier expert residency
 - [ ] **T3 — Intelligent cross-layer-gate prefetch.** Predict layer i+1 experts from
       layer i's gate input (FATE arXiv:2502.12224: 78.8% base, 97.15% at 75th-pct
       confidence). CPU-side, parallel with GPU. New module. Owner: agent-predict.
-- [ ] **T4 — Low-bit KV turbo3/4 wired into attention** (currently types-only). Owner:
+- [~] **T4 — Low-bit KV turbo3/4 wired into attention.** Types-only, but the math is now
+      unblocked (RUN-028): the graph already Hadamard-rotates quantized K/V and turbo3's
+      own FWHT is self-inverse, so they compose. Remaining is a device port of the working
+      CPU codec in the q4_0 FA pattern (see RUN-028 items 1-5). Guard on `nrot == 128`.
       agent-kv.
 
 ## PARTIAL

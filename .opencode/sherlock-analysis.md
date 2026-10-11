@@ -1174,3 +1174,72 @@ L3.2-8X3B-Q8_0 18.21, GLM-4.7-Flash-APEX 17.89, Laguna-XS.2-IQ4_XS 16.84 GiB.
 Every one overruns 16 GiB, so the RAM L1 pool + NVMe cold tier are forced to engage
 (unreachable at 48 GiB, where the whole model sits in page cache). 24 GiB would prove
 nothing (ornith35b and Qwen3.5-35B both fit).
+
+## [RUN-028] 2026-10-11 - MODE: BUILD/DESIGN - turbo3 KV is BLOCKED on the kernel, not on the math
+
+### (user is reducing the RDNA2 box to 16 GiB SYS RAM; no GPU runs this session)
+
+### FINDING 1: the fork ALREADY Hadamard-rotates quantized K and V
+Verified by reading, not inferred:
+- `src/llama-kv-cache.cpp:321-325` enables `attn_rot_k` when `ggml_is_quantized(type_k)`
+  and `hparams.n_embd_head_k() % 64 == 0` (so it is ON by default for quantized KV).
+- Same for V at 334-338. `LLAMA_ATTN_ROT_DISABLE` turns it off.
+- Hadamard matrices `attn_rot_hadamard[n]` are precomputed in HOST memory (344-349) for
+  n = 64,128,256,... up to max(n_embd_head_k_all, n_embd_head_v_all).
+- `build_input_k_rot()` (1437-1456) emits an nrot x nrot F32 `attn_inp_k_rot` graph input,
+  where nrot = largest power of 2 <= n_embd_head_k_all (loop 1445-1448).
+- **The rotation is applied to BOTH operands**, before the value is stored:
+  `src/llama-graph.cpp:2862-2864`:
+  ```
+  if (inp->self_k_rot) { q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
+                         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot); }
+  ```
+  then `mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)` at 2885 stores the ROTATED k_cur.
+  `src/llama-kv-cache.cpp:1985` states the invariant: "note: assumes k_rot^2 == I".
+  So the FA kernel receives an already-rotated Q and dots it against a stored
+  rotated K, and the inner product is preserved because H^2 = I.
+
+### FINDING 2: turbo3's transform is the SAME rotation, and it composes correctly
+`ggml/src/ggml-quants.c`:
+- `dequantize_row_turbo3` (5673): codebook lookup -> `ggml_fwht_f32(t, QK_TURBO)` (5683)
+  -> `* norm` (5685). NO other math.
+- `quantize_row_turbo3_ref` (5704): x/nrm -> `ggml_fwht_f32(t, QK_TURBO)` (5714) -> nearest
+  codebook (5717) -> 3-bit pack (5718-5720).
+- `ggml_fwht_f32` scales by 1/sqrt(n) (5652-5653), so H^2 = I and FWHT is an involution.
+- Block: `QK_TURBO = 128` (ggml-common.h:258), `block_turbo3` = 50 B (fp16 norm + 48 B of
+  3-bit codes = 128x3). IDs 49/50 (ggml.h:445-446).
+
+**Composition:** the cache stores `H k`. turbo3 quantizes that and dequantizes it as
+`FWHT(CB[code]) * nrm ~= FWHT(FWHT(H k /nrm)) * nrm = H k`. The dequant recovers exactly
+what the cache holds, so the FA kernel's existing rotated-Q dotted against this is correct.
+No extra transform is needed on the attention side, and the two Hadamards cancel in the
+round trip rather than compounding. The `nrot == 128 == QK_TURBO` coincidence (head_dim 128,
+the common case incl. Qwen3-35B-A3B) makes the rotation block match the turbo block exactly.
+
+### WHAT THIS CHANGES
+Turbo3 KV is NOT "not viable" and NOT "declined". The remaining work is a device-side port
+of a working CPU codec, in the well-understood q4_0 FA pattern:
+1. port `ggml_fwht_f32` (7 butterfly stages, 1/sqrt(128)) to `__device__` in fattn-common.cuh.
+2. add `vec_dot_fattn_vec_KQ_turbo3<D,nthreads>` (codebook -> FWHT -> dot with rotated Q).
+3. add `dequantize_V_turbo3<T,ne>` (codebook -> FWHT, mirroring dequantize_V_q4_0).
+4. add `GGML_TYPE_TURBO3` to `get_vec_dot_KQ`, `get_dequantize_V`, and
+   `ggml_cuda_fattn_kv_type_supported` (fattn.cu:513).
+5. add `turbo3` to FA_TYPES (ggml/cmake/common.cmake:54) and create the
+   `template-instances/fattn-vec-instance-*.cu` files it requires (configure-time fatal
+   if a file named by the loop is missing).
+Constraint: nrot must equal QK_TURBO=128. head_dim 64 gives nrot=64 and head_dim 256 gives
+nrot=256, so turbo3 KV is only valid where nrot == 128 - guard on it, do not silently
+mis-rotate.
+
+### PAYOFF (why it is worth doing)
+turbo3 = 50 B per 128 values = 3.125 bit/value, vs q4_0's 18 B/32 = 4.5 bit and
+iq4_nl's level. On Qwen3-35B-A3B at long ctx the KV tensor is what caps usable context;
+a ~31% smaller K than q8_0/q4_0 per element directly extends ctx for a fixed VRAM/
+budget. This is the "decrease context" lever the user asked about.
+
+### NOT DONE / HONEST
+- This is a code-reading result only. No turbo3 KV has ever been loaded or measured.
+- The gcc round-trip test that passed (windows/tools/turbo_kv_test.c) validates the CPU
+  codec, not this composition, and not the device port.
+- No fixture exists in C:\x with a turbo3 KV type; wiring the type alone cannot be
+  runtime-verified until a turbo3-quantized GGUF is produced.
