@@ -371,3 +371,53 @@ back as `stub@ggml-hip.dll` - so it does **not** yet give per-kernel attribution
 the point of wiring it. The memcpy shapes are readable and show the expert traffic (a
 stream of repeated 142.6 MB blocks, plus 10.37 GB and 417 MB transfers).
 
+## 25. Full `C:\x` model sweep (RDNA2, RX 6700 XT 12 GiB, 48 GiB RAM)
+
+Every `.gguf` in `C:\x` (11 files, 227 GB). `llama-bench`, **`-t 8 -p 512 -n 128 -r 2 -o csv`**,
+12 GiB VRAM / 48 GiB host RAM, engine build `c838aa844` (build 11111). Auto-fit is used for
+all rows (omit `-ngl`, default `-1`) with `--load-mode none`; the 78 GiB model is the exception
+(explicit `-ngl 99 -ncmoe 99`, mmap). Columns are **Prompt Process (pp512 tok/s)** and
+**Token Gen (tg128 tok/s)**.
+
+| model | arch | size GiB | params | ncmoe 0 pp/tg | ncmoe 2 pp/tg | ncmoe 6 pp/tg |
+|---|---|---:|---:|---:|---:|---:|
+| gemma-e2b-rocmfp4 | gemma4 E2B (dense) | 3.13 | 4.65 B | 1633 / 132.2 | 1643 / 132.0 | **1644 / 132.3** |
+| ornith9b | qwen35 9B (dense) | 4.62 | 8.95 B | 439.8 / 64.5 | 440.7 / 64.6 | **440.9 / 64.6** |
+| Underdog-Saluki-27B IQ2_XS | qwen35 27B (dense) | 7.78 | 27.3 B | **179.7 / 22.1** | 179.5 / 22.1 | 179.6 / 22.1 |
+| Qwen3-30B-A3B Q2_K | qwen3moe 30B.A3B | 10.48 | 30.5 B | **300.8 / 115.2** | 297.6 / 99.1 | 292.2 / 77.1 |
+| Laguna-XS.2 IQ4_XS | laguna 30B.A3B | 16.84 | 33.4 B | 577.3 / 39.5 | 557.6 / 38.2 | **849.3 / 39.9** |
+| GLM-4.7-Flash-APEX Q6_K | deepseek2 30B.A3B | 17.89 | 29.9 B | 421.9 / 23.0 | 408.4 / 22.2 | **701.2 / 24.4** |
+| ornith35b | qwen35moe 35B.A3B | 17.96 | 34.7 B | 263.9 / 29.1 | **421.1 / 24.3** | 253.8 / 15.1 |
+| Qwen3.5-35B-A3B Q4_K_M | qwen35moe 35B.A3B | 18.34 | 34.7 B | 415.9 / 28.4 | **929.5 / 28.2** | 196.8 / 30.4 |
+| Qwen3.6-27B-AEON Q5_K_M | qwen35 27B (dense) | 18.19 | 27.3 B | 78.0 / 3.27 | **79.2 / 3.25** | 76.6 / 3.30 |
+| L3.2-8X3B-MOE Q8_0 | llama (MoE) | 18.22 | 18.4 B | 432.6 / 11.3 | 397.0 / 11.3 | **606.0 / 11.8** |
+| qwen3.8-flash-next-reap-288 Q4_K_M | qwen4exp A3B | 78.05 | 124.1 B | 50.9 / 10.6 (`-ngl 99 -ncmoe 99`) | - | - |
+
+Best measured per model in bold. Raw CSVs: `D:\edge0\b1.csv`..`b11.csv` on the box.
+
+### 25b. Findings
+
+- **Two dense subtypes.** Small dense models run fast (`gemma-e2b` pp 1644 / tg 132;
+  `ornith9b` 441 / 64.6). Dense 27B is memory-bound: the IQ2_XS file (7.78 GiB) fits mostly in
+  VRAM -> 180 / 22.1, but the Q5_K_M file (18.19 GiB) cannot -> **78 / 3.27**, a 6.7x decode
+  collapse for 2.3x more bytes. `-ncmoe` is a no-op on all dense models (no MoE tensors).
+- **MoE `-ncmoe` is model-dependent, not monotonic.** Prefill improves sharply once experts fit
+  (`Qwen3.5-35B` pp 415.9 -> **929.5** at ncmoe 2; `Laguna` 577 -> **849** at 6; `GLM` 422 -> **701**
+  at 6), but over-offloading past the fit collapses it (`Qwen3.5-35B` ncmoe 6 -> 196.8;
+  `ornith35b` ncmoe 6 -> 253.8). The optimum is the smallest `-ncmoe` that stops VRAM spill.
+- **When the model already fits VRAM, `-ncmoe` only hurts.** `Qwen3-30B-A3B Q2_K` (10.48 GiB
+  < 12 GiB) peaks at ncmoe 0 (**tg 115.2**); pushing experts to CPU drops decode to 77.1.
+- **`L3.2-8X3B Q8_0` decode is CPU-matmul bound** (~11.3 tg) regardless of `-ncmoe`; prefill
+  still scales with GPU expert residency (432 -> 606).
+- **The 78 GiB / 124 B-A3B model runs**, but only with all experts on host: `--load-mode none`
+  cannot allocate 78 GiB in 48 GiB RAM (`failed to load model`), auto-fit (`-ngl -1`) also fails,
+  and `-ngl 99 -ncmoe 0` requests a 48.2 GiB ROCm buffer. Working config = **`-ngl 99 -ncmoe 99`**
+  (mmap): pp 50.9 / tg 10.6 - decode is usable, prefill is host-bound.
+
+### 25c. Cross-check vs S19 (RDNA2, `-ngl 99`, n_cpu_moe 16)
+
+S19 measured n_cpu_moe 16: Laguna 461 / 46.2, GLM 215 / 29.3, L3.2 466 / 11.9. The S25 rows use
+auto-fit with ncmoe 0/2/6, so they are not the same operating point (ncmoe 0 leaves more experts
+on GPU than n_cpu_moe 16, and Laguna ncmoe 6 shows the prefill peak that S19's fixed 16 missed).
+Numbers agree in shape: L3.2 decode ~11-12 tg on both; Laguna decode 39-46; GLM 23-29.
+

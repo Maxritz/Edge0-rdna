@@ -1328,3 +1328,54 @@ amdhip64 proxy-DLL shim producing per-HIP-call CSV traces (test_trace.csv..
 test_trace8.csv already exist), and `G:\AMD-Ai\AMD-AI-COMPASS` is the user's own AMD perf
 tracing port. The Dispatch trap (RUN-012) needs hip_tracer wiring, not rocprof.
 NOT yet wired or used this session.
+
+## [RUN-030] 2026-10-11 - MODE: FULL - all-model `C:\x` sweep (11 models) on RDNA2
+
+### BOX AND METHOD
+RDNA2 gfx1031, 12 GiB VRAM, **~48 GiB SYS RAM** (restored from the S22-S24 16 GiB cap;
+`Total Physical Memory 49,073 MB`), ROCm 10 at `C:\Rocm10\bin`. Engine rebuilt to
+`c838aa844` (build 11111). Every `.gguf` in `C:\x` (11 files, 227 GB).
+`llama-bench -t 8 -p 512 -n 128 -r 2 -o csv`, auto-fit (omit `-ngl`) + `--load-mode none`,
+per model `-ncmoe 0,2,6`. The 78 GiB model is the exception (see below). Raw CSVs
+`D:\edge0\b1.csv`..`b11.csv`; published as benchmarks.md §25.
+
+### RESULT (pp512 / tg128 tok/s; best per model bold)
+| model | arch | GiB | ncmoe 0 | ncmoe 2 | ncmoe 6 |
+|---|---|---:|---:|---:|---:|
+| gemma-e2b-rocmfp4 | gemma4 (dense) | 3.13 | 1633/132 | 1643/132 | **1644/132** |
+| ornith9b | qwen35 9B (dense) | 4.62 | 440/64.5 | 441/64.6 | **441/64.6** |
+| Underdog-Saluki-27B IQ2_XS | qwen35 27B (dense) | 7.78 | **180/22.1** | 180/22.1 | 180/22.1 |
+| Qwen3-30B-A3B Q2_K | qwen3moe 30B.A3B | 10.48 | **301/115.2** | 298/99.1 | 292/77.1 |
+| Laguna-XS.2 IQ4_XS | laguna 30B.A3B | 16.84 | 577/39.5 | 558/38.2 | **849/39.9** |
+| GLM-4.7-Flash Q6_K | deepseek2 30B.A3B | 17.89 | 422/23.0 | 408/22.2 | **701/24.4** |
+| ornith35b | qwen35moe 35B.A3B | 17.96 | 264/29.1 | **421/24.3** | 254/15.1 |
+| Qwen3.5-35B-A3B Q4_K_M | qwen35moe 35B.A3B | 18.34 | 416/28.4 | **929/28.2** | 197/30.4 |
+| Qwen3.6-27B-AEON Q5_K_M | qwen35 27B (dense) | 18.19 | 78/3.27 | **79/3.25** | 77/3.30 |
+| L3.2-8X3B-MOE Q8_0 | llama (MoE) | 18.22 | 433/11.3 | 397/11.3 | **606/11.8** |
+| qwen3.8-flash-next-reap-288 Q4_K_M | qwen4exp A3B | 78.05 | 51/10.6 | - | - |
+
+### FINDINGS (confirms and extends S19/RUN-018)
+1. **`-ncmoe` is a no-op on dense models** - gemma4/ornith9b/Underdog give identical
+   pp/tg across 0/2/6. Two dense regimes: small (fits VRAM) is fast; dense 27B at Q5_K_M
+   (18.19 GiB > 12 GiB) collapses to 78/3.27 while the IQ2_XS file (7.78 GiB) holds 180/22.1
+   (6.7x decode for 2.3x fewer bytes).
+2. **MoE `-ncmoe` optimum is the smallest value that stops VRAM spill, not a max.**
+   Prefill peaks then collapses: Qwen3.5-35B 416->**929**->197 across 0/2/6; Laguna 577->849;
+   GLM 422->701; ornith35b peaks at 2 (421) and falls at 6 (254).
+3. **If the model already fits VRAM, `-ncmoe` only hurts** - Qwen3-30B-A3B Q2_K (10.48 GiB)
+   tops out at ncmoe 0 (**tg 115.2**); offloading experts to CPU drops it to 77.1.
+4. **L3.2-8X3B Q8_0 decode is CPU-matmul bound** at ~11.3 tg regardless of ncmoe; only
+   prefill scales (433->606).
+5. **78 GiB / 124 B-A3B load matrix (all four tested):**
+   `--load-mode none` -> `failed to load model` (78 GiB > 48 GiB RAM);
+   auto-fit `-ngl -1` -> fails; `-ngl 99 -ncmoe 0` -> 48.2 GiB ROCm buffer request -> fails;
+   **working = `-ngl 99 -ncmoe 99`** (mmap, all experts on host) -> pp 50.9 / tg 10.6.
+   `llama-bench` lacks `-cmoe`; `-ncmoe 99` is the flag-level equivalent of the earlier
+   `smoke288.ps1` server config (`-ngl 99 -cmoe`), which is why the server path worked on the
+   16 GiB box while the bench re-discovery kept failing.
+
+### HONEST SCOPE LIMITS
+- Single run per point (`-r 2` inside llama-bench, but one sweep); no repeat variance study.
+- `-t 8` only (S3 thread matrix already showed `-t 12` (full SMT) collapses decode ~4x).
+- These are bench (batch-1) numbers, not the engine/server path; S19 and RUN-018 remain the
+  engine-path reference.
