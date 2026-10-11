@@ -102,30 +102,36 @@ are co-located with each checkpoint and load automatically, so
 
 Measured by us on a single **RX 6700 XT (gfx1031, RDNA2, 12 GB)** + 48 GB RAM,
 Windows ROCm, with the Windows engine in this repo (`windows/`). Command:
-`llama-bench -ngl 99 -fa auto -p 512 -n 128 -r 2`, letting llama.cpp auto-fit the
-offload to free VRAM. Rendered tokens correct in every row.
+`llama-bench -fa auto -p 512 -n 128 -r 2 -t 8` with the per-row `--n-cpu-moe`, letting
+llama.cpp auto-fit the offload to free VRAM; the 78 GiB row instead uses explicit
+`-ngl 99 --n-cpu-moe 99` over mmap. Engine build `c838aa844` (b11111). Columns are
+**Prompt Process (pp512)** and **Token Gen (tg128)** tok/s. Rendered tokens correct in
+every row. Full `--n-cpu-moe` 0/2/6 matrix: [`benchmarks.md` §25](benchmarks.md).
 
-| Model | arch | MoE | L | E / topK | pp512 | tg128 |
-|---|---|---|--:|--:|--:|--:|
-| gemma-4-E2B-it Q4_0 ROCMFP4 | gemma4 | no | 35 | - | 1646.9 | 131.4 |
-| ornith-1.0-9b ROCmFPX | qwen35 | no | 32 | - | 439.1 | 64.1 |
-| Qwen3-30B-A3B-abliterated i1-Q2_K | qwen3moe | yes | 48 | 128/8 | 301.5 | 115.1 |
-| Laguna-XS.2 IQ4_XS | laguna | yes | 40 | 256/8 | 578.4 | 33.6 |
-| Qwen3.5-35B-A3B UD-Q4_K_XL | qwen35moe | yes | 40 | 256/8 | 405.4 | 25.4 |
-| ornith-1.0-35B Q3_0 ROCmFPX | qwen35moe | yes | 40 | 256/8 | 211.5 | 24.8 |
-| Underdog-Saluki-27B IQ2-mix-MTP | qwen35 | no | 65 | - | 178.3 | 21.8 |
-| GLM-4.7-Flash-APEX-I | deepseek2 | yes | 47 | 64/4 | 417.1 | 17.6 |
-| L3.2-8X3B-MOE Q8_0 | llama | yes | 28 | 8/2 | 434.3 | 10.1 |
-| Qwen3.6-27B-AEON BF16-MTP Q5_K_M | qwen35 | no | 65 | - | 80.1 | 3.4 |
-| qwen3.8-flash-next-reap-288 Q4_K_M | qwen4exp | yes | 48 | 288/10 | (78 GiB, exceeds RAM) | - |
+| Model | arch | MoE | L | E / topK | n_cpu_moe | pp512 | tg128 |
+|---|---|---|---|---|--:|--:|--:|--:|
+| gemma-4-E2B-it Q4_0 ROCMFP4 | gemma4 | no | 35 | - | 6 | 1643.7 | 132.3 |
+| ornith-1.0-9b ROCmFPX | qwen35 | no | 32 | - | 6 | 440.9 | 64.6 |
+| Qwen3-30B-A3B-abliterated i1-Q2_K | qwen3moe | yes | 48 | 128/8 | 0 | 300.8 | 115.2 |
+| Laguna-XS.2 IQ4_XS | laguna | yes | 40 | 256/8 | 6 | 849.3 | 39.9 |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | qwen35moe | yes | 40 | 256/8 | 2 | 929.5 | 28.2 |
+| ornith-1.0-35B Q3_0 ROCmFPX | qwen35moe | yes | 40 | 256/8 | 2 | 421.1 | 24.3 |
+| Underdog-Saluki-27B IQ2-mix-MTP | qwen35 | no | 65 | - | 0 | 179.7 | 22.1 |
+| GLM-4.7-Flash-APEX-I | deepseek2 | yes | 47 | 64/4 | 6 | 701.2 | 24.4 |
+| L3.2-8X3B-MOE Q8_0 | llama | yes | 28 | 8/2 | 6 | 606.0 | 11.8 |
+| Qwen3.6-27B-AEON BF16-MTP Q5_K_M | qwen35 | no | 65 | - | 2 | 79.2 | 3.25 |
+| qwen3.8-flash-next-reap-288 Q4_K_M | qwen4exp | yes | 48 | 288/10 | 99 | 50.9 | 10.6 |
 
 ROCmFPX rows use the low-bit weight formats added in this fork, with a native MMVQ
-dp4a kernel for fp4/fp4_fast/fp3/fp6: **ornith-9b (100/101) 64.1 tok/s and
-ornith-35b (101/102/104) 24.8 tok/s** on the RX 6700 XT.
+dp4a kernel for fp4/fp4_fast/fp3/fp6: **ornith-9b (100/101) 64.6 tok/s and
+ornith-35b (101/102/104) 24.3 tok/s** on the RX 6700 XT.
 
-Findings from the sweep: on **CPU-expert MoE** the planner's smallest-fit `n_cpu_moe`
-often over-offloads to CPU (ornith-35b: 4.2 tok/s at its plan vs 24.8 when auto-fit lets
-more experts stay on the GPU); and `tg128` tracks how much of the model stays in VRAM.
+Findings from the sweep: on **CPU-expert MoE** the best `--n-cpu-moe` is the smallest
+value that stops VRAM spill, not the largest — over-offloading collapses prefill
+(Qwen3.5-35B: pp 929 at `--n-cpu-moe 2` vs 197 at 6; ornith-35b: 421 at 2 vs 254 at 6),
+while under-offloading spills to PCIe. When the model already fits VRAM, any offload only
+hurts (Qwen3-30B-A3B peaks at 115.2 tok/s at 0, drops to 77.1 at 6). `tg128` tracks how
+much of the model stays in VRAM; dense models are unaffected by `--n-cpu-moe`.
 
 ### Quality
 
