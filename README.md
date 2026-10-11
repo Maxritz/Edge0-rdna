@@ -2,8 +2,6 @@
 
 **Streaming MoE inference for AMD Radeon (RDNA2 / RDNA4), built on a pinned llama.cpp with the Edge0 patch band.**
 
-English | [中文](README_zh.md) | [日本語](README_ja.md) | [Español](README_es.md) | [Français](README_fr.md)
-
 This is a fork of [Edge0-AI/edge0](https://github.com/Edge0-AI/edge0) focused on running
 large sparse-MoE models on consumer **AMD Radeon** GPUs — RDNA2 (`gfx1031`, RX 6700 XT)
 and RDNA4 (`gfx1201`, RX 9070 XT) — through the Windows HIP (ROCm) engine, with dense
