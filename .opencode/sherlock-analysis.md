@@ -1243,3 +1243,88 @@ budget. This is the "decrease context" lever the user asked about.
   codec, not this composition, and not the device port.
 - No fixture exists in C:\x with a turbo3 KV type; wiring the type alone cannot be
   runtime-verified until a turbo3-quantized GGUF is produced.
+
+## [RUN-029] 2026-10-11 - MODE: FULL - VRAM hot tier ENGAGES but is architecturally dead as wired
+
+### MODELS AND BOX
+RDNA2 (gfx1031) now at **16,305 MB (~15.9 GiB) SYS RAM** (user pulled 32 GiB), 12 GiB VRAM.
+Two models used: qwen3.8-flash-next-reap-288-Q4_K_M.gguf (78.06 GiB) and
+Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf (18.63 GiB) - both overrun RAM at 16 GiB.
+Thinking disabled via `--reasoning-format none --no-reasoning-preserve`.
+Non-thinking params per Qwen3.8-Flash-Next guidance (temp .7/top_p .8/k20/pres 1.5).
+
+### ARCHITECTURE FACTS (verified from arXiv:2608.30320, Qwen3.8-Next)
+125B total / **6B activated per token**; "51B parameters of n-gram embedding tables held
+off the accelerator" and "prefetched from host memory" - the tiered-residency design is
+BUILT INTO the model. Token mix = 3 GDN + 1 QSA attention per 4; n-gram embedding at
+Layer 2; QSA indexer = MQA, 4 query heads / 1 key head, token budget K=2048, r=4.
+
+### BUGS FOUND AND FIXED
+1. **`E0_VRAM_MB` alone was a no-op.** `edge0_pref_init` gates its early return on
+   `g.vram_mb` (prefetch.cc:997) but read `E0_VRAM_MB` at line 1085, 88 lines AFTER the
+   gate - so the value was still 0 at the check. With only `--pool-mb` keeping the function
+   alive did the tier come up. Moved the parse above the gate.
+2. **The hook never fired at all.** `ggml_cuda_mul_mat_id` (ggml-cuda.cu:1983-2012) takes a
+   fused fast path and RETURNS before reaching the per-expert loop the hook lives in:
+   decode (`ne2 <= MMVQ_MAX_BATCH_SIZE`, quantized src0) goes to
+   `ggml_cuda_mul_mat_vec_q` at line 1990 and returns. `ggml_cuda_mul_mat_id_needs_sync`
+   only feeds an ASSERT at line 2015, not a routing decision - so patching it changed
+   nothing. Measured proof: `hit=0 miss=0 refused=0 bypass=0` over 4 steps.
+   FIX = new patch **0009**: skip the fused fast paths when the source is a pooled expert
+   tensor, so control reaches the per-expert loop. After: step 1->4 hits 12->36->56->77.
+
+### THE REAL BLOCKER (measured, not theorised)
+A/B on Qwen3.5-35B-A3B, `-ngl 99 --n-cpu-moe 20`, 48 tokens, 16 GiB RAM:
+- POOL-OFF: **11.55 tok/s**
+- POOL-ON (E0_VRAM_MB=1024): **8.36 tok/s = -28%**
+- trace: `hit=6292 miss=2533 evict=1293 fills L1=0 GGUF=2533` (71.7% hit rate)
+
+The tier reaches a 71% hit rate and is still 28% SLOWER. Why: every fill came from the
+GGUF (`fills L1=0 GGUF=2533`), never from the resident expert tensor. `ggml_cuda_mul_mat_id`
+only runs on the GPU backend, so `src0` is necessarily **already VRAM-resident** when the
+hook fires. The pool therefore duplicates data that is already in VRAM and pays NVMe reads
++ H2D copies + evictions to serve "D2D hits" that replace a VRAM read with a VRAM read.
+
+Configuration matrix that proves the point:
+| expert tensor lives in | does the hook fire? | result |
+|---|---|---|
+| host RAM (`-cmoe` / `--n-cpu-moe`) | no - CPU backend runs the matmul | dead |
+| VRAM (`-ngl`) | yes | dead *and* slower: data already resident |
+
+`-ngl 99` without `-cmoe` on the 78 GiB model fails outright:
+`alloc_tensor_range: failed to allocate ROCm0 buffer of size 48239767808` (48.2 GiB
+requested on 12 GiB VRAM) - llama.cpp offloads expert tensors all-or-nothing per tensor.
+
+### UPSTREAM BUG HIT (not ours)
+`--n-cpu-moe 9999` asserts at common/common.cpp:1706 "Tensor buffer overrides not
+terminated with empty pattern". Cause is upstream `common/common.h:1145`
+`llm_add_n_cpu_ffn_overrides`, which pushes ONE override PER LAYER (`for i in 0..n`), so a
+huge N overruns `llama_max_tensor_buft_overrides()` and the padding loop at arg.cpp:942
+never runs. Our patches do not touch that vector. Correct value is a LAYER COUNT.
+
+### 78 GiB MODEL THROUGHPUT (honest, slow)
+`-cmoe` (all experts on CPU, whole model demand-paged through 16 GiB):
+- 76s load, prompt eval 78113 ms / 12 tokens (0.15 tok/s)
+- eval 1143445 ms / 32 tokens = **36885 ms/token = 0.03 tok/s**
+That is the pure cold-tier baseline; a 78 GiB model on a 16 GiB box thrashes the page cache.
+
+### VERDICT ON THE CENTRAL GOAL
+The VRAM hot tier (T1/T2) is implemented, builds clean (493/493, 9 patches), and the
+identification/monitoring machinery works - hot counts, ARC eviction, decayed top-N pinning
+and per-step/final traces all measure real. But it CANNOT pay off in its current form: to
+benefit, the expert tensor must live in host memory while the matmul runs on the GPU, i.e.
+the op-offload / custom-buffer-type path. That is exactly what RUN-012 found unreachable and
+what the completeness audit named as needing a "GPU-backend implementation". Confirmed
+independently here by measurement.
+
+### WHAT THIS DOES NOT MEAN
+Not a statement that a VRAM hot tier is impossible - FATE (arXiv:2502.12224) gets
+33.7 -> 64.5 t/s doing exactly this. It means the hook must be on the *upload* side (host
+-> VRAM per step), not on a base-substitution of an already-resident tensor.
+
+### PROFILING (unblocked)
+rocprof/bprofiler absent, but `G:\AMD-Ai\hip_tracer\build\hip_tracer_launcher.exe` is an
+amdhip64 proxy-DLL shim producing per-HIP-call CSV traces (test_trace.csv..
+test_trace8.csv already exist), and `G:\AMD-Ai\AMD-AI-COMPASS` is the user's own AMD perf
+tracing port. The Dispatch trap (RUN-012) needs hip_tracer wiring, not rocprof.
+NOT yet wired or used this session.

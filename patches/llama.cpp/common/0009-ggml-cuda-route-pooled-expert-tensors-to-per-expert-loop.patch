@@ -1,0 +1,40 @@
+From fd55718f86fb965d6be0a47386663f521d47576a Mon Sep 17 00:00:00 2001
+From: edge0 <dev@edge0.ai>
+Date: Sun, 11 Oct 2026 13:34:32 +0530
+Subject: [PATCH] ggml-cuda: route pooled expert tensors to the per-expert loop
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 22ede3b52..837d58cbf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1936,8 +1936,6 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
+-    // edge0: a pooled expert tensor must take the per-expert fallback, where the device
+-    // base can be substituted (and which is never graph-captured).
+     if (ggml_edge0_vram_has(src0)) {
+         return true;
+     }
+@@ -1980,7 +1978,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++    //
++    // edge0 VRAM tier: a pooled expert tensor is routed to the per-expert loop below,
++    // which is the only place the resident device base can be substituted for
++    // src0->data. The fused MMVQ/MMQ/MMF kernels return early and read the base inside
++    // the kernel, so they cannot serve the hot tier.
++    const bool edge0_pooled = ggml_edge0_vram_has(src0);
++    if (!edge0_pooled && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+             if (ggml_is_quantized(src0->type)) {
+-- 
+2.55.0.windows.5
+
