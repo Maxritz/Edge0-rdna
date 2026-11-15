@@ -307,6 +307,21 @@ bool env_on(const char* name) {
 const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
+// STRATA_PERF_TRACE=1: the host-side phase timings of a window - capture and instantiate, the graph launch, the
+// stream query, every layer's ring wait and the window total.  A gfx103x card loses its first window inside one of
+// these, and the counters name which one: diagnostics only, no behaviour change.
+bool perf_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PERF_TRACE");
+        return v != nullptr && v[0] != 0 && v[0] != '0';
+    }();
+    return on;
+}
+void perf_note(const char* what, double ms) {
+    if (!perf_on()) return;
+    std::fprintf(stderr, "strata perf: %-32s %10.1f ms\n", what, ms);
+    std::fflush(stderr);
+}
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
@@ -2730,6 +2745,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        // (CUDA only.) The cudaMemcpy below is a blocking D2H copy on the null stream, and on HIP that syncs against
+        // the stream being captured, so hipStreamEndCapture returns "operation failed due to a previous error during
+        // capture" and the request fails. It is a debug print of the first windows' top-3 logits, so the HIP build
+        // keeps it out of the captured window; STRATA_VERIFY_NODES and the profile counters still report the same.
         if (windows <= 12 && n_vocab_ > 0 && T > 0) {
             static std::vector<float> tmp;
             tmp.resize((size_t) n_vocab_);
@@ -2749,6 +2769,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                          std::sqrt(s2 / (double) n_vocab_));
             std::fflush(stderr);
         }
+#endif
     }
     stamp(g.n_layers, 1, 0);
     if (tap_on_ && !batch_rec_ && tap_file_ != nullptr) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
@@ -2883,7 +2904,7 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-#if !defined(STRATA_GPU_METAL)
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (graph) {   // K0: dump node order (unconditional — env was not reaching the engine) (D2H / wait_flag / H2D / kernel)
         size_t nn = 0;
         if (cudaGraphGetNodes(graph, nullptr, &nn) == cudaSuccess && nn > 0) {
@@ -3371,6 +3392,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (!pre) refresh_ar();
     // STRATA_SELECT_LONG: the select kernels this window's context pays off with (the same on every stage)
     sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;
+    const Clock::time_point t_cap = Clock::now();
     if (!capture(T, err) || !capture_commit(err)) return false;
     const bool chain = chain_overlap();
     if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
@@ -3379,6 +3401,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         next_->sel_long_ = sel_long_;
         if (!next_->capture(T, err) || !next_->capture_commit(err)) return false;
     }
+    perf_note("capture + instantiate", ms_since(t_cap));
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
     if (!pre && !staged_) stage_inputs(T, tokens, pos0);
@@ -3396,6 +3419,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     std::optional<HostGraphLaunch> launch_o;   // (not set when the previous stage launched this window already)
+#else
+    // HIP: the window graph is submitted from a helper thread, so this thread always reaches the serve loop below.
+    std::optional<std::thread> launch_th;
+    std::atomic<int> launch_rc{(int) cudaSuccess};   // the helper's result, read when the window ends
+    struct LaunchJoiner {
+        std::optional<std::thread>& th;
+        ~LaunchJoiner() { if (th && th->joinable()) th->join(); }   // an early return never leaves a joinable thread
+    } launch_joiner{launch_th};
 #endif
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     bool flag_raised = false;   // the PLE flag went up before the launch (early_ple_flag_mode)
@@ -3431,6 +3462,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
             !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+        const Clock::time_point t_launch = Clock::now();
+        cudaError_t le = cudaSuccess;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
         static const bool threaded_launch = [] {
@@ -3439,13 +3472,28 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }();
         launch_o.emplace(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_, device_, threaded_launch,
                          [this] { (void) release_gpu_waits(5000); });
-        const cudaError_t le = launch_o->status();
+        le = launch_o->status();
 #else
-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
+        // HIP (gfx103x): hipGraphLaunch blocks while the graph's first kernels spin on this thread's doorbell and the
+        // command queue stops draining, so a blocking submit here can never reach the serve loop that would raise it
+        // and the window only ends on the watchdog's release (#267).  Submit from a helper thread - the CUDA path's
+        // threaded HostGraphLaunch - and this thread serves.  STRATA_VERIFY_ASYNC_LAUNCH=0 keeps the blocking submit.
+        static const bool threaded_launch = [] {
+            const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (threaded_launch) {
+            launch_th.emplace([&launch_rc, exec = (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]), cs = cs_] {
+                launch_rc.store((int) cudaGraphLaunch(exec, cs), std::memory_order_release);
+            });
+        } else {
+            le = cudaGraphLaunch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
+        }
 #endif
+        perf_note("graph launch", ms_since(t_launch));
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         graph_launched = true;
-        { cudaError_t q = cudaStreamQuery(cs_); std::fprintf(stderr, "K0-LAUNCH-QUERY %s\n", q == cudaSuccess ? "SUCCESS(idle)" : (q == cudaErrorNotReady ? "NOTREADY(busy)" : cudaGetErrorString(q))); }
+        { const Clock::time_point tq = Clock::now(); cudaError_t q = cudaStreamQuery(cs_); perf_note("stream query (after launch)", ms_since(tq)); std::fprintf(stderr, "K0-LAUNCH-QUERY %s\n", q == cudaSuccess ? "SUCCESS(idle)" : (q == cudaErrorNotReady ? "NOTREADY(busy)" : cudaGetErrorString(q))); }
         if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         (void) launch_o->query();
@@ -3546,6 +3594,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const Clock::time_point b = Clock::now();
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);
+        if (perf_on() && ms_since(a) > 50.0) perf_note(("layer " + std::to_string((long long) l) + " ring wait").c_str(), ms_since(a));
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && l >= 0 &&
             (size_t) l < adapt_gate_->has.size() && adapt_gate_->has[(size_t) l] != 0 &&
             !adapt_gate_wait((int32_t) l, err)) return false;
@@ -3763,6 +3812,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
     }
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    if (launch_th) {   // the window is served: the submit has drained, so this returns without a stall
+        if (launch_th->joinable()) launch_th->join();
+        const cudaError_t lr = (cudaError_t) launch_rc.load(std::memory_order_acquire);
+        if (lr != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(lr); return false; }
+    }
+#endif
+    perf_note("window total (launch to done)", ms_since(t0));
     VDBG("window done\n");
     ++windows;
     progress_at("decode");
@@ -4613,6 +4670,19 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
     }
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // HIP loads a graph's kernels on its first launch, and that load lands inside the first window, where the serve
+    // watchdog ends the engine (#267).  Upload the graph here, where it is made, so any such cost is paid at capture
+    // time - before the first window runs - and the launch is only a queue submit.  Measured 0.0-0.1 ms on gfx1031
+    // with ROCm 7.16 (the kernels are already resident there): the guard against a driver that does pay it here.
+    // STRATA_PERF_TRACE=1 prints the upload and the launch side by side.
+    {
+        const Clock::time_point tu = Clock::now();
+        const hipError_t ue = hipGraphUpload(got, cs_);
+        perf_note("hipGraphUpload (cold kernel load)", ms_since(tu));
+        if (ue != hipSuccess) (void) hipGetLastError();   // a failed upload is retried by the launch itself
+    }
+#endif
     ex = got;
     return true;
 }

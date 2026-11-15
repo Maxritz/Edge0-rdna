@@ -1529,6 +1529,7 @@ void experts_latent_q3k(const WideBatch& b, const LatentGeom& g, int n_expert, i
         std::exit(1);
     }
     const cudaStream_t s = (cudaStream_t) stream;
+#if !defined(__HIPCC__)
     const Tables tb = tables(const_cast<void*>(scratch), n_expert);
     // the most tiles the batch can have: every row in it, plus a partial tile per expert
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
@@ -1542,6 +1543,13 @@ void experts_latent_q3k(const WideBatch& b, const LatentGeom& g, int n_expert, i
     latent_kernel_q3k<false><<<g_d, LTHREADS, lat_smem_bytes(), s>>>(b, tb, g, (const uint8_t*) hbuf, src, nullptr, dm);
     ck(cudaGetLastError(), "experts_latent_q3k down");
     ck(cudaGetLastError(), "experts_latent_q3k");
+#else
+    // The q3k latent A kernel is the sm_80 s8-mma form (mma.sync m16n8k16) and is compiled for CUDA only; the
+    // section above opens with `#if !defined(__HIPCC__)` and lat_dev() reports not-ok in the same file, so the
+    // caller never reaches this launch.  A HIP engine runs the prompt's grouped experts through MMQ (the default
+    // path: STRATA_PF_FUSED is opt-in), which is how the gfx1030/gfx103x community builds ran.
+    (void) s;
+#endif
 }
 
 // The latent D projection on the fused dense kernel: the layer input's q8_1 rows [M = T, K = N] (`xq`,

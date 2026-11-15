@@ -106,6 +106,10 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaPeekAtLastError hipPeekAtLastError
+// hipPointerAttribute_t carries the same fields the callers read: `device` (the ordinal) and `type` (the deprecated
+// union member over memoryType; hipMemoryTypeHost=1, hipMemoryTypeDevice=2, hipMemoryTypeManaged=3, the CUDA values).
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #define cudaSetDevice hipSetDevice
 #define cudaStreamBeginCapture hipStreamBeginCapture

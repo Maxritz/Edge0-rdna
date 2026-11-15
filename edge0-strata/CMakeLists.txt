@@ -2499,6 +2499,15 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
       src/prefill/moe_f16_kq.cu
+      # the Q3_K latent A stage (docs: the CUDA branch adds these with the other latent sources): the Edge0 120B /
+      # 145B Q3_K packs' grouped expert product.  Without them a HIP engine built for a Q3_K model links with
+      # experts_latent_q3k / lat_q3k_fused undefined.  They are Strata's own CUDA-shaped sources and need the
+      # HIP compat headers (the INCLUDE_DIRECTORIES line below).
+      src/prefill/lat_q3k_down.cu
+      src/prefill/lat_q3k_gu.cu
+      src/prefill/lat_q3k_swiglu.cu
+      src/prefill/lat_q3k_fused.cu
+      src/prefill/moe_fused_q3k.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_quantize_cu}")
     if(STRATA_MMQ_KQUANTS)
@@ -2517,6 +2526,8 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
     # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
     set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
+                                src/prefill/lat_q3k_down.cu src/prefill/lat_q3k_gu.cu src/prefill/lat_q3k_swiglu.cu
+                                src/prefill/lat_q3k_fused.cu src/prefill/moe_fused_q3k.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
@@ -2565,6 +2576,12 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_mmq_parity COMMAND hip_prefill_mmq_parity)
     set_tests_properties(hip_prefill_mmq_parity PROPERTIES TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_mmq_parity)
+  endif()
+  if(STRATA_ENABLE_HIP)
+    # The latent-MoE layer of the Edge0 packs (the D/U file mapping and its mmap, the latent layer): the CUDA
+    # branch adds these two with the other latent sources (see STRATA_ENABLE_CUDA above).  A HIP engine serving
+    # edge0-120b / edge0-145b needs them or LatentA / LatentDense are undefined at link.
+    target_sources(strata_engine PRIVATE src/core/latent_dense.cpp src/latent/latent_moe.cpp)
   endif()
   if(STRATA_ENABLE_HIP)
     # Optional real-model diagnostic: pass the GGUF shard containing the native PLE key.

@@ -34,6 +34,10 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 
+#if defined(_WIN32)
+#include <windows.h>   // GetModuleHandleA / GetProcAddress: the HIP graph listing resolves hipKernelNameRefByPtr
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -888,7 +892,16 @@ void mtp_list_nodes(cudaGraph_t graph, const char* what) {
         if (ty == hipGraphNodeTypeKernel) {
             hipKernelNodeParams kp{};
             if (hipGraphKernelNodeGetParams(nd, &kp) == hipSuccess && kp.func != nullptr) {
+#if defined(_WIN32)
+                // On Windows amdhip64's import library exports no hipKernelNameRefByPtr, so calling it directly
+                // fails at link; it is still in the runtime and is resolved here as verify.cpp's listing does.
+                using Fn_hipKernelNameRefByPtr = const char* (*)(const void*, hipStream_t);
+                static auto p_hipKernelNameRefByPtr = reinterpret_cast<Fn_hipKernelNameRefByPtr>(
+                    GetProcAddress(GetModuleHandleA("amdhip64_7.dll"), "hipKernelNameRefByPtr"));
+                const char* fn = p_hipKernelNameRefByPtr ? p_hipKernelNameRefByPtr(kp.func, nullptr) : nullptr;
+#else
                 const char* fn = hipKernelNameRefByPtr(kp.func, nullptr);
+#endif
                 if (fn != nullptr) name = fn;
             }
         }

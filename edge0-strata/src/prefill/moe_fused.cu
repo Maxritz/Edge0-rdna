@@ -1404,6 +1404,7 @@ void experts_latent(const WideBatch& b, const LatentGeom& g, int n_expert, int64
         std::exit(1);
     }
     const cudaStream_t s = (cudaStream_t) stream;
+#if !defined(__HIPCC__)
     const Tables tb = tables(const_cast<void*>(scratch), n_expert);
     // the most tiles the batch can have: every row in it, plus a partial tile per expert
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
@@ -1415,6 +1416,14 @@ void experts_latent(const WideBatch& b, const LatentGeom& g, int n_expert, int64
     latent_kernel<false><<<g_d, LTHREADS, lat_smem_bytes(), s>>>(b, tb, g, (const uint8_t*) hbuf, src, nullptr, dm);
     ck(cudaGetLastError(), "experts_latent down");
     ck(cudaGetLastError(), "experts_latent");
+#else
+    // The NVFP4 latent A kernel is an sm_80 s8-mma path and is compiled for CUDA only (the section above opens
+    // with `#if !defined(__HIPCC__)`), so the launch is out of the HIP build.  lat_dev() never reports ok on HIP
+    // (its probe is in the same CUDA-only section), and the check above has already returned, so this is
+    // unreachable: a Q3_K pack's latent A stage runs moe_fused_q3k.cu's latent_kernel_q3k instead, and an NVFP4
+    // pack is refused before it gets here.
+    (void) s;
+#endif
 }
 
 // The latent D projection on the fused dense kernel: the layer input's q8_1 rows [M = T, K = N] (`xq`,
