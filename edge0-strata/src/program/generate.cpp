@@ -18005,6 +18005,21 @@ int main(int argc, char** argv) {
             }
             if (o.prefill_auto) {
                 o.prefill_chunk = k > 0 ? chunk : request_chunk(n_batched, 1024);
+                // 0.28: cap the automatic chunk at 512 tokens for a pack whose layers hold few experts.  The
+                // measured reason: a 1,024-token chunk streams 24,024 experts - EVERY expert of the 12,288-row
+                // pack TWICE - while 512 streams 62,558 (63 % once), and at the same 552-slot cache that is
+                // 203.31 / 201.66 tok/s against 244.16 / 244.14.  The host-tier planner cannot see it (its
+                // stream term is `experts_total - gpu_cache + lend_bytes`, which can never exceed one pack), so
+                // the cap lives here, keyed on the geometry rather than on a box or a harness pin.  Packs with
+                // many experts a layer (the multi-GPU rigs the planner was fitted on) keep the old choice.
+                if (g.n_expert > 0 && g.n_expert <= 512 && o.prefill_chunk > 512 &&
+                    (o.prefill_auto_cap <= 0 || o.prefill_auto_cap > 512)) {
+                    std::fprintf(stderr,
+                                 "strata generate: prompt chunk auto: %lld -> 512 tokens (a %lld-expert layer's "
+                                 "working set fits ~512 tokens; a larger chunk re-streams every expert twice)\n",
+                                 (long long) o.prefill_chunk, (long long) g.n_expert);
+                    o.prefill_chunk = 512;
+                }
                 std::fprintf(stderr, "strata generate: prompt chunk auto: %lld tokens\n", (long long) o.prefill_chunk);
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before

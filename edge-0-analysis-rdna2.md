@@ -947,6 +947,30 @@
 >
 > `STRATA_PLE_PREFETCH=N` (4-128, default 64) ships as the diagnostic the A/B used.
 
+> ### 0.31 Lean: the auto chunk is capped by geometry, no harness pinning needed
+>
+> The correction that made this work: this pack has **512 experts a layer (24,576 in all**, not 12,288 - the
+> profile line says "built for 24576 slots").  So a 1,024-token chunk streams 24,024 experts = **the whole
+> pack once**, and 512 streams 7,819 a chunk.
+>
+> With that, the engine caps its own automatic chunk: a pack with <=512 experts a layer never takes more
+> than 512 tokens, because a larger chunk re-streams a layer's working set.  Measured with no pinning and no
+> STRATA_* override, `--prefill auto` alone:
+>
+> | cache slots | auto chunk before | after | prefill |
+> |---|---|---|---|
+> | 735 | 512 | 512 | 239.47 |
+> | 511 | 1024 | **512** | **234.48** (was 192.82 with 1024: **+21.6 %**) |
+> | 626 | 256 | 256 | 166.93 |
+>
+> Byte-identical output where the cap fired.  The 626-slot case still takes 256 because that is the host-tier
+> planner's own fit choice - the remaining planner defect (0.24-0.27), now bounded to that band.
+>
+> **hc1 norm resolved as well** (the interrupted test): with the persistent read ON the whole HC read is
+> charged to the `norm` slot (26.19 ms); turning persistence OFF splits it and shows the truth - **`up`
+> 24.61 ms**, down 2.89, **norm 0.30**.  So the 22.9 % decode item is the FFN-side hyper-connection *up
+> projection*, at ~0.51 ms a layer for 4 tokens: a latency-bound small-batch GEMV, not a norm.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
