@@ -818,6 +818,24 @@
 > Until the formula is derived from that pair, the shipped behaviour is unchanged (0.23's ring 96 gives
 > chunk 512 at 796-803 slots, 249.00 / 248.54 tok/s) and every harness pins the chunk explicitly.
 
+> ### 0.26 The half-chunk rule (attempt 2) also did not fire - the early return bypasses the scan
+>
+> 0.25 proved the defect at a fixed cache (512 pinned 244.16 / 244.14 against auto's 1024 at 203.31 /
+> 201.66) and found the mechanism in the same pair: 1024 streams 81,684 blobs against 62,554 and keeps
+> 854 experts resident against 1,519, because a bigger chunk lends the prompt path more cache slots.
+> Attempt 2 was a bounded rule - "while c > 512 and half of c also fits with a nearly full ring, take the
+> half" - inserted right after `int64_t c = scan(ring_max);`.
+>
+> It changed nothing: at 782 / 674 / 557 cache slots the auto chunk stayed 512 / 256 / 1024.  The reason
+> is above the loop, not in it: `if (small >= c) { ... return slots_for(small); }` returns 0.1.39's chunk
+> *before* any refinement runs, and at 557 slots `old_rule()` already returns 1024, so `small >= c` and
+> the function exits with 1024.  Any future fix has to be placed above that early return (or make it
+> compare against the refined value), which is where attempt 1 also failed.
+>
+> Reverted unshipped again.  The shipped behaviour is unchanged (ring 96, chunk 512 at 782-803 slots,
+> 249.00 / 248.54 tok/s) and the two arms' blob/resident numbers above are the honest anchors for the
+> cost model whenever it is written.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
