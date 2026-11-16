@@ -862,6 +862,29 @@
 > 249.00 / 248.54 tok/s, byte-identical, 512K+MTP exit 0).  The next attempt starts in `prefill_plan.hpp`,
 > not in `plan_lend`.
 
+> ### 0.28 Per-chunk streaming, instrumented: at chunk 1024 the prompt streams the whole pack TWICE
+>
+> `STRATA_CHUNK_TRACE=1` prints what each chunk actually streamed (prefill.cpp, at `++stats_.chunks`), at a
+> fixed 552-slot cache:
+>
+> | chunk | per-chunk streamed | series | total |
+> |---|---|---|---|
+> | 512 | ~7,800 | 7,758 / 7,282 / 7,365 / 7,497 / 8,115 / 7,843 / 8,372 | 62,589 |
+> | 1024 | **24,024** | 24,024 / 24,024 / 24,024 (+ the 991-token tail) | 81,818 |
+>
+> The pack has 48 layers x 256 experts = **12,288 experts in total**, so chunk 1024 streams *every expert
+> twice* within one chunk, where 512 streams 63 % of them once.  That is the whole 21 %: not the cache
+> size, not the ring depth, but **re-staging inside a chunk** - a chunk's working set (up to 256 distinct
+> experts a layer) no longer fits the 96-slot ring, so experts needed by entries in two different A-stage
+> batches are copied twice.
+>
+> So the planner's `stream = experts_total - gpu_cache + lend_bytes` is wrong in kind, not just in scale:
+> it can never exceed one pack's worth, while the engine can stream 2x.  And the cheaper fix may not be in
+> the planner at all - sizing the ring to the chunk's working set would make a bigger chunk competitive
+> instead of penalising it, which is the trade the automatic rule is trying to find.
+>
+> The instrument ships (env-gated, one line per chunk); nothing else changed.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

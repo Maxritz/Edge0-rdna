@@ -3413,6 +3413,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #endif
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
+        if (std::getenv("STRATA_CHUNK_TRACE") != nullptr) {
+            // 0.27: the planner's stream term is chunk-independent (`experts_total - gpu_cache + lend_bytes`)
+            // while the measurement says per-chunk streaming is strongly chunk-dependent (at a fixed 552-slot
+            // cache: 6,490 blobs/chunk at 256 tokens, 7,819 at 512, 20,421 at 1024 - the last is more than the
+            // 12,288 experts that exist, i.e. it re-streams WITHIN a chunk through the ring).  This prints what
+            // each chunk actually streamed, so the model can be fitted to the real shape instead of 3 totals.
+            static long long prev_streamed = 0;
+            const long long now = (long long) stats_.experts_streamed;
+            std::fprintf(stderr, "prefill chunk %lld: %lld experts streamed in the previous chunk\n",
+                         (long long) stats_.chunks - 1, now - prev_streamed);
+            prev_streamed = now;
+        }
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
