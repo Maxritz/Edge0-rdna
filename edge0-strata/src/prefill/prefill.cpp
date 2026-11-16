@@ -1524,7 +1524,13 @@ bool lat_fused_q3k_on() {
 int lat_staged_batch() {
     static const int n = [] {
         const char* v = std::getenv("STRATA_LAT_STAGED_BATCH");
-        const int k = v != nullptr ? std::atoi(v) : 4;
+        // 16, not 4: with stage_n finally equal to the 32 staging slots the walk owns (it was hard-coded to
+        // STAGE = 8), the cap stage_n / 2 is 16 and each launch carries that many expert groups instead of
+        // four - 4x fewer launches, 4x more blocks in flight.  Measured on gfx1031, 4063-token prompt:
+        // GPU timeline 32,828 -> 28,492 ms (-13.2%), prefill 123.66 -> 142.46 tok/s, gemm gate/up
+        // 8,420 -> 6,170 ms, and the generated tokens unchanged (n2.log against w3.log).  The earlier
+        // 8/16/64 measurements that showed "no effect" were all silently clamped to 4 at this cap.
+        const int k = v != nullptr ? std::atoi(v) : 16;
         return k > 0 ? k : 1;
     }();
     return n;
@@ -5381,7 +5387,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool group_resident = group_env && !stream_all && use_mmq && lay.native &&
                                                     MMQ_GROUP <= mmq::kGatherGroupMax;
                         const bool gg_now = group_gather || group_resident;
-                        const int stage_n = group_resident ? STAGE_GRP : STAGE;
+                        // The staging slots this walk may cycle through.  It was `group_resident ? STAGE_GRP : STAGE`,
+                        // i.e. 8 for a streamed walk, and stage_batch = min(batch, stage_n / 2) then capped the fused
+                        // A stage's launch at FOUR groups - which is why asking for 8, 16 or 64 changed nothing at
+                        // all (all three measured 32.1 s: the request was silently clamped).  The buffers are already
+                        // stage_slots() = max(ring_slots, STAGE_GRP = 32), and the walk cycles `% stage_n`, so the
+                        // ring can use all 32 of them: this is the launch width's real ceiling, and it costs no VRAM.
+                        const int stage_n = (int) stage_slots((size_t) T);
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
                         std::vector<int> stage_of(order.size(), -1);
