@@ -3115,6 +3115,7 @@ struct DevState {
     unsigned* bar = nullptr;
     int max_t = 0;      // 0: off on this card
     bool tried = false;
+    bool enabled = false;   // the decision (env, else the arch default) - the read's gate, so init and read agree
 };
 DevState g_dev[64];
 using KFn = void (*)(PArgs);
@@ -3152,15 +3153,23 @@ void launch(const FusedGrArgs* a, int n_tok, const DevState& st, cudaStream_t s,
     f.part = st.part; f.ssp = st.ssp; f.bar = st.bar; f.partd = st.partd; f.sspd = st.sspd; f.timeout_ticks = ticks;
     kernel_for(n_tok)<<<NB, THREADS, 0, s>>>(f);
 }
-bool env_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_HC_PERSIST"); return v != nullptr && std::atoi(v) != 0; }();
-    return on;
+// -1 = not given: decide from the card's arch.  0 / 1 = explicit, and the explicit value always wins.
+int env_mode() {
+    static const int m = [] { const char* v = std::getenv("STRATA_HC_PERSIST"); return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
+    return m;
+}
+// gfx10 (RDNA1/2) is where this kernel was written and measured ("written and measured for gfx1030", below).
+// Defaulting it on there is the 2026-11-16 measurement on a gfx1031 (RX 6700 XT): decode 24.67 -> 25.65 tok/s on a
+// 32-token run of prompt4k, the verify window 92.93 -> 88.96 ms, and the 32 committed tokens identical to the default
+// read (re2.log vs h1.log).  gfx11/gfx12 are refused by the checks in the init below, and every other arch keeps the
+// previous opt-in default.  STRATA_HC_PERSIST=0 is the escape hatch.
+bool arch_default_on(const char* gcn_arch) {
+    return gcn_arch != nullptr && std::strncmp(gcn_arch, "gfx10", 5) == 0;
 }
 }  // namespace hcp
 }  // namespace
 
 void fused_gr_persist_init() {
-    if (!hcp::env_on()) return;
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64 || hcp::g_dev[dev].tried) return;
@@ -3168,14 +3177,21 @@ void fused_gr_persist_init() {
     st.tried = true;
     cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, dev);
+    const int mode = hcp::env_mode();
+    const char* arch = nullptr;
+#if defined(__HIPCC__)
+    arch = prop.gcnArchName;
+#endif
+    st.enabled = mode >= 0 ? mode == 1 : hcp::arch_default_on(arch);
+    if (!st.enabled) return;
     if (prop.warpSize != 32) {
-        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: the kernel is written for 32-lane waves "
+        std::fprintf(stderr, "strata hc: CUDA%d: the persistent hyper-connection read is off here: the kernel is written for 32-lane waves "
                              "(this card runs %d)\n", dev, prop.warpSize);
         return;
     }
 #if defined(__HIPCC__)
     if (strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName) || strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName)) {
-        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: gfx11 / gfx12 have no s_memrealtime for the barrier "
+        std::fprintf(stderr, "strata hc: CUDA%d: the persistent hyper-connection read is off here: gfx11 / gfx12 have no s_memrealtime for the barrier "
                              "timeout (written and measured for gfx1030; an R9700 saw no gain from it, #2226)\n", dev);
         return;
     }
@@ -3189,7 +3205,7 @@ void fused_gr_persist_init() {
               cudaMemset(st.bar, 0, 64 * sizeof(unsigned)) == cudaSuccess;
     if (!ok) {
         cudaGetLastError();
-        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: workspace allocation failed\n", dev);
+        std::fprintf(stderr, "strata hc: CUDA%d: the persistent hyper-connection read is off here: workspace allocation failed\n", dev);
         return;
     }
     // the check: random weights and inputs with the pending write and the inject rows, against the default read; the
@@ -3284,28 +3300,29 @@ void fused_gr_persist_init() {
     cudaDeviceSynchronize();
     cudaGetLastError();
     if (!ok) {
-        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: the check failed at %d tokens "
+        std::fprintf(stderr, "strata hc: CUDA%d: the persistent hyper-connection read is off here: the check failed at %d tokens "
                              "(max relative difference %.3g)\n", dev, bad_t, worst);
         return;
     }
     if (max_t == 0) {
-        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: 80 blocks are not resident at once on %d "
+        std::fprintf(stderr, "strata hc: CUDA%d: the persistent hyper-connection read is off here: 80 blocks are not resident at once on %d "
                              "multiprocessors (the check timed out)\n", dev, mp);
         return;
     }
     st.max_t = max_t;
-    std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1: the verifier's hyper-connection read runs as one "
+    std::fprintf(stderr, "strata hc: CUDA%d: the persistent hyper-connection read is on (STRATA_HC_PERSIST=0 turns it off): one "
                          "persistent kernel (80 blocks on %d multiprocessors, up to %d tokens; %d token counts timed out in "
                          "the check; checked against the default read, max relative difference %.2g)\n", dev, mp, max_t,
                  timeouts, worst);
 }
 
 bool fused_gr_read_persist(const FusedGrArgs* a, int n_tok, void* stream) {
-    if (!hcp::env_on() || n_tok < 1) return false;
+    if (n_tok < 1) return false;
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) return false;
     const hcp::DevState& st = hcp::g_dev[dev];
+    if (!st.enabled) return false;
     if (n_tok > st.max_t) return false;
     if (a[0].q8_down != nullptr || a[0].q8_up != nullptr) return false;    // STRATA_HC_Q8: the default read
     for (int t = 0; t < n_tok; ++t)

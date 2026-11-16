@@ -642,7 +642,7 @@ void Verifier::trace_ev(const char* what, int64_t step, int64_t layer, int64_t a
 
 void Verifier::trace_dump(std::FILE* f) const {
     if (!g_trace || f == nullptr) return;
-    static const char* names[kProfPer] = {"pre", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "kv-idx", "k/v rope", "kv append", "q", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+ring", "shared", "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "combine", "", "head", "", "", "ymWait", "ymCopy", "ymAdd", "", "", "", ""};
+    static const char* names[kProfPer] = {"pre", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "kv-idx", "k/v rope", "kv append", "q", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+ring", "shared", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "combine", "", "head", "", "", "ymWait", "ymCopy", "ymAdd", "", "", "", ""};
     const uint64_t end = g_trace_next.load();
     const uint64_t n = end < 160 ? end : 160;
     std::fprintf(f, "strata verify trace (#649): the last %llu handshake events (host clock, us before the last; "
@@ -2484,6 +2484,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);   // E-6 latent: no CPU rows in an all-resident plan
                 else
                 wait_flag_ge(m_flag_, ring, cs);   // separate 1-block wait (not 12800 fused spins)
+                stamp(l, 22, grp);                 // the pool's hq rows are in (the latent path uses 22/23 where the
+                                                   // non-latent path reports its PCIe group and its CPU-row wait)
                 if (trace_m_ != nullptr) gpu_stamp(trace_m_, (l * kProfPer + 37) * 2, cs);   // T-TRI breadcrumb
                 // knife-0: a copy KERNEL, not cudaMemcpyAsync: a host-issued H2D inside the verify window (the GPU
                 // spinning on the flag it raises) is the issue #31 driver-lock deadlock; the kernel moves the same
@@ -2496,6 +2498,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                  p_dst, p_counts + 1, (int64_t) lat_E_, cap,
                                                  (int) lat_ELL_, (int) N, (int) lat_G_, parts_out, cs, lat_fmt_);
                 moe_hit_set(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);   // knife-0: assign, as u0 does
+                stamp(l, 23, grp);   // the hq copy + the U matvec + the hit rows are done; `copy+combine` is the combine
                 if (trace_m_ != nullptr) gpu_stamp(trace_m_, (l * kProfPer + 38) * 2, cs);   // T-TRI breadcrumb
             } else if (seg_split) {   // SEGSPLIT: the measured three-step form (wait / copy / add separated)
                 stamp(l, 32, grp);                                        // before-wait (slot 32: unused)
@@ -2789,7 +2792,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
 std::string Verifier::profile_by_t_report() {
     if (!prof_on_) return std::string();
-    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine", "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "ymWait", "ymCopy", "ymAdd"};
+    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "ymWait", "ymCopy", "ymAdd"};
     std::string out;
     char b[96];
     for (int T = 1; T <= 8; ++T) {
@@ -2845,7 +2848,7 @@ std::string Verifier::route_stats_report() {
 
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
-    static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan+bell", "shared+quant", "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine", "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up", "", "", ""};
+    static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan+bell", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up", "", "", ""};
     std::string out;
     char b[80];
     double total = 0;
