@@ -1611,6 +1611,41 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             pending = false;
         }
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+            // Which memory the hyper-connection weights actually live in, and what that memory delivers, printed once
+            // per half.  This is the one thing the profile cannot see: `hc1 up` measures 18.3-24.6 ms a round against
+            // `hc1 down` 2.16-2.89 ms for the SAME 6.55 MB a layer, invariant to the up kernel (default gr_up_q32_kernel
+            // 18.351 / 18.331 ms, STRATA_QFUSE_HC_LOCAL=0 gr_up_multi_kernel + gr_q8_tail 18.328 ms) and nearly
+            // invariant to the token count (17.064 ms at T=1, 18.283 at T=4).  Both arrive as `->data`, so the only
+            // remaining variable is residency: 6.55 MB in 0.061 ms is 107 GB/s (VRAM), in 0.522 ms is 12.6 GB/s (PCIe).
+            // A copy of the same bytes device-to-device is the direct measurement of which one it is.
+            static bool told[2] = {};
+            if (half >= 0 && half <= 1 && !told[half]) {
+                told[half] = true;
+                auto mem_class = [](const void* p) -> const char* {
+                    if (p == nullptr) return "null";
+                    cudaPointerAttributes at{};
+                    if (cudaPointerGetAttributes(&at, p) != cudaSuccess) { cudaGetLastError(); return "UNREGISTERED"; }
+                    switch ((int) at.type) {
+                        case 1: return "HOST (read over PCIe)";
+                        case 2: return "DEVICE (VRAM)";
+                        case 3: return "MANAGED";
+                        default: return "OTHER";
+                    }
+                };
+                // A device-to-device copy is illegal during graph capture (cudaMalloc is not capturable) and this function
+                // runs inside the captured decode graph, so the pointer class above is the measurement here.
+                const int64_t wd_bytes = wd[half]->elements * 2, wu_bytes = wu[half]->elements * 2;
+                const bool nat = strata::kernels::cpu::expert_layout().native;
+                std::fprintf(stderr, "strata hc: %s HC weights: w_norm %s | w_down %s %.1f MB | w_up %s %.1f MB\n",
+                             half == 0 ? "attention-side" : "FFN-side", mem_class(wn[half]->data),
+                             mem_class(wd[half]->data), (double) wd_bytes / (1024.0 * 1024.0),
+                             mem_class(wu[half]->data), (double) wu_bytes / (1024.0 * 1024.0));
+                std::fprintf(stderr, "strata hc: %s HC extras: w_inject %s | q8_mixed target %s (native layout %d) | "
+                                     "hc_q8 down %s up %s\n",
+                             half == 0 ? "attention-side" : "FFN-side", mem_class(wi[half]->data),
+                             mem_class(half == 0 ? (const void*) xq_ : (const void*) nat_xq_), nat ? 1 : 0,
+                             wd[half]->hc_q8 != nullptr ? "set" : "null", wu[half]->hc_q8 != nullptr ? "set" : "null");
+            }
             FusedGrArgs fa[kFusedGrWideT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];

@@ -1038,6 +1038,53 @@
 > D table is still blocked applies unchanged. It would shrink the 73 GB expert stream, which is the prefill lever,
 > so it is worth doing *with* a KL/NLL gate, not before.
 
+> ### 0.33 hc1 up: five hypotheses eliminated, and the two halves disagree 9x in one trace
+>
+> The residency hypothesis of 0.32 is **wrong**, and it is now proved wrong rather than argued. `verify.cpp`'s
+> `gr_read_group` prints each HC weight's memory class and, on this card:
+>
+> ```
+> strata hc: attention-side HC weights: w_norm DEVICE (VRAM) | w_down DEVICE (VRAM) 6.2 MB | w_up DEVICE (VRAM) 6.2 MB
+> strata hc: attention-side HC extras: w_inject DEVICE (VRAM) | q8_mixed target DEVICE (VRAM) (native layout 1) | hc_q8 down null up null
+> strata hc: FFN-side HC weights: w_norm DEVICE (VRAM) | w_down DEVICE (VRAM) 6.2 MB | w_up DEVICE (VRAM) 6.2 MB
+> strata hc: FFN-side HC extras: w_inject DEVICE (VRAM) | q8_mixed target DEVICE (VRAM) (native layout 1) | hc_q8 down null up null
+> ```
+>
+> Everything is VRAM, everything is plain bf16, nothing is dequantized per call. (A device-to-device bandwidth
+> probe cannot be used here: `cudaMalloc` is illegal inside the captured decode graph, which these diagnostics
+> also discovered - the decode path runs under graph capture.)
+>
+> Five hypotheses, all eliminated with alternating runs and a byte-identical 32-token output every time:
+>
+> | hypothesis | test | result |
+> |---|---|---|
+> | the up kernel changed | default `gr_up_q32_kernel` vs `STRATA_QFUSE_HC_LOCAL=0` (`gr_up_multi_kernel` + `gr_q8_tail`) | 18.351 / 18.331 / 18.328 ms - flat |
+> | it is arithmetic | T=1 vs T=4 | 17.064 / 18.283 ms - flat, so it is one weight read a layer |
+> | the q8_1 image write | `STRATA_QFUSE_HC=0` | 18.418 vs 18.433 ms - flat |
+> | host-mapped weights | `cudaPointerGetAttributes` on all four tensors | all DEVICE (VRAM) |
+> | the read variant | `STRATA_HC_SPLIT=0` / `=1` / default staged | 18.452 / 18.402 / 18.345 ms - flat |
+>
+> **What the trace does show** is that the two halves of the same projection disagree by 9x inside one window:
+> the attention-side up is **2.000 ms** a round (slot 29, 42 us a layer - matching the isolated kernel's 57 us),
+> and the FFN-side up is **18.433 ms** (slot 32, 383 us a layer). Same 6.2 MB, same kernel family, both VRAM.
+> That contrast is the new lead, and it rules out anything global to the read.
+>
+> The profiler semantics were verified while chasing this, and are worth recording because the slot names mislead:
+>
+> * slot 30/31/32 for the FFN read are `norm` / `down` / `up`, computed at verify.cpp:3361 as
+>   `gap(30,16)`, `gap(31,30)`, `gap(32,31)`; the FFN read itself only writes stamps at base+0 and base+1, so
+>   `up` is closed by the caller's `stamp(l, 32)` at verify.cpp:2276 ("the FFN-side read ends here").
+> * slot 29 is labelled `u: copy` but is also where the hc-read0 split puts its `up` (verify.cpp:3409). The
+>   label collision is why the attention-side up has been invisible.
+> * slot 32 is written a second time at verify.cpp:2592 ("slot 32: unused"), but only under `seg_split`, which
+>   these runs do not take - so there is no collision here, and the 18.4 ms is the up stage itself.
+>
+> Next: the attention half is fast and the FFN half is not, with identical tensors, so the difference is in the
+> *call*, not the data - the FFN read is `gr_read_group(1, true, ...)` with `apply` forced true, so its up does
+> the per-row `R_out` store and the `bo_prev`/`inj_prev` loads on every one of the 10,240 rows that the attention
+> half skips when `apply` is false. That is the one asymmetry left to measure: stamp inside the FFN up's prologue
+> versus its stores.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
