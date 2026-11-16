@@ -928,6 +928,25 @@
 > either U half**, and the PLE read pattern is the largest unexplored prefill cost.  Both are new, both are
 > named here with counts and latencies, neither has been touched.
 
+> ### 0.30 PLE I/O: batching is impossible and prefetch depth is a measured non-lever
+>
+> The PLE line is 69,736 random reads of 4.2 KB for 294.8 MB, `blocked 1,562.6 ms`.  Three facts close the
+> obvious fixes:
+>
+> * **batching cannot work.**  The table is **47.68 GB** and a prompt needs 69,808 rows = **0.58 % of it**,
+>   scattered (row cache hits 0.1 %).  Coalescing nearby rows would read ~170x more than it uses.
+> * **`--ple-io ram` cannot fit.**  47.68 GB against 48 GB of RAM with a 26.66 GB arena already pinned.
+> * **the read is latency, not queue depth.**  `--ple-inflight` is already 256, and the prefetch queue depth
+>   was A/B'd at 16 / 48 / 128 tickets in alternating runs: `blocked` 1,553.1 / 1,555.0 / 1,560.2 ms and
+>   1,564.4 / 1,565.4 ms, wall 16,929-16,980 ms, prefill 239.0-239.6 tok/s, output byte-identical.  Flat.
+>
+> So `blocked` is one read round-trip per layer-chunk: 1,562 ms over 384 layer-chunks = **4.1 ms a layer**
+> against a 5.6 ms p50 read.  The lever is **pipelining** - asking for layer N+1's rows before layer N
+> computes - not a deeper queue.  That is a change to the prefill loop's call pattern, and it is the
+> recorded next step for this item.
+>
+> `STRATA_PLE_PREFETCH=N` (4-128, default 64) ships as the diagnostic the A/B used.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

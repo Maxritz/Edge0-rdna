@@ -237,7 +237,20 @@ struct PleTable::Impl {
     std::recursive_mutex mu;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
-    static constexpr size_t kMaxPrefetch = 16;
+    // 64, not 16: a prompt chunk walks all 48 layers and every layer asks for its rows, but the queue used to
+    // DRAIN whenever 16 tickets were outstanding (`wait_prefetches`), so the I/O stalled three times a chunk and
+    // the compute waited: measured 69,736 random 4 KB reads, 294.8 MB, `blocked 1,562.6 ms` of a 17.7 s prompt.
+    // 64 covers a whole chunk's layers in flight; the buffers are 64 x PLE_N_HEADS x PLE_ROW_BYTES_MAX (~4.3 MB).
+    // A prompt chunk walks all 48 layers and every layer asks for its rows, but the queue DRAINS at the limit
+    // (wait_prefetches), so 16 stalled three times a chunk.  The arrays are sized for the largest depth and the
+    // live limit is a member, so STRATA_PLE_PREFETCH=N A/Bs it without a rebuild.  Buffers: N x PLE_N_HEADS x
+    // PLE_ROW_BYTES_MAX (~8.6 MB at 128).
+    static constexpr size_t kMaxPrefetch = 128;
+    size_t prefetch_lim = [] {
+        const char* v = std::getenv("STRATA_PLE_PREFETCH");
+        const int n = v != nullptr ? std::atoi(v) : 64;
+        return (size_t) (n >= 4 && n <= 128 ? n : 64);
+    }();
     size_t n_prefetch = 0;
     strata::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
@@ -480,7 +493,7 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
         for (size_t i = 0; i < impl_->n_prefetch; ++i)
             if (std::memcmp(impl_->prefetch_keys[i], rows16, sizeof(uint32_t) * PLE_N_HEADS) == 0) return;
-        if (impl_->n_prefetch >= Impl::kMaxPrefetch) wait_prefetches();
+        if (impl_->n_prefetch >= impl_->prefetch_lim) wait_prefetches();
         const size_t slot = impl_->n_prefetch++;
         std::memcpy(impl_->prefetch_keys[slot], rows16, sizeof(uint32_t) * PLE_N_HEADS);
         impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
