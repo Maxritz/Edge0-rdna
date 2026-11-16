@@ -757,6 +757,43 @@
 > VRAM drift cannot move it.  That is configuration logic in `generate.cpp`'s `scan`/`host_plan_chunk`,
 > not a kernel.
 
+> ### 0.24 The auto-chunk cost model, specified from the data (not yet implemented)
+>
+> The scan in `generate.cpp` (plan_lend, ~8893-8905) maximises the chunk subject to "the ring is full"
+> (`room_of(t) >= ring_max`) and the lend cap.  That objective explains two of the three measured points
+> and fails the third:
+>
+> | cache slots | what the current rule picks | measured prefill | what it should pick |
+> |---|---|---|---|
+> | 741-753 | 256 (512 cannot have a FULL ring) | 164-172 tok/s | 512 |
+> | 796-803 | 512 | 248.5-249.0 | 512 |
+> | 570-572 | 1024 (the ring is full there too) | 203.6-205.7 | 512 |
+>
+> Two separate defects, and they need different terms:
+>
+> 1. **A binary floor on the ring size.**  A chunk is rejected when its ring is 3/4 full, so a 3 % VRAM
+>    drift halves the chunk.  Fix: accept `room_of(t) >= ring_max * 3 / 4` and take the larger chunk
+>    (hysteresis), which buys 512 back at 741-753 slots.
+> 2. **No term for streamed expert bytes.**  At 570 slots the ring *is* full at 1024, so the rule is
+>    satisfied - but 1024 streams **80k blobs against 512's 63.6k** for the same prompt, which is what the
+>    20 % is.  The planner currently prices buffers only (`bytes_needed` / `bytes_needed_no_ring`), and no
+>    amount of ring hysteresis can see this.
+>
+> So the objective has to become bytes **per token**, streaming included:
+>
+>   cost(T) = bytes_needed_no_ring(g, ss, T, src) / T  +  E_distinct(T) * max_blob / T
+>
+> with the second term estimated from the geometry - the engine knows `n_expert`, `K` (routed per token)
+> and `n_layers`, and the measured anchors are 63.6k blobs at chunk 512 and 80.1k at 1024 on 48 layers x
+> 4,063 tokens, i.e. ~165 and ~240 distinct experts per layer-chunk.  A saturating form
+> `E * (1 - exp(-a * T * K / E))` fits those two anchors with a ~ 0.55, and its shape is what matters:
+> the streaming term's slope falls with T while the buffer term's falls faster, so the minimum lands near
+> 512 for this pack and moves with the pack's geometry instead of being hard-coded.
+>
+> Verification the change must pass (already measured, so it is a like-for-like check): chunk 512 with
+> ~249 tok/s and byte-identical output at all three cache sizes, plus the 512K + MTP configuration still
+> starting (177 slots, exit 0) - the last one is why this is not a one-line cap.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
