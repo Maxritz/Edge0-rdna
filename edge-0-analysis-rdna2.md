@@ -394,6 +394,35 @@
 > Both tile variants stay behind `STRATA_VERIFY_U_TILE` (0 = shipped per-row, 1 = prefill tile, 2 = decode
 > tile), default 0, because a measured negative is worth more than a deleted one.
 
+> ### 0.10 Decode's U measured against four shapes and two placements: the shipped kernel is the optimum
+>
+> With the round split (0.8) the target was clear - `u: gemv` ~10-13 ms a round, `u: hqcp+matvec+hits`
+> ~14.8 - and every shape that helped prefill was tried here.  Clean alternating pairs, 32 tokens,
+> `u: gemv` from the T4 table, tokens identical in every arm:
+>
+> | decode U variant | u: gemv | decode | verdict |
+> |---|---|---|---|
+> | per-row, 8 warps a block (shipped) | **9.90 / 10.01 ms** | 25.50 / 25.40 tok/s | optimum |
+> | per-row, 32 warps a block (4x fewer blocks, `U_WARPS=32`) | 10.61 / 10.84 | 25.38 / 25.40 | -7 % |
+> | prefill tile, 64 rows (`U_TILE=1`) | 13.23 | 24.79-25.38 | -33 % |
+> | decode tile, 16 rows lane-per-column (`U_TILE=2`) | 68.7 / 69.0 | 14.09 / 15.10 | -590 % |
+>
+> and the CPU pool's placement, which the engine's own bench suggested would matter (it runs unpinned at
+> 37 GB/s): pinned 30.8 GB/s / 25.88 tok/s, unpinned 30.5 / 25.37 - flat within noise, so `--pool-cores`
+> and `STRATA_POOL_NO_PIN` are not levers either.
+>
+> So the hypothesis that decode's U is bound by block count (320 blocks a row x 10 rows x 48 layers =
+> ~154k blocks a round, at 86 ns each matching the 13.2 ms) is **refuted by its own test**: cutting the
+> block count 4x made it slightly worse, not better.  What remains is the data layout.  A label's U slice
+> is needed once per routed entry (~35 MB a layer, ~1.7 GB a round) and the shipped kernel already runs
+> that at ~170 GB/s effective - neither the Infinity Cache's 1.38 TB/s nor DRAM's 384 GB/s - so the work
+> is latency-bound with the row-major layout.  A **column-major (transposed) U table** would let a warp
+> read 32 columns coalesced with no staging and no shuffle, which is the one direction left; it costs
+> ~167 MB of VRAM (available at 4K context, not at 512K context), so it is a memory-budget decision.
+>
+> Knobs added, all defaulting to the shipped behaviour: `STRATA_LATENT_U_WARPS` (8 = shipped),
+> `STRATA_POOL_NO_PIN` (unset = pinned), `STRATA_VERIFY_U_TILE` (0 = shipped, 1/2 = the tiles).
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

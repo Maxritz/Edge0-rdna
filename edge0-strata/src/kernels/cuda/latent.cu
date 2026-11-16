@@ -667,7 +667,17 @@ void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* id
         std::fflush(stderr);
         std::abort();
     }
-    const int warps_per_block = 8;   // 256 threads
+    // STRATA_LATENT_U_WARPS=N (8..32): output columns a block covers, one warp each.  Decode's U is bound
+    // by BLOCK COUNT, not bytes - 320 blocks per routed row x 10 rows x 48 layers = ~154k blocks a round at
+    // ~86 ns each = the 13.2 ms the round table charges to "u: gemv" - so the knob that matters is how many
+    // columns a block carries.  The kernel already generalises over blockDim, and the arithmetic per output
+    // is untouched (same terms, same order, same reduction tree), so every width is bit-identical.
+    static const int u_warps = [] {
+        const char* v = std::getenv("STRATA_LATENT_U_WARPS");
+        const int n = v != nullptr ? std::atoi(v) : 8;
+        return (n >= 1 && n <= 32) ? n : 8;
+    }();
+    const int warps_per_block = u_warps;
     const int rows_per_block = warps_per_block;
     // STRATA_LATENT_U_WALK=1 selects the row-walk kernel.  It is NOT the default: a standalone probe
     // (u_probe.cu, kernels back to back, U hot in the Infinity Cache) measures it 33.3 % faster, but in
