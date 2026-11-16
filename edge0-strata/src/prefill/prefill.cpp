@@ -419,7 +419,11 @@ inline int stage_slots(size_t T) {
         const char* v = std::getenv("STRATA_STAGE_SLOTS");
         return v != nullptr ? std::atoi(v) : 0;
     }();
-    const int base = env > 0 ? env : 128;
+    // 96 and not 128: the auto chunk/ring budget demands a FULL ring at the chosen chunk, so a ring
+    // that is 37 MB bigger pushes this box past the point where chunk 512 can still have a full ring -
+    // and there the chunk collapses to 256 and prefill falls from 250 to 165 tok/s.  96 measured 246.34
+    // tok/s with chunk 512 and keeps that margin.
+    const int base = env > 0 ? env : 96;
     return std::min(std::max(base, std::max(ring_slots(T), STAGE_GRP)), ring_cap());
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)

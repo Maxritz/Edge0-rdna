@@ -730,6 +730,33 @@
 > should too.  The engine-side fix - hysteresis, or a floor that does not sit on the cliff - is a
 > configuration-logic change, not a kernel one, and it is the cheapest remaining robustness win in the tree.
 
+> ### 0.23 The auto chunk is mis-tuned on this box: 256 / 512 / 1024 across cache sizes, and only 512 is good
+>
+> 0.22 recorded the cliff; this measures the whole landscape.  Same prompt, same binary, varying only the
+> expert cache (and therefore the room the chunk/ring budget has):
+>
+> | cache slots | `--prefill auto` chunk | chunks | prefill |
+> |---|---|---|---|
+> | 741-753 (1.83-1.84 GiB free) | 256 | 16 | 164.2-171.7 tok/s |
+> | **796-803 (1.89-1.90 GiB free)** | **512** | **8** | **248.5-249.0** |
+> | 570 (reserve 1024 MiB) | 1024 | 4 | 203.6-205.7 |
+> | 572 (reserve 1536 MiB) | 1024 | 4 | 205.7 |
+>
+> 512 is the optimum by 20-50 %, and the heuristic lands on it only in a narrow band: fewer cache slots
+> makes the ring affordable at a *bigger* chunk (1024, which streams 80k blobs) and slightly fewer makes
+> it unaffordable at 512 (256, 105k blobs).  So `--prefill auto` is not merely fragile at one threshold -
+> its optimum window is one step wide on this hardware.
+>
+> Shipped fix, part 1 (code): the staging-ring default is 96 slots, not 128.  The budget demands a FULL
+> ring at the chosen chunk, so the 37 MB a 128-slot ring takes was enough to push this box past the point
+> where chunk 512 can still have one - chunk 512 came back at 796-803 slots with prefill 249.00 / 248.54
+> tok/s and the output byte-identical, and the margin is now ~50 MB instead of ~0.
+>
+> Still open (and the cheapest remaining win in the tree): the heuristic itself should prefer the measured
+> optimum rather than a binary "ring full" test - a chunk of 512 for this pack, with hysteresis so a 3 %
+> VRAM drift cannot move it.  That is configuration logic in `generate.cpp`'s `scan`/`host_plan_chunk`,
+> not a kernel.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
