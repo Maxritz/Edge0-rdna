@@ -686,6 +686,28 @@
 > shared instead of through `GuStaged` registers.  That is the rewrite, and it now has a number to hit
 > (<=128, 0 spills) rather than a hope.
 
+> ### 0.21 The occupancy target is not reachable by the cheap routes - measured three ways
+>
+> The rewrite's acceptance criterion was "<=128 VGPRs, 0 spills, 8 waves/SIMD".  Three measurements say the
+> compiler will not give it up by request, and what the structural route costs:
+>
+> | build | VGPRs | spills | waves/SIMD | blocks/CU |
+> |---|---|---|---|---|
+> | 512-thread, 64-row tile (shipped) | 256 | 28 | 4 | 1 |
+> | 512-thread, 32-row tile (acc halved) | 193 | 0 | 4 | 1 |
+> | 256-thread + `__launch_bounds__(256, 2)` (resource probe) | 256 | 28 | 4 | 1 |
+> | `amdgpu_num_vgpr(128)` (earlier) | 128 | 234 | 8 | 2 - and 2.4x slower |
+>
+> So: halving the accumulator removes every spill (256 -> 193, 28 -> 0) and the engine measured it NEUTRAL;
+> asking for two blocks a CU through `launch_bounds` is ignored outright; and the one way to force 128 is
+> the attribute that costs 234 spills and 2.4x the time.  8 waves/SIMD therefore needs live state below 128
+> by construction - `acc[2][4]`, one staged decode buffer instead of two, Q3_K decode straight to shared -
+> and the 65-register gap between 193 and 128 sits in exactly those staging registers.
+>
+> That is a new kernel, and it is the one remaining item on the A stage.  Between it and the two
+> user-gated levers (Q4_0 latent D; the Windows commit limit) nothing else on this engine has an
+> unmeasured avenue left.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
