@@ -449,6 +449,16 @@ const size_t lookahead = group_resident ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) :
 
 **What is left is the shape, not the traffic.** One warp produces **one scalar output** from a 32→1 reduction over 1,280 values (10 dp4a per lane), so the reduction is never amortised across outputs and x is re-read once per output. A real tiled int8 GEMM (M = the group's rows, N = H, K = 1,280, int32 accumulate) is the shape that fixes it — a kernel project, not a tweak. → T16, with the per-layer instrument already in place to score it.
 
+**Third attempt, and the most important lesson of the audit.** With a standalone probe (`u_probe.cu`, the kernel run back to back 50× at the engine's exact shape) a **row-walk** variant — the row's q8_1 blocks decoded once into registers, the block's warps walking `h` — measured **16.85 ms vs 25.25 ms (−33.3 %)**, output `memcmp`-equal across 50 MB, occupancy identical (8 blocks/CU for every variant). Ported and measured **in the engine**: **37.56 vs 32.69 ms a layer = 15 % SLOWER** (`ab_uwalk.log` vs `ab_uold2.log`, tokens identical).
+
+| | standalone probe | in the engine |
+|---|---|---|
+| per-column (shipped) | 25.25 ms | 32.69 ms |
+| row-walk | **16.85 ms (−33 %)** | **37.56 ms (+15 %)** |
+| weight-reuse | — | 32.7 → 37.6 in situ, +8 % (measured earlier) |
+
+The probe and the engine disagree because the probe runs the kernel **hot**: U (26.6 MB) and Hq (7 MB) stay in the Infinity Cache across 50 back-to-back launches. In the engine, the expert **A stage streams 60+ MB between two U calls** and evicts them, and only the per-column kernel's 1.3 M small blocks carry enough independent work to hide those cold misses. A kernel that wins on a hot-cache microbenchmark and loses in the pipeline is not an optimisation. **The shipped default is therefore the per-column kernel**; the row-walk stays behind `STRATA_LATENT_U_WALK=1`, and `u_probe.cu` is committed as the tool that produced the misleading answer.
+
 **Both F14 and F15 in one sentence:** prefill's remaining 45 % is two dense projections executed as **matvec/GEMV kernels** — 2.7 TFLOP at ~110 GFLOP/s (0.2 % of the card). The A stage, which the earlier audit ranked first, is now 19 %.
 
 ### F16 — P2 / CONFIRMED — no quality gate exists for a numerically-equivalent-but-not-identical change
@@ -500,6 +510,14 @@ The paper's problem statement is this engine's problem, stated better: reactive 
 * No number from either source is quoted as an expected gain here. The 2.20× and the 70.4 % are *hypotheses to measure on this box*, and the acceptance criteria in §10 are measurements.
 * Neither source touches the thing this audit found to be dominant — **the launch geometry of the A-stage kernel** (F1). ProMoE assumes the fused/persistent kernels of a data-centre engine; llama.cpp fuses experts at the CUDA-graph level. RDNA2 has neither, so the batching here has to be done in the walk.
 * llama.cpp's `mmq` path *is* the thing Edge0's `lat_mmq` mirrors, and its per-expert gather is the reason `gather` costs 19.5 % here (F3) — the fused in-place kernel is the answer, and it is now the default.
+
+### 8.4 MAPLE (`AmSach/maple`) — pruning, and one real discrepancy in this engine's prune path
+
+MAPLE keeps 54 of 64 experts (chosen from a `llama-imatrix` activation profile) so a 16B MoE fits in 6 GB, and reports 65–76 tok/s where the offloaded model does 4.5–10. Its speedup is **entirely the removal of PCIe traffic**, not a kernel technique.
+
+* **Not applicable to the problem in this document.** Edge0's 120B pack is 28.5 GB of expert blobs against 12 GB of VRAM — streaming is the design, not a defect, and the measured walls are three dense projections (F14, F15), not the link (9.1 %). Pruning would change the model; nothing in MAPLE makes a matvec faster.
+* **What does transfer, and is a real discrepancy here:** MAPLE masks a pruned expert's router logit to **−∞** so that "softmax over active experts remains strictly normalized with zero numerical leakage", and lists "cascaded normalization suppression" (rescaling expert outputs, 0.795³⁰ → 0.001) as a documented failure mode. Edge0's rank prune instead substitutes a **zeroed blob** (`g_zero_blob`, `prefill.cpp`) and leaves the router's softmax denominator untouched — so a rank-pruned expert contributes 0 to the sum while still consuming its share of the softmax mass, and every surviving expert is systematically scaled *down*. That is the same class of defect MAPLE warns about, arrived at from the opposite direction. **Quality, not speed** → T17, gated on T14 (tokens necessarily differ).
+* Its admission score `C(e,l) · sqrt(σ̄(e,l) + ε)` — routing frequency × channel energy — is a better statistic than the frequency-only `profile.bin` Edge0 ranks by. That belongs with the cache-admission question (T13).
 
 ## 9. The change that was landed, and what it measured
 
@@ -611,6 +629,7 @@ No issues, tickets or reminders were created. The following are ready to file on
 | **T14** | **A quality gate**: fixed-prompt KL (or teacher-forced NLL) of the current logits vs a candidate path, on the real pack, threshold agreed before the change | — | M | a number, repeatable to ±0.1 %, and a documented threshold. **Blocks T15/T16** |
 | **T15** | **D stage as a GEMM** (F14): 512 tokens share one D matrix; tile them instead of calling a matvec per token | T14 | M–L | D stage 11.1 s → < 2 s; KL under threshold; per-layer `[dprof]` before/after |
 | **T16** | **U stage as a per-expert GEMM** (F15): use the bucketed `goff`/`rows` the CUDA path already consumes, one accumulator per output tile instead of a warp reduce per scalar | T14 | M–L | U stage 12.5 s → < 3 s; weight traffic 765 GB → ~25 GB; KL under threshold |
+| **T17** | **Prune-path renormalisation** (F15 note, MAPLE §8.4): compare the zeroed-blob stand-in against masking the pruned expert's router logit to −∞ at R=7 | T14 | S–M | quality delta on a fixed prompt (KL / NLL), and a documented decision; tokens change either way, so T14 first |
 
 **The 2× is T15+T16.** They are 23.5 s of a 52.2 s prefill, both running at ~110 GFLOP/s = 0.2 % of the card. A tiled int8 GEMM at even 5 % of peak would take them to ~1 s. Everything else in this table is 1–4 s.
 

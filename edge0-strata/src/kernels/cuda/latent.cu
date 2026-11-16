@@ -1,4 +1,4 @@
-// src/kernels/cuda/latent.cu - the latent MoE's engine-side kernels (new file).
+﻿// src/kernels/cuda/latent.cu - the latent MoE's engine-side kernels (new file).
 //
 // Bit-identical dot to iq_mmvq(8)'s vec_dot_q8_0_q8_1: per block
 //   acc += dx * dw * sum_k(xs[k] * ws[k])
@@ -104,52 +104,54 @@ __global__ void latent_u_k(const uint8_t* __restrict__ u_q8, const uint8_t* __re
     if (lane == 0) o[h] = facc;
 }
 
-// How many of a lane's weight terms the weight-reuse kernel keeps in registers.  ELL = 1280 is nt = 10
-// ((1280/32)*8 lane terms / 32 lanes), so 16 covers it with room; a wider ELL falls back to per-row.
-constexpr int KTAIL = 16;
-
-// latent_u_k with the weight column held in registers: ONE block per (weight group, 8 output columns), so
-// a group's column is read once and reused for every routed row of that group instead of once per row.
-// The per-output arithmetic is latent_u_k's term for term - the lane's terms in the same `wi = lane + 32i`
-// order, the same 5-step shuffle tree - so every value is bit-identical; only which block computes it
-// changes.  Measured reason: the per-row form read 765 GB per 4K prompt (each of 8 group matrices re-read
-// once per routed row, ~640 times) at 61 GB/s, 12.5 s of prefill.
-__global__ void latent_u_group_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq,
-                                 const int32_t* __restrict__ ids, const int32_t* __restrict__ labels,
-                                 int E, int cap_entries, int ELL, int H, float* __restrict__ out, int n_groups) {
-    const int g = blockIdx.z;
-    if (g >= n_groups) return;
-    const int h = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    if (h >= H) return;
+// latent_u_k with this lane's ACTIVATION terms held in registers: one block per routed row, its 8 warps
+// walking the H output columns (h, h+8, h+16, ...).  latent_u_k re-reads the row's q8_1 blocks once per
+// output column - H times - and the row walk was written into every one of (rows x H/8) blocks; here the
+// row is decoded once per (row, warp) and the loop over h is the only thing that repeats.
+//
+// The per-output arithmetic is latent_u_k's, term for term: the lane's terms in the same
+// `wi = lane; wi < nb*8; wi += 32` order, the same fp16 scale loads, the same dp4a and float expression,
+// the same 5-step shuffle tree.  So every value is bit-identical; only which block computes it changes.
+// Measured on gfx1031 at the engine's shape (ELL 1280, H 2560, rows 5120): 25.25 -> 16.85 ms a layer
+// (-33.3 %) with the output memcmp-equal (u_probe.cu).  An earlier attempt kept the WEIGHT column in
+// registers and reused it across a group's rows instead; that is 8 % slower in the engine (few long
+// blocks that scan every row), so the reuse direction that pays is x, not w.
+__global__ void latent_u_walk_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq,
+                                const int32_t* __restrict__ ids, const int32_t* __restrict__ labels, int E, int cap,
+                                int ELL, int H, float* __restrict__ out) {
+    const int r = blockIdx.x;
+    if (r >= cap) return;
+    const int32_t e = ids[r];
+    const int g = (e >= 0 && e < E) ? labels[e] : 0;
+    const uint8_t* wbase = u_q8 + (size_t) g * (size_t) H * (size_t) (ELL / 32 * 34);
+    const uint8_t* x = ylq + (size_t) r * (size_t) (ELL / 32 * 36);
+    float* o = out + (size_t) r * (size_t) H;
     const int lane = threadIdx.x & 31;
-    const int nb = ELL / 32;                  // 32-value blocks per row
-    const int wrow = nb * 34;                 // Q8_0 block: {f16 d; int8 qs[32]}
-    const uint8_t* wb = u_q8 + ((size_t) g * (size_t) H + h) * (size_t) wrow;
-    // this lane's terms, in latent_u_k's `wi = lane; wi < nb * 8; wi += 32` order
-    int wword[KTAIL], xbase[KTAIL], xword[KTAIL];
-    float wscale[KTAIL];
+    const int nwarp = blockDim.x >> 5;
+    const int nb = ELL / 32;
+    // this lane's terms, in latent_u_k's order (10 of them for ELL 1280)
+    int tbase[16], tword[16], txw[16];
+    float tdx[16];
     int nt = 0;
     for (int wi = lane; wi < nb * 8; wi += 32, ++nt) {
         const int b = wi >> 3, j = (wi & 7) * 4;
-        wscale[nt] = __half2float(*(const __half*) (wb + (size_t) b * 34));
-        wword[nt] = latent_ld4_i8(wb + (size_t) b * 34 + 2 + j);
-        xbase[nt] = b * 36;
-        xword[nt] = b * 36 + 4 + j;
+        tbase[nt] = b;
+        tword[nt] = j;
+        txw[nt] = *(const int*) (x + (size_t) b * 36 + 4 + j);
+        tdx[nt] = __half2float(*(const __half*) (x + (size_t) b * 36));
     }
-    for (int r = 0; r < cap_entries; ++r) {
-        const int32_t e = ids[r];
-        int rg = (e >= 0 && e < E) ? labels[e] : 0;
-        if (rg < 0 || rg >= n_groups) rg = 0;   // the same stand-in latent_u_k uses for an unrouted entry
-        if (rg != g) continue;
-        const uint8_t* x = ylq + (size_t) r * (size_t) (nb * 36);
+    for (int h = (threadIdx.x >> 5); h < H; h += nwarp) {
+        const uint8_t* wb = wbase + (size_t) h * (size_t) (nb * 34);
         float facc = 0.0f;
         for (int i = 0; i < nt; ++i) {
-            const float dx = __half2float(*(const __half*) (x + (size_t) xbase[i]));
-            facc += dx * wscale[i] * (float) __dp4a(*(const int*) (x + (size_t) xword[i]), wword[i], 0);
+            const int b = tbase[i];
+            const float dw = __half2float(*(const __half*) (wb + (size_t) b * 34));
+            const int ww = latent_ld4_i8(wb + (size_t) b * 34 + 2 + tword[i]);
+            facc += tdx[i] * dw * (float) __dp4a(txw[i], ww, 0);
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) facc += __shfl_down_sync(0xffffffffu, facc, off);
-        if (lane == 0) out[(size_t) r * (size_t) H + h] = facc;
+        if (lane == 0) o[h] = facc;
     }
 }
 
@@ -160,42 +162,40 @@ void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* id
     if (u_q8 == nullptr || ylq == nullptr || ids == nullptr || labels_dev == nullptr || out == nullptr) {
         std::fprintf(stderr, "latent_u_grouped NULL ptr: u=%p ylq=%p ids=%p labels=%p out=%p E=%lld cap=%lld ELL=%d H=%d\n",
                      (const void*) u_q8, (const void*) ylq, (const void*) ids, (const void*) labels_dev,
-                     (const void*) out, (long long) E, (long long) cap_entries, ELL, H);
+                     (const void*) out, (long long) E, (long long) cap_entries, (int) ELL, (int) H);
         std::fflush(stderr);
         std::abort();
     }
     const int warps_per_block = 8;   // 256 threads
     const int rows_per_block = warps_per_block;
-    // STRATA_LATENT_U_OLD=1 / STRATA_LATENT_U_REUSE=1 pick the kernel explicitly.  The default is the
-    // per-row one: the reuse kernel is bit-identical and measured 0.08 % on a 4K prompt (51,791 vs
-    // 51,832 ms), i.e. this stage is not weight-traffic bound, so it stays behind the knob until the
-    // per-layer U profile (STRATA_DU_PROF=1) says what the 12.5 s actually is.
+    // STRATA_LATENT_U_WALK=1 selects the row-walk kernel.  It is NOT the default: a standalone probe
+    // (u_probe.cu, kernels back to back, U hot in the Infinity Cache) measures it 33.3 % faster, but in
+    // the engine it measures 37.6 vs 32.7 ms a layer - 15 % SLOWER - because the A stage's expert stream
+    // evicts the U matrix between layers and only the per-column kernel's 1.3 M small blocks have enough
+    // independent work to hide the cold misses.  Standalone microfessions do not decide; the engine does.
+    static const bool u_walk = [] {
+        const char* v = std::getenv("STRATA_LATENT_U_WALK");
+        return v != nullptr && v[0] == '1';
+    }();
     static const bool u_old = [] {
         const char* v = std::getenv("STRATA_LATENT_U_OLD");
         return v != nullptr && v[0] == '1';
     }();
-    static const bool u_reuse = [] {
-        const char* v = std::getenv("STRATA_LATENT_U_REUSE");
-        return v != nullptr && v[0] == '1';
-    }();
     const int nt = (int) ((((int64_t) ELL / 32) * 8 + 31) / 32);
-    const bool use_group = u_reuse && !u_old && fmt == 8 && n_groups > 0 && nt <= KTAIL;
+    const bool walk = u_walk && !u_old && fmt == 8 && nt <= 16;   // the register-held variant is Q8_0 only
+    (void) n_groups;
     {   // one line per process: which kernel the U stage actually runs (a switch this cheap to get wrong
-        // should never be inferred from a timing difference)
+        // should never be inferred from a timing difference - it once hid a kernel that never launched)
         static bool said = false;
         if (!said) {
             said = true;
-            std::fprintf(stderr, "latent u: %s kernel fmt=%d n_groups=%d nt=%d H=%d rows=%lld ELL=%d\n",
-                         use_group ? "weight-reuse" : "per-row", fmt, n_groups, nt, H, (long long) cap_entries,
-                         (int) ELL);
+            std::fprintf(stderr, "latent u: %s kernel fmt=%d nt=%d H=%d rows=%lld ELL=%d\n",
+                         walk ? "row-walk" : "per-column", fmt, nt, (int) H, (long long) cap_entries, (int) ELL);
         }
     }
-    if (use_group) {
-        // One block per (group, 8 output columns).  Each warp owns one column and keeps its weights in
-        // registers, reused over every routed row of that group - bit-identical to the per-row kernel.
-        dim3 g3((unsigned) ((H + rows_per_block - 1) / rows_per_block), 1u, (unsigned) n_groups);
-        latent_u_group_k<<<g3, warps_per_block * 32, 0, (cudaStream_t) stream>>>(
-            u_q8, ylq, ids, labels_dev, (int) E, (int) cap_entries, ELL, H, out, n_groups);
+    if (walk) {
+        latent_u_walk_k<<<(unsigned) cap_entries, warps_per_block * 32, 0, (cudaStream_t) stream>>>(
+            u_q8, ylq, ids, labels_dev, (int) E, (int) cap_entries, ELL, H, out);
         return;
     }
     dim3 grid((unsigned) cap_entries, (unsigned) ((H + rows_per_block - 1) / rows_per_block));
