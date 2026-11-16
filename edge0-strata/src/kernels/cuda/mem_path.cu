@@ -20,10 +20,18 @@
 namespace strata::kernels {
 namespace {
 
-constexpr std::size_t kCacheBytes = std::size_t(64) << 20;   // Infinity-Cache resident
-constexpr std::size_t kDramBytes = std::size_t(512) << 20;   // past every cache on a consumer card
+constexpr std::size_t kCacheBytes = std::size_t(32) << 20;   // Infinity-Cache resident (96 MB on Navi 22)
+constexpr std::size_t kDramBytes = std::size_t(192) << 20;   // past every cache on a consumer card
 constexpr int kCachePasses = 8;
 constexpr int kDramPasses = 3;
+// A health check must never be able to break the run it is checking.  This config can sit at ZERO MiB of
+// free VRAM legitimately (512K context + MTP on 12 GiB, ctx_mtp logs), and a 576 MiB probe there made
+// "verify: layer 3 never rang" appear where the same build without the probe decoded fine.  So the probe
+// needs this much free VRAM to run at all and says so when it does not - and it is 6x smaller than the
+// first version (224 MiB total against 576): 32 MiB is still IC-resident and 192 MiB is still past the
+// 96 MB Infinity Cache, which is all the ratio test needs (a wedged card reads 0.085 against a healthy
+// 0.42 on the 0.15 threshold).
+constexpr std::size_t kNeedFreeBytes = std::size_t(1536) << 20;
 
 // 16 bytes a lane, no dependency between iterations: the pattern every card is fastest at, so the
 // result is the memory path rather than the access pattern.
@@ -77,6 +85,16 @@ bool mem_path_probe(MemPath& out, int device) {
     cudaDeviceProp prop{};
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return false;
     out.vram_mib = (int) (prop.totalGlobalMem >> 20);
+    // never take VRAM from a configuration that has none to spare (see kNeedFreeBytes)
+    {
+        std::size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < kNeedFreeBytes) {
+            out.skipped_for_vram = true;
+            out.free_mib = (int) (free_b >> 20);
+            return false;
+        }
+        (void) cudaGetLastError();
+    }
     const unsigned grid = (unsigned) (prop.multiProcessorCount > 0 ? prop.multiProcessorCount * 32 : 640);
 
     void* small = nullptr;
@@ -104,6 +122,12 @@ const char* mem_path_verdict(const MemPath& m) {
 
 bool mem_path_report(const MemPath& m, void* file) {
     std::FILE* f = static_cast<std::FILE*>(file != nullptr ? file : stderr);
+    if (m.skipped_for_vram) {
+        std::fprintf(f, "strata: memory path: not measured, only %d MiB of VRAM free (the probe needs %d MiB so it "
+                        "can never be the reason a tight configuration fails to start)\n",
+                     m.free_mib, (int) (kNeedFreeBytes >> 20));
+        return true;
+    }
     if (!m.ran) {
         std::fprintf(f, "strata: memory path: not measured (allocation refused)\n");
         return true;

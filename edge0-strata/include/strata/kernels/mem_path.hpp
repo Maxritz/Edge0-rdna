@@ -24,11 +24,13 @@
 namespace strata::kernels {
 
 struct MemPath {
-    double dram_gbps = 0.0;    // one streaming pass over 512 MiB
-    double cache_gbps = 0.0;   // eight passes over 64 MiB
+    double dram_gbps = 0.0;    // one streaming pass over 192 MiB
+    double cache_gbps = 0.0;   // eight passes over 32 MiB
     double ratio = 0.0;        // dram / cache
     int vram_mib = 0;
+    int free_mib = 0;          // free VRAM when the probe looked (reported when it skipped)
     bool ran = false;
+    bool skipped_for_vram = false;   // ... and it deliberately took nothing
 };
 
 // Measures the device's read path.  Returns false when it could not run (no device, allocation
