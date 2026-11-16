@@ -586,6 +586,31 @@
 > resident.  `gemm gate/up` is unchanged across every arm (5,610-5,632 ms), so this is purely the copy
 > wait: 19.3 % of the prompt at 32 slots, 11.6 % at 128.
 
+> ### 0.17 Re-measuring the A stage at the deep ring: batch 16 -> 32 gives another 1.9 %
+>
+> With the ring at 128 slots the batch cap `stage_n / 2` is 64 instead of 16, so the 16-vs-32 question
+> could finally be asked on a copy engine that is not starved.  Two alternating pairs each, 4,063-token
+> prompt, output byte-identical in every arm:
+>
+> | batch | `gemm gate/up` | `wait copy` | prefill |
+> |---|---|---|---|
+> | 16 (the value shipped in fb1a943) | 5,616 / 5,619 ms | 1,873 / 1,874 | 250.48 / 250.29 tok/s |
+> | **32 (new default)** | **4,860 / 4,846** | 2,345 / 2,330 | **255.57 / 255.69** |
+> | 48 | 4,626 | 2,897 | 250.56 |
+>
+> So 32 is the balance and ships: -13.5 % on the A stage's kernels, +1.9 % on the prompt, with the extra
+> copy wait (2.3 s against 1.9) paid out of that gain.  48 keeps winning on the kernels and loses it to
+> the copies.  Confirmed as the default: **254.65 / 254.93 tok/s**, TTFT 16.4 s, output unchanged.
+>
+> **The 64-vs-32-row tile was NOT re-measured, and the reason is mechanism rather than convenience.**  The
+> measurement that rejected it (`lat_q3k_down_test`, and the engine A/B at 33,701 against 32,828 ms) fails
+> for an SM-side reason: a 32-row tile needs *two* tiles for a group larger than 32 rows and each tile
+> re-stages that expert's whole 256-row weight block, so the staging per MAC doubles (measured +38 % per
+> entry at 32 entries a group).  Nothing in that changes with the PCIe ring depth - the ring feeds VRAM,
+> the tile stages VRAM into shared - so the earlier negative stands on its mechanism.  What *is* worth
+> asking at this ring is a tile sized to the groups the engine actually builds (~25 entries at chunk 512),
+> which is a new kernel shape rather than the 64/32 toggle the old A/B covered.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

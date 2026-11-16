@@ -1544,13 +1544,15 @@ bool lat_fused_q3k_on() {
 int lat_staged_batch() {
     static const int n = [] {
         const char* v = std::getenv("STRATA_LAT_STAGED_BATCH");
-        // 16, not 4: with stage_n finally equal to the 32 staging slots the walk owns (it was hard-coded to
-        // STAGE = 8), the cap stage_n / 2 is 16 and each launch carries that many expert groups instead of
-        // four - 4x fewer launches, 4x more blocks in flight.  Measured on gfx1031, 4063-token prompt:
-        // GPU timeline 32,828 -> 28,492 ms (-13.2%), prefill 123.66 -> 142.46 tok/s, gemm gate/up
-        // 8,420 -> 6,170 ms, and the generated tokens unchanged (n2.log against w3.log).  The earlier
-        // 8/16/64 measurements that showed "no effect" were all silently clamped to 4 at this cap.
-        const int k = v != nullptr ? std::atoi(v) : 16;
+        // 32, not 4 and not 16: with the ring now 128 slots deep (STRATA_STAGE_SLOTS, 257e803) the cap
+        // stage_n / 2 is 64, so the batch question can finally be asked.  Measured at 128 slots, two
+        // alternating pairs each, 4,063-token prompt, output byte-identical:
+        //   batch 16  gemm gate/up 5,616 / 5,619 ms   wait copy 1,873 / 1,874   prefill 250.48 / 250.29
+        //   batch 32  gemm gate/up 4,860 / 4,846      wait copy 2,345 / 2,330   prefill 255.57 / 255.69
+        //   batch 48  gemm gate/up 4,626              wait copy 2,897           prefill 250.56
+        // so 32 is the balance: 48 keeps winning on the kernels and loses it to the copies.  (The original
+        // 4 came from a hard-coded STAGE = 8 ring; every 8/16/64 number before 257e803 was clamped to 4.)
+        const int k = v != nullptr ? std::atoi(v) : 32;
         return k > 0 ? k : 1;
     }();
     return n;
