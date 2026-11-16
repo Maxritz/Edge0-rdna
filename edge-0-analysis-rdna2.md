@@ -98,12 +98,30 @@ RDNA2 has **no matrix cores**. Any `mma.sync` path is CUDA-only by definition, w
 
 Reproduce: `bench4k.bat`, or `strata` with `STRATA_PREFILL_TIMING=1`.
 
-Two independent readings of the same run agree, which is why the numbers are trusted:
-
-* `tr_512.log` (chunk 512, NPROF on): `latfq3kprof: calls=64,080 ms=10,742 entries=1,948,496 us/entry=5.51` — i.e. the A-stage kernels themselves are **10.7 s** of the 65 s perturbed wall, while the *component table of the same run* charges `gemm gate/up 21,658 + gemm down 12,691 + gather 11,095 = 45.4 s`. **The gap is per-launch overhead, not arithmetic.**
+Two independent readings of the same run agree, which is why the numbers are trusted:* `tr_512.log` (chunk 512, NPROF on): `latfq3kprof: calls=64,080 ms=10,742 entries=1,948,496 us/entry=5.51` — i.e. the A-stage kernels themselves are **10.7 s** of the 65 s perturbed wall, while the *component table of the same run* charges `gemm gate/up 21,658 + gemm down 12,691 + gather 11,095 = 45.4 s`. **The gap is per-launch overhead, not arithmetic.**
 * `tr_2048.log`: `latfq3kprof ... us/entry=3.6–3.7` at ~90 entries/call, against `5.51` at 30 entries/call (chunk 512) — the per-entry cost falls as the group grows, which is the occupancy signature of a launch that is too small.
 
 Decode, from the repo's own `STRATA_VERIFY_PROFILE` table (4K, served window T=4, 95.99 ms/round): `copy+combine` 40.22 ms (41.1 %), `hc1 up` (the latent D stage) 24.27 ms (24.8 %), everything else 34.2 % with no single item above 4 %.
+
+### 4.1 The ranking **after** the landed A-stage fix (`pf_now.log`, same prompt, shipped path)
+
+The trace above is the pre-fix path. Re-running it with the fused in-place A stage and batched launches moves the ranking — and not to the item the earlier audit ranked first:
+
+| component | marks | dev ms | % dev | what it actually is |
+|---|---|---|---|---|
+| **`gemm down`** | 384 | **12,464** | **23.9 %** | the latent **U** projection (`latent_u_grouped`) + the q8_1 of H |
+| **`gather`** | 384 | **11,076** | **21.2 %** | the latent **D** projection (`iq_mmvq`), *not* an expert gather |
+| **`gemm gate/up`** | 16,178 | **9,910** | **19.0 %** | the expert A stage, now fused and batched |
+| wait copy | 16,178 | 4,310 | 8.3 % | staging ring |
+| gdn | 288 | 4,893 | 9.4 % | attention block + recurrence (36 layers) |
+| qsa proj / attn | 192 / 96 | 1,481 / 865 | 4.5 % | 12 layers |
+| hc write + hc read (5 phases) | 768 | 3,580 | 6.9 % | hyper-connection |
+| router+shared | 768 | 1,135 | 2.2 % | |
+| host grouping | 768 | 194 (dev) | 0.4 % | **25,863 host** |
+| combine / ple / gdn extras | — | ~1,900 | 3.6 % | |
+| **wall 52,163 ms** | | | | |
+
+**Read it as: the two dense latent projections are 45.1 % of prefill, and both are matvec/GEMV kernels doing a matrix problem** — F14 and F15. The expert A stage that this audit ranked first is now 19 %, and `wait copy` is 8.3 %. The earlier baseline put `gather`+`gemm down` at 39 % too, but attributed them to expert traffic; the trace labels say otherwise (384 marks = per layer per chunk, not per expert).
 
 ---
 
@@ -371,6 +389,36 @@ const size_t lookahead = group_resident ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) :
 
 ---
 
+### F14 — P1 / CONFIRMED — the latent **D stage** runs a matvec kernel over the prompt's tokens (11.1 s, 21.2 %)
+
+**Where:** `prefill.cpp:5502-5521`, `pt.mark(kPfGather)` then `strata::kernels::iq_mmvq(...)` — the `gather` row of the phase table is this, not the expert gather.
+
+**Observed (current shipped path, `pf_now.log`, 52,163 ms wall):** `gather` = **11,076 ms over 384 marks** = 28.8 ms per (layer, chunk). That is 512 tokens × `iq_mmvq` of D (`N` → `G·ELL` = 8·640 outputs) — llama.cpp's **matrix-vector** kernel, called once per token, so each token re-reads the whole D matrix. 512 × 4,864 × 5,120 × 2 = 25.5 GFLOP per layer, 1.2 TFLOP per prompt at **110 GFLOP/s**.
+
+**Why it is slow:** a matvec reads `K·N` weight bytes for `n=1` token (intensity ≈ 0.5 FLOP/byte). The prompt has 512 tokens per chunk that all share the same D matrix; a GEMM tiles 8–32 of them so each weight byte is used 8–32 times. llama.cpp ships *both* kernels (`vec_dot` for n=1, the tiled GEMM for n>1); **this port kept only the matvec** and calls it n times.
+
+**Fix:** route D through the int8 matrix-matrix path the engine already has (`mmq::Product` / `run_p`, used by the A stage) or a tiled dp4a GEMM. **Caveat: the partial-sum order changes**, so this is numerically equivalent within fp32, not necessarily bit-identical → needs the quality gate of F16/T14.
+
+### F15 — P1 / CONFIRMED — the latent **U stage** re-reads each expert's matrix once per routed row (12.5 s, 23.9 %)
+
+**Where:** `src/kernels/cuda/latent.cu:70-105` (`latent_u_k`), launched by `latent_u_grouped` at `:107-122`; called from `prefill.cpp:6486` under `pt.mark(kPfGemmD)` — the `gemm down` row of the table.
+
+**Observed:** `gemm down` = **12,464 ms over 384 marks** = 32.5 ms per (layer, chunk). The kernel is `grid = (cap_entries, H/8)`, one block per (routed row, 8 output columns), **each warp computing one scalar `o[h]`** with a 32-lane `__shfl_down` tree over the 640-element reduction. Weight bytes read per layer: `rows × H × ELL` = 5,120 × 4,864 × 640 B = **15.9 GB**, 765 GB per prompt — because the same expert's 640×H matrix is re-read **once per routed row** (~30 times).
+
+**Why it is slow:** the rows of one expert are already bucketed (`latent_dense_u_tables` builds `goff`/`rows`), and the CUDA path (`latent_dense_kernel<false>`) consumes exactly that tiling — but it is `#if !defined(__HIPCC__)`, so HIP takes `latent_u_grouped`, which throws the bucketing away. Its name says "grouped"; its body is a per-row GEMV with a warp reduction on the critical path.
+
+**Fix:** one tiled GEMM per (expert, output tile) over that expert's rows: weight traffic falls ~30× (765 GB → 25 GB), the warp-reduce disappears into an accumulator. Same numerical caveat as F14.
+
+**Both F14 and F15 in one sentence:** prefill's remaining 45 % is two dense projections executed as **matvec/GEMV kernels** — 2.7 TFLOP at ~110 GFLOP/s (0.2 % of the card). The A stage, which the earlier audit ranked first, is now 19 %.
+
+### F16 — P2 / CONFIRMED — no quality gate exists for a numerically-equivalent-but-not-identical change
+
+**Where:** the only gates in the tree are token equality (`det_A1`/`det_A2`) and `kv_turbo_parity`'s byte oracle. There is no KL/perplexity harness on this pack.
+
+**Impact:** the two biggest remaining wins (F14, F15) deliberately change the summation order, so token equality will fail by design and cannot be used as the gate. Without a quality measurement, the honest options are: keep 110 GFLOP/s, or ship a change gated by "it still produces plausible text". Neither is acceptable.
+
+**Fix:** a fixed-prompt KL (or teacher-forced NLL) against the current path's logits, on the real pack, with a threshold agreed before the change. → **T14**, and F14/F15 depend on it.
+
 ### F13 — P3 / CONFIRMED — the perf log's baseline and the recommended configuration are different paths
 
 **Where:** `docs/perf-log-2026-11-16.md` §Baseline vs `run_512k_mtp.ps1` / `ctx_mtp_c_pf1024.log`.
@@ -520,6 +568,11 @@ No issues, tickets or reminders were created. The following are ready to file on
 | **T11** | **Reordered inference** (ProMoE §5.3): run the layer's resident experts first, then the staged ones in staging order, instead of expert-id order. Bit-exact — each expert writes only its own `yl[entry]` rows, nothing cross-expert is summed in the A stage | T1 | M (~40 ln in the walk) | `wait copy` falls without `gemm` rising; tokens bit-identical; `us/entry` unchanged or better |
 | **T12** | Chunked prefetch (ProMoE §5.1): split a blob's copy into its natural sections (gate/up `0..352000`, up `352000..704000`, down `704000..1164800`) so a precise fetch can start at a chunk boundary | T1, T11 | M | `wait copy` falls again; no token change; only accepted if T11's headroom is exhausted |
 | **T13** | Measure the eviction/admission question the header calls unmeasured (R4.1): static profile rank vs LFU-decay (llama.cpp's ClassLRU shape: 8 frequency classes, score halved every 128 tokens) | T3 | M | hit rate + tok/s at a fixed slot count, same prompt; the loser is removed, not kept behind a flag |
+| **T14** | **A quality gate**: fixed-prompt KL (or teacher-forced NLL) of the current logits vs a candidate path, on the real pack, threshold agreed before the change | — | M | a number, repeatable to ±0.1 %, and a documented threshold. **Blocks T15/T16** |
+| **T15** | **D stage as a GEMM** (F14): 512 tokens share one D matrix; tile them instead of calling a matvec per token | T14 | M–L | D stage 11.1 s → < 2 s; KL under threshold; per-layer `[dprof]` before/after |
+| **T16** | **U stage as a per-expert GEMM** (F15): use the bucketed `goff`/`rows` the CUDA path already consumes, one accumulator per output tile instead of a warp reduce per scalar | T14 | M–L | U stage 12.5 s → < 3 s; weight traffic 765 GB → ~25 GB; KL under threshold |
+
+**The 2× is T15+T16.** They are 23.5 s of a 52.2 s prefill, both running at ~110 GFLOP/s = 0.2 % of the card. A tiled int8 GEMM at even 5 % of peak would take them to ~1 s. Everything else in this table is 1–4 s.
 
 **Recommended order:** T3 (gate first) → T1 → T2 → T4 → T11 → T10 → T5/T9 → T6/T7 → T12/T13 → T8.
 
