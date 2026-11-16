@@ -2236,6 +2236,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 16, grp);
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
+        // The FFN-side up ENDS here.  Read stamps its base+0 (norm) and base+1 (after down), and stamp 32 used to
+        // close this stage - but between the read and 32 the decode-side latent D stage runs (below), so 32 was
+        // measuring the up AND the D stage together.  That is why slot 32 sat at 18.4 ms and stayed there while the
+        // up kernel, its read variant, the token count, the q8_1 image and the memory classes were all varied: the
+        // up is ~2.0 ms (the attention half shows 2.000 for the same 6.2 MB) inside a ~16.4 ms D stage.  Slot 15 is
+        // never written anywhere else in this file, so it closes the up; 32 keeps the D stage.
+        stamp(l, 15, grp);
         if (latent_ && grp == 0 && h_latxlq_ != nullptr) {   // edge0 CPU share: the D stage RIGHT HERE - mixed_ is
             // just normed, the router/plan/doorbell still run after it, and the host's pool call (which starts at
             // the ring this pre publishes) waits on the xl doorbell: the D stage now has the whole router+plan+bell
@@ -2887,7 +2894,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
 std::string Verifier::profile_by_t_report() {
     if (!prof_on_) return std::string();
-    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "Dstg|hc0n", "rtpl|hc0d", "u: copy", "hc1 norm", "hc1 down", "hc1 up", "u: gemv", "u: pool wait", "u: matvec"};
+    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "hc1 up", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "Dstg|hc0n", "rtpl|hc0d", "u: copy", "hc1 norm", "hc1 down", "D stage", "u: gemv", "u: pool wait", "u: matvec"};
     std::string out;
     char b[96];
     for (int T = 1; T <= 8; ++T) {
@@ -3364,14 +3371,23 @@ void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
             prof_sum_[kind][i] += (double) (x - prev);
             prev = x;
         }
-        {   // the FFN-side read split like hc-read0: norm 30, down 31, up 32; what is left of 17 is the router, plan, doorbell
-            const double n1 = gap(at(l, 30), at(l, 16)), d1 = gap(at(l, 31), at(l, 30)), u1 = gap(at(l, 32), at(l, 31));
+        {   // The FFN-side read and the D stage that follows it.  Slot 15 closes the read's `up`; slot 32 closes the
+            // decode-side latent D stage that runs between the up and the router.  Slot 32 used to close the read,
+            // which charged that whole D stage to the up: it read 18.4 ms against the attention half's 2.000 ms for
+            // the same 6.2 MB, and no change to the up kernel, its read variant, the token count, the q8_1 image or
+            // the memory classes moved it, because a ~2 ms kernel was sitting in a ~16.4 ms bucket.
+            // The read writes base+0 (norm) and base+1 (after down) only when it runs the three-kernel path, so the
+            // norm/down/up split is conditional while the D stage is not.
+            const double n1 = gap(at(l, 30), at(l, 16)), d1 = gap(at(l, 31), at(l, 30)), u1 = gap(at(l, 15), at(l, 31));
+            const double d2 = gap(at(l, 32), at(l, 15));
             if (n1 > 0 && d1 > 0 && u1 > 0) {
                 prof_sum_[kind][30] += n1;
                 prof_sum_[kind][31] += d1;
-                prof_sum_[kind][32] += u1;
-                prof_sum_[kind][17] -= gap(at(l, 32), at(l, 16));
+                prof_sum_[kind][15] += u1;
             }
+            if (d2 > 0) prof_sum_[kind][32] += d2;
+            const double read_all = gap(at(l, 32), at(l, 16));   // 16 -> 32 is the read and the D stage together
+            if (read_all > 0) prof_sum_[kind][17] -= read_all;
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
         {   // What the 16 -> 17 bucket actually is.  verify.cpp:2197-2224 runs the DECODE-side D stage inside

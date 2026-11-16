@@ -1121,6 +1121,46 @@
 >
 > This item is **not** fixed, and no speedup has been claimed for it.
 
+> ### 0.35 SOLVED (attribution): `hc1 up` was the latent D stage, and the shipped D kernel is the best of three
+>
+> The seven failed hypotheses of 0.33/0.34 have one explanation, and it is in the source rather than the kernel:
+> **between the FFN-side HC read and `stamp(l, 32)` the engine runs the whole decode-side latent D stage.**
+> verify.cpp 2239-2280, inside that gap: `quantize_q8_1_rows(mixed_)`, `iq_mmvq` over `[G*ELL, N]`, the Q3_K
+> `lat_colscale_rows`, `quantize_q8_1_rows(lat_xl_)`, `quantize_q8_0_rows`, two `cudaMemcpyAsync` D2H, and a
+> doorbell. So slot 32 - labelled `hc1 up` - measured the up projection *and* a ~16-22 ms D stage, which is why
+> varying the up kernel (18.351/18.331/18.328), the read variant (18.452/18.402/18.345), the token count
+> (17.064/18.283), the q8_1 image (18.418/18.433), the weights and state memory classes (all VRAM) and the
+> per-row stores (7 %) never moved it: a ~2-10 ms kernel was sitting inside a ~20 ms bucket.
+>
+> The fix is instrumentation only. Slot 15 is never written anywhere else in verify.cpp, so it now closes the
+> read's `up`, and slot 32 keeps the D stage it actually measures. Measured with the persistent read off:
+>
+> ```
+> GDN: qkv gemv 6.320 ... rec 1.390  hc1 up 10.124  shared+quant 1.972 ... (gap) 0.026 head 4.472
+>      Dstg|hc0n 0.715  rtpl|hc0d 2.427  u: copy 2.010  hc1 norm 0.226  hc1 down 2.170  D stage 16.627
+> QSA: ... gate 0.041  hc1 up 3.484 ... Dstg|hc0n 0.077  rtpl|hc0d 0.811  u: copy 0.676
+>      hc1 norm 0.080  hc1 down 0.788  D stage 5.804                                       | total 120.04 ms
+> ```
+>
+> Two caveats stated rather than hidden: adding the 48 stamps grew the window 116.65 -> 120.04 ms, so the
+> profiler's own stamps are not free; and up+D (36.1 ms) does not equal the old single bucket (24.88 ms), so
+> these are attribution figures, not yet a clean baseline. What they do establish is that the D stage is the
+> big half and that it was invisible.
+>
+> **A/B of the three D implementations** (`STRATA_VERIFY_D_TILE`, no rebuild), with the read's cost folded into
+> `hc1 norm` under the shipped default so the whole read + D is one number, 32-token output byte-identical in
+> all four arms:
+>
+> | arm | `hc1 norm` (GDN) | vs shipped |
+> |---|---|---|
+> | **D0 `iq_mmvq` (shipped)** | **19.606 / 19.723** | - |
+> | D2 `latent_d_fast` | 23.625 | +4.0 ms |
+> | D1 `latent_d_tiled` | 24.208 | +4.6 ms |
+>
+> So the shipped choice is already the best of the three by ~4 ms, and the doc comment at the call site ("the
+> staged tile loses at M=4: 21.3 vs 15.3-17.4 ms") is confirmed on this card. **No speedup in this item** - but
+> the target is now named: a small-M GEMV at M=4 over `[G*ELL, N]`, ~16-22 ms a round, about a fifth of decode.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
