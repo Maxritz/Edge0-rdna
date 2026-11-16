@@ -611,6 +611,30 @@
 > asking at this ring is a tile sized to the groups the engine actually builds (~25 entries at chunk 512),
 > which is a new kernel shape rather than the 64/32 toggle the old A/B covered.
 
+> ### 0.18 The 32-row A-stage tile, measured at the deep ring: not a lever either way
+>
+> The experiment the earlier negative deferred, run properly this time: `kTileRows` 64 -> 32 in
+> `lat_q3k_fused.cu` with `nb0 = 8*(warp>>2)` and the second row-half disabled (`on1 = false`), so one
+> tile covers a 32-row group at 78 % fill instead of 39 % and the compute halves.  Two clean runs each,
+> 32 tokens, output byte-identical:
+>
+> | tile rows | `gemm gate/up` | prefill |
+> |---|---|---|
+> | 64 (shipped) | 4,865 / 4,855 (batch-32 pair) and 4,973 / 4,975 (reverted, re-verified) | 254.65 / 254.93 and 254.00 / 250.94 |
+> | 32 | 4,991 / 4,987 | 254.12 / 253.63 |
+>
+> So 32 rows is **inside the 64-row arm's own spread** (4,855-4,975 across four runs): the tile size is
+> not a lever at batch 32 on a 128-slot ring.  That is worth contrasting with the earlier measurement at
+> 32 slots, where the same change was clearly worse (9,777 against 8,420 ms) - the starved ring was
+> paying for the extra tiles, so the reviewer's premise was right that the old negative needed re-taking,
+> even though the direction turned out to be "no effect" rather than "win".  Reverted to 64 (nothing is
+> gained by changing it) and re-verified: prefill 254.00 / 250.94 tok/s, tokens unchanged.
+>
+> The A stage is therefore 4,860-4,990 ms of compute at ~1.7 TFLOP/s that neither its batch (32 measured
+> optimal against 16 and 48) nor its tile size moves.  What is left there is instruction-level: the Q3_K
+> decode inside the kernel, the same class of work the U and D tiles needed - and unlike those, its
+> weights arrive per group so its staging cannot be amortised further at 25 entries a group.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
