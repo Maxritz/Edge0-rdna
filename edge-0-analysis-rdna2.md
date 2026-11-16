@@ -885,6 +885,49 @@
 >
 > The instrument ships (env-gated, one line per chunk); nothing else changed.
 
+> ### 0.29 Full component trace: hc1 norm (decode) and PLE SSD reads (prefill) are the unexamined costs
+>
+> One recorded run (`trace_full.log`, chunk 512 pinned, ring default, `STRATA_PREFILL_TIMING` +
+> `STRATA_VERIFY_PROFILE` + `STRATA_VERIFY_U_PROF`), 4,063-token prefill then 32 decode tokens.
+>
+> **Prefill, 17,702 ms of marked device time** (the profiler inflates absolute figures; shares hold):
+>
+> | component | dev ms | % dev | note |
+> |---|---|---|---|
+> | `gemm gate/up` = the A stage | 5,298 | 29.9 | 4,180 marks |
+> | gdn block (gdn 3,077 + out-proj 374 + rec 303 + conv 46) | 3,800 | 21.5 | |
+> | `wait copy` | 2,530 | 14.3 | |
+> | hc reads (down+silu 1,077, up 320, inject 167, mix 101) | 1,665 | 9.4 | |
+> | `gemm down` = U | 1,170 | 6.6 | |
+> | qsa (attn 631, proj 412, select 30, indexer gemms 50, prep 29) | 1,152 | 6.5 | |
+> | `gather` = D | 970 | 5.5 | |
+> | router+shared 578, hc write 146, embed 81, ple 68, combine 61 | 934 | 5.3 | |
+>
+> and off the device timeline: **host grouping 9,841 ms of host time (55.6 %)** - overlapped, but it is the
+> single largest host cost - and **PLE I/O: 69,736 SSD reads for 294.8 MB, p50 5,664 us, p99 9,257 us,
+> blocked 1,562.6 ms**.  That is 4.2 KB a read: the reads are far too small to hide latency, and 1.56 s is
+> 8.8 % of the prompt on its own.
+>
+> **Decode round, 116.67 ms with the profiler on** (~86-90 unprofiled), T4:
+>
+> | component | ms | % | |
+> |---|---|---|---|
+> | **`hc1 norm`** (hyper-connection FFN read, norm stage) | **26.76** | 22.9 | largest single item |
+> | `u: gemv` (GPU-rows U + q8_1 of H) | 18.05 | 15.5 | |
+> | dense GEMVs (qkv 6.32, out-proj 5.23, z 3.84, q+q-idx 2.86) | 18.25 | 15.6 | |
+> | `u: matvec` (CPU-rows U) | 14.62 | 12.5 | |
+> | `u: pool wait` | 6.28 | 5.4 | pool at its 30-32 GB/s ceiling |
+> | hc-read0 5.42, VRAM hits 4.71, head 4.48, waitB 3.95, shared+quant 2.60, attention 1.24 | 22.40 | 19.2 | |
+> | u: copy 0.25, conv 0.25, ab 0.41, rec 1.37, copy+combine 0.15, gap 0.03 | 2.46 | 2.1 | |
+>
+> Plus: the pool itself is **26.27 ms/token over 48 layers** (624 dispatches, drain 23.07 ms/token), and
+> **R4 expert-cache hits 0 of 0** - the cache supplied nothing in this window, so every expert came through
+> the pool or PCIe.
+>
+> So the ranking the earlier tables missed: **hc1 norm is the biggest decode item (22.9 %), larger than
+> either U half**, and the PLE read pattern is the largest unexplored prefill cost.  Both are new, both are
+> named here with counts and latencies, neither has been touched.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
