@@ -48,6 +48,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/kernels/mem_path.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -1833,6 +1834,25 @@ int64_t res_check(const int32_t* d_res, const std::vector<int32_t>& host_res, st
             }
         }
     return bad;
+}
+
+/// The device's memory path, measured once before the weights load (kernels/cuda/mem_path.cu +
+/// mem_path.hpp explain the two numbers and why their ratio is the diagnostic).
+///
+/// 2026-11-16: this box ran for hours with the adapter reading its own VRAM at 22.6 GB/s instead of
+/// 361.5 GB/s after a TDR - caches and compute stayed healthy, so nothing looked wrong from inside the
+/// process - and every measurement taken in that state (5.04 tok/s decode, 46.3 s prefill) was read as
+/// a property of the engine.  A reboot restored 23.56 tok/s and 32.5 s TTFT with no code change at all.
+/// One line at startup makes that mistake impossible to repeat.  `STRATA_MEM_PATH=0` turns the probe
+/// off; it costs ~20 ms and its scratch is freed before the VRAM budget is read.
+static void print_memory_path() {
+    const char* e = std::getenv("STRATA_MEM_PATH");
+    if (e != nullptr && e[0] == '0') return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    strata::kernels::MemPath m;
+    if (!strata::kernels::mem_path_probe(m, dev)) (void) cudaGetLastError();
+    strata::kernels::mem_path_report(m, stderr);
 }
 
 /// #3797: when the engine cannot start for lack of GPU memory, the cards' free and total memory and the largest other
@@ -4705,6 +4725,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     mem_mark("the CUDA context and the weight arena");
+    print_memory_path();   // before the weights load: its 512 MiB scratch is freed again immediately
     auto load_t0 = std::chrono::steady_clock::now();
     auto load_s = [&] {
         const auto t = std::chrono::steady_clock::now();
