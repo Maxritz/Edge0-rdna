@@ -182,6 +182,31 @@ int main() {
         std::printf("FAIL: the decode-shaped tile is not numerically equal\n");
         ok = false;
     }
+
+    // The decode-shaped D kernel (one warp a row, T tokens in registers, no padding) against the same
+    // single-group reference.  M = 20 > its 8-token register cap, so this also exercises the chunking.
+    strata::kernels::latent_u_grouped(dw, da, dids0, dlab0, 1, kRows, kELL, kH, dref, nullptr, 8, 0);
+    strata::kernels::latent_d_fast(dw, da, kRows, kELL, kH, dtile, nullptr, 8);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(ref.data(), dref, ref.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(tile.data(), dtile, tile.size() * 4, cudaMemcpyDeviceToHost));
+    double f_max_rel = 0.0, f_sum_rel = 0.0, f_dot = 0.0, f_nr = 0.0, f_nt = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double dv = std::fabs((double) tile[i] - (double) ref[i]);
+        const double rel = dv / (std::fabs((double) ref[i]) + 1e-6);
+        if (rel > f_max_rel) f_max_rel = rel;
+        f_sum_rel += rel;
+        f_dot += (double) ref[i] * (double) tile[i];
+        f_nr += (double) ref[i] * (double) ref[i];
+        f_nt += (double) tile[i] * (double) tile[i];
+    }
+    const double f_mean_rel = f_sum_rel / (double) ref.size();
+    const double f_cos = f_dot / (std::sqrt(f_nr) * std::sqrt(f_nt) + 1e-30);
+    std::printf("D fast      : mean_rel %.3e  max_rel %.3e  cos %.9f\n", f_mean_rel, f_max_rel, f_cos);
+    if (!(f_mean_rel < 1e-5) || !(f_cos > 0.9999999)) {
+        std::printf("FAIL: the decode D kernel is not numerically equal\n");
+        ok = false;
+    }
     std::printf("%s\n", ok ? "PASS latent_u_tile_test" : "FAIL latent_u_tile_test");
     return ok ? 0 : 1;
 }

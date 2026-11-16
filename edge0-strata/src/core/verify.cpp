@@ -2199,15 +2199,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // the ring this pre publishes) waits on the xl doorbell: the D stage now has the whole router+plan+bell
             // stretch (~0.6 ms) of head start instead of starting when the pool is already waiting.
             quantize_q8_1_rows(mixed_, T, (int) N, lat_xq_, cs);
-            // STRATA_VERIFY_D_TILE=1: the same staged tile prefill's D uses (21.5 TFLOP/s there, and it made
-            // prefill's D 4.2x faster than iq_mmvq), here at M = T = 4.  It pads the row tile to 64 so the
-            // COMPUTE is 16x wasted, but it reads exactly the same 52 MB a layer that iq_mmvq does - and that
-            // read is what the 21.5 ms is spent on (2.5 GB a round at ~120 GB/s, against DRAM's ~384).
-            static const bool d_tile = [] {
+            // STRATA_VERIFY_D_TILE: 0 = iq_mmvq (shipped), 1 = the prefill staged tile (loses at M=4: 21.3 vs
+            // 15.3-17.4 ms), 2 = latent_d_fast, the decode-shaped kernel (one warp an output row, T tokens in
+            // registers from each loaded weight word, no padding - bit-exact to this reference).
+            static const int d_tile = [] {
                 const char* v = std::getenv("STRATA_VERIFY_D_TILE");
-                return v != nullptr && v[0] == '1';
+                return v != nullptr ? std::atoi(v) : 0;
             }();
-            if (d_tile)
+            if (d_tile == 2)
+                strata::kernels::latent_d_fast((const uint8_t*) lat_d_ + (size_t) l * lat_dense_.d_bytes(),
+                                               (const uint8_t*) lat_xq_, T, (int) N,
+                                               (int64_t) lat_G_ * lat_ELL_, lat_xl_, cs, lat_fmt_);
+            else if (d_tile == 1)
                 strata::kernels::latent_d_tiled((const uint8_t*) lat_d_ + (size_t) l * lat_dense_.d_bytes(),
                                                 (const uint8_t*) lat_xq_, T, (int) N,
                                                 (int64_t) lat_G_ * lat_ELL_, lat_xl_, cs, lat_fmt_);

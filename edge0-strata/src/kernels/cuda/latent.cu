@@ -633,6 +633,67 @@ void latent_u_tiles(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids,
     u_run_ck(cudaGetLastError(), "latent_u_tile_s");
 }
 
+// ---- the decode-shaped D kernel -----------------------------------------------------------------
+//
+// D is 21.46 ms of a decode round (`iq_mmvq` + the copies) and the bytes say why: G*ELL x N = 19,200 x
+// 2,560 Q8_0 is 52 MB a LAYER, 2.5 GB a round, and the stage moves it at ~150 GB/s against DRAM's ~384.
+// The prefill tile loses here because its 64-row tile pads 16x for T = 4 rows; this kernel keeps D's own
+// shape instead:
+//
+//   one warp per output row (so its 1,360 B row is read as coalesced 128-byte instructions), T tokens
+//   accumulated in registers from each loaded weight word (4x reuse of the bytes that dominate), and the
+//   activations left in L1 - they are T x 2,880 B for the whole layer, so they are hot and free.
+//
+// No staging, no __syncthreads, no row padding: 512 threads = 16 rows a block, ~57k blocks a round
+// instead of the tile's, and 10-deep independent loads a lane.
+constexpr int kDFastWarps = 16;      // output rows a block owns (one warp each)
+constexpr int kDFastThreads = kDFastWarps * 32;
+constexpr int kDMaxTok = 8;          // tokens accumulated in registers (the engine's window is <= 8)
+
+__global__ void latent_d_fast_k(const uint8_t* __restrict__ w, const uint8_t* __restrict__ xq, int M, int K,
+                                int n_out, float* __restrict__ out, int t0) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n = (int) blockIdx.x * kDFastWarps + warp;
+    if (n >= n_out) return;
+    const int nt = min(M - t0, kDMaxTok);
+    if (nt <= 0) return;
+    const int nb = K >> 5;                     // 32-value blocks along K
+    const uint8_t* wrow = w + (size_t) n * (size_t) nb * 34;
+    const uint8_t* xbase = xq + (size_t) t0 * (size_t) nb * 36;
+    float acc[kDMaxTok];
+    for (int t = 0; t < nt; ++t) acc[t] = 0.0f;
+    for (int wi = lane; wi < nb * 8; wi += 32) {   // this lane's 4-value terms of the row
+        const int b = wi >> 3, j = (wi & 7) * 4;
+        const float dw = __half2float(*(const __half*) (wrow + (size_t) b * 34));
+        const int w4 = latent_ld4_i8(wrow + (size_t) b * 34 + 2 + j);
+        for (int t = 0; t < nt; ++t) {
+            const uint8_t* xb = xbase + (size_t) t * (size_t) nb * 36 + (size_t) b * 36;
+            const float dx = __half2float(*(const __half*) xb);
+            acc[t] += dx * dw * (float) __dp4a(*(const int*) (xb + 4 + j), w4, 0);
+        }
+    }
+    for (int t = 0; t < nt; ++t) {
+        float s = acc[t];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) out[(size_t) (t0 + t) * (size_t) n_out + n] = s;
+    }
+}
+
+void latent_d_fast(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, int64_t n_out, float* out,
+                   void* stream, int fmt) {
+    if (M <= 0 || K <= 0 || n_out <= 0 || fmt != 8 || (K & 31) != 0) return;
+    if (w_q8 == nullptr || xq == nullptr || out == nullptr) {
+        std::fprintf(stderr, "latent_d_fast: NULL pointer\n");
+        std::abort();
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    const unsigned grid = (unsigned) ((n_out + kDFastWarps - 1) / kDFastWarps);
+    for (int64_t t0 = 0; t0 < M; t0 += kDMaxTok)
+        latent_d_fast_k<<<grid, kDFastThreads, 0, s>>>(w_q8, xq, (int) M, K, (int) n_out, out, (int) t0);
+    u_run_ck(cudaGetLastError(), "latent_d_fast");
+}
+
 void latent_d_tiled(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, int64_t n_out, float* out,
                     void* stream, int fmt) {    // The D projection: every token against the whole [G*ELL, N] dense matrix, no groups (each token
     // uses G*ELL outputs whatever its route), so the same staged tile serves it with rows == nullptr -

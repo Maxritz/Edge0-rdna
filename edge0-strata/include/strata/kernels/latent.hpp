@@ -53,6 +53,12 @@ void latent_u_tiles(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* id
                     int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
                     int G);
 
+/// The DECODE-shaped D kernel: one warp per output row (coalesced 128-byte row reads), T tokens
+/// accumulated in registers from each loaded weight word, activations in L1, no staging and no row
+/// padding.  For T = 4 the prefill tile pads 16x, which is why it loses there; this keeps D's own shape.
+void latent_d_fast(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, int64_t n_out, float* out,
+                   void* stream, int fmt);
+
 /// The same staged tile for the D projection (no groups: every token against the whole [n_out, K]
 /// matrix).  `out` is [M, n_out] fp32, the layout the caller then quantizes to the xl rows' q8_1.
 void latent_d_tiled(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, int64_t n_out, float* out,

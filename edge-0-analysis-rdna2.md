@@ -502,6 +502,36 @@
 > model's arithmetic and there is no KL/NLL gate to accept it).  Every parameter-level lever around decode
 > has now been measured: window depth, pcie split, pool width, pool placement, and three U shapes.
 
+> ### 0.14 The decode-shaped D kernel: bit-exact, and slower - D is instruction-bound, not DRAM-bound
+>
+> `latent_d_fast` was written to the prescription: one warp per output row so its 1,360 B row is read as
+> coalesced 128-byte instructions, T tokens accumulated in registers from each loaded weight word (4x
+> reuse of the bytes that dominate), activations left in L1 (T x 2,880 B a layer, hot), no staging, no
+> `__syncthreads`, no row padding, 512 threads = 16 rows a block.  It is **bit-exact** against the
+> per-row reference (`latent_u_tile_test`: mean_rel 0.000e+00, cos 1.000000000) because it keeps the same
+> term order and the same per-4-value scaling.
+>
+> It is slower, in alternating pairs:
+>
+> | D kernel | D stage (slot 30) | decode |
+> |---|---|---|
+> | `iq_mmvq` (shipped) | **15.27 / 15.16 ms** | **25.08 / 25.04 tok/s** |
+> | `latent_d_fast` | 19.78 / 19.63 | 22.14 / 22.78 |
+>
+> That is the useful part: **D is not DRAM-bound after all.**  It moves 2.5 GB a round in 15.3 ms = 163
+> GB/s, which is well under DRAM's ~384 - and a kernel with perfectly coalesced reads and 4-token reuse
+> is 29 % SLOWER, so the limit is instructions per byte, not bytes.  `iq_mmvq` gets more MAC per
+> instruction than a hand-written per-4-value loop can (my inner loop spends ~22 instructions per 16 MAC
+> across the tokens: a weight word, an activation word and half per token, a `dp4a`, two multiplies).
+> The "DRAM floor 6.5-8.3 ms" in 0.12 is therefore not reachable from this direction and is withdrawn.
+>
+> Decode now has five measured designs around its two biggest items (per-row U 9.9-10.0, 64-row U tile
+> 13.2, 16-row U tile 68.7, 32-warp blocks 10.6; D tile at M=4 21.3, D fast 19.7 vs iq_mmvq 15.2), and
+> the shipped kernels win or tie every one.  The remaining 2.4x is not a kernel-shape gap: it is the
+> arithmetic the model demands per token - 480 expert-blob reads, 10 U slices and 15 D slices - so the
+> only levers left are the bytes themselves (Q4_0 for the latent D table: ~2x on 15-21 ms and ~1.2 GB of
+> VRAM back) or moving expert bytes off PCIe (the CPU share, blocked by the Windows commit limit).
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
