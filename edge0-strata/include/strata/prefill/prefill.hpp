@@ -40,6 +40,20 @@ struct PrefillStats {
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     int64_t experts_direct = 0;     ///< ...of which MMQ read in their cache slots, not gathered (STRATA_MMQ_DIRECT=1)
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
+    int64_t probe_streamed = 0;     ///< STRATA_PREFILL_PRUNE_PROBE: experts the staged walk would stream (count only)
+    int64_t probe_pruned = 0;       ///< ...of those a rank prune at the probe's threshold would drop
+    // STRATA_PRUNE_STATS=R: what a rank-R prune would change in the routing, and what renormalising the
+    // surviving weights costs.  Measurement only: no blob, weight or result is altered.
+    int64_t prune_rows = 0;           ///< rows (tokens) examined
+    int64_t prune_rows_hit = 0;       ///< rows that would lose at least one of their K experts
+    int64_t prune_slots = 0;          ///< (row, slot) pairs a rank-R prune would drop, VALID ids only
+    double prune_mass = 0.0;          ///< router weight those pairs carry
+    /// A slot with no expert (a padding row) is not a prune: it was never a term, so counting its weight as "dropped"
+    /// inflated every earlier tail-cost figure.  Kept apart here, so the two causes can be told apart in the report.
+    int64_t prune_slots_padding = 0;  ///< (row, slot) pairs with an out-of-range expert id
+    double prune_mass_padding = 0.0;  ///< router weight sitting in those pairs (0 when the router fills all K slots)
+    double prune_kept_mass = 0.0;     ///< router weight the survivors carry
+    double prune_renorm_ms = 0.0;     ///< host time to renormalise the survivors per row
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
 };

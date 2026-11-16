@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/prune_plan.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -1199,18 +1200,25 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             const char* v = std::getenv("STRATA_NO_MULTI_GR");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
+        // STRATA_PRUNE_APPLY: the draft model combines with the same rank cut as the main model's decode and prefill
+        // (slots j >= rank drop out, weights un-renormalised), so a pruned run is pruned in the MTP head too.  The
+        // head is a single layer of its own and is not one of STRATA_PRUNE_PLAN_L's entries, so it takes the flat
+        // rank (layer -1 -> no plan entry), which is what the prefill path gives a plan shorter than the layer index.
+        static const int64_t mtp_keep_rank = strata::core::prune_rank_for_layer(-1);
         for (int t = 0; t < T; ++t) {
             if (!(T > 1 && native_moe_combine_enabled())) {
                 if (native_moe_combine_enabled())
-                    native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
+                    native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs,
+                                       mtp_keep_rank);
                 else
-                    moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
+                    moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs,
+                                mtp_keep_rank);
             }
             if (!fuse_head_gr && no_multi_gr)
                 gr_write(R_ + (size_t) t * HC * N, y_ + t * N, inj2_ + t * HC, gs, R_ + (size_t) t * HC * N, cs);
         }
         if (T > 1 && native_moe_combine_enabled())
-            native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
+            native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs, mtp_keep_rank);
         // #783 PR-g (stuchapin909): the T residual writes in one launch (each token's R, block output and injection are
         // its own, so doing them after the loop changes nothing)
         if (!fuse_head_gr && !no_multi_gr)

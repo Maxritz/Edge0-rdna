@@ -2526,7 +2526,7 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, prefix: int | None = None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -2541,7 +2541,12 @@ class StrataEngine:
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            # SAVE prefix=<N> <path>: the checkpoint-only image - the prefix's own state and K/V, no live tail and no
+            # checkpoint chain - so the file is the size of the prefix rather than of the session that holds it
+            cmd = "SAVE" if action == "save" else "RESTORE"
+            if action == "save" and prefix is not None:
+                cmd += f" prefix={int(prefix)}"
+            self.proc.stdin.write(f"{cmd} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -4190,6 +4195,8 @@ class Service:
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        self.prefix_store = None                      # prefix_dir: the content-addressed shared-prefix store (T7)
+        self.prefix_auto = False                      # prefix_auto: pick the pin boundary from the leading system turns
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -5313,13 +5320,40 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
-        if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images and not ds_pics:
-            lead = self.deepseek_shared_start(messages)
+        if req is not None and req.get("strata_prefix") is None and not images and not ds_pics:
+            # the shared start is picked here, never asked of the client: the leading system/developer turns are
+            # what every request of one agent (or one app) repeats verbatim, so pinning there turns N reads of a
+            # long system prompt into one.  deepseek41 keeps its own rule (its tools live in the system turn).
+            lead = self.deepseek_shared_start(messages) if self.family == "deepseek41" else 0
+            if not lead and getattr(self, "prefix_auto", False):
+                lead = self.shared_start(messages)
             if lead:
-                req["strata_prefix"] = {"messages": lead}
+                # mark the END of the last leading system turn (`{"message": i, "chars": n}`) rather than
+                # `{"messages": k}`: that form renders the WHOLE list with a sentinel at the cut, so a template
+                # that refuses to render a system turn on its own (Qwen's "No user query found in messages.")
+                # still yields the boundary.  `{"messages": k}` renders the prefix alone and is ignored there.
+                msg = messages[lead - 1]
+                text = msg.get("content") if isinstance(msg, dict) else None
+                req["strata_prefix"] = ({"message": lead - 1, "chars": len(text)} if isinstance(text, str) and text
+                                        else {"messages": lead})
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    @staticmethod
+    def shared_start(messages) -> int:
+        """How many leading messages are the system/developer turns: the prefix every request behind this prompt
+
+        repeats.  0 when there is none, or when nothing would follow it (a request that IS only its system turn has
+        no suffix to pin, and the engine refuses `pin >= prompt - 1`).
+        """
+        n = 0
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+                n += 1
+            else:
+                break
+        return n if 0 < n < len(messages) else 0
 
     @staticmethod
     def deepseek_shared_start(messages) -> int:
@@ -5377,7 +5411,13 @@ class Service:
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
                   if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
             kw["add_generation_prompt"] = False
-            text = self.template.render(marked, tools=marked_tools, **kw)
+            try:
+                text = self.template.render(marked, tools=marked_tools, **kw)
+            except ValueError as e:
+                # the template refused these turns on their own (Qwen's "No user query found in messages." when the
+                # prefix leaves no user turn): nothing can be marked, which is an ignored pin, never a failed request
+                print(f"[strata] strata_prefix not marked: the template refused the prefix alone ({e})", flush=True)
+                return []
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
                 text = text[:cut]
@@ -5402,7 +5442,10 @@ class Service:
             if not isinstance(text, str) or chars > len(text):
                 print(f"[strata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
                 return {}
-            cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
+            # the WHOLE list with the sentinel inside message i: rendering only messages[:i] leaves a system turn
+            # with no user after it, which a template may refuse outright (Qwen's "No user query found in
+            # messages."), so the boundary could never be marked for that family.  head_ids() cuts at the sentinel.
+            cut = (messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}] + messages[i + 1:])
             head = head_ids(cut)
             n = lcp(head, ids)
         if n < 1 or n >= len(ids) - 1:
@@ -5458,15 +5501,88 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    def prefix_restore(self, ids, sampling):
+        """T7: restore the stored image whose token prefix matches this prompt.  -> (store, key to save | None).
+
+        The engine's session_file() runs between requests, exactly as the slot endpoint calls it (the caller holds
+        the FIFO), so this is safe here and only here.  Any failure degrades to the engine's own prompt cache.
+        """
+        store = getattr(self, "prefix_store", None)
+        if store is None or not isinstance(sampling, dict):
+            return None, None
+        pfx = sampling.get("strata_prefix")
+        n = pfx.get("tokens") if isinstance(pfx, dict) else None
+        if not isinstance(n, int) or isinstance(n, bool) or not 0 < n < len(ids):
+            return None, None                       # no pinned prefix in this request: nothing to key on
+        try:
+            from serve.prefix_store import prefix_key
+        except ImportError:
+            from prefix_store import prefix_key
+        try:
+            # the model arch (and the pack, when the config names one) keeps two engines' images apart: the engine
+            # refuses a session file whose model fingerprint differs, so a collision costs a refused restore, never
+            # a wrong answer - but it would also waste a slot in the store
+            what = str(getattr(self, "model_arch", "") or "")
+            path = str(getattr(self, "model_path", "") or getattr(self, "engine_pack", "") or "")
+            key = prefix_key(what + "\x00" + path, ids, n)
+        except ValueError:
+            return None, None
+        if not store.has(key):
+            return store, key                        # cold: save it when this request is done
+        try:
+            self.engine.session_file("restore", store.path(key))
+            store.touch(key)
+            print(f"[strata] prefix store: restored {n} tokens ({key[:12]}) - the prompt is not read again", flush=True)
+        except Exception as e:                       # a refused restore must not fail the request
+            print(f"[strata] prefix store: restore of {key[:12]} failed ({e}); reading the prompt", flush=True)
+            return store, None
+        return store, None                            # a hit: nothing to save afterwards
+
+    def prefix_save(self, store, key, tokens):
+        """T7: keep the state this request produced, so a later request behind the same prefix skips the read.
+
+        `SAVE prefix=<tokens>` writes the checkpoint-only image: that checkpoint's running state and the K/V cut to it,
+        with no live tail and no checkpoint chain, so the entry is the size of the prefix and not of the session that
+        read it (the whole-session image carried the tail too: ~139 KiB per prompt token, and it grew with the reply).
+        The entry is still checked against `prefix_max_image_mb` and dropped when it does not fit: a cap that only
+        logged would leave the directory growing with every new prefix.
+        """
+        try:
+            self.engine.session_file("save", store.path(key), prefix=tokens)
+        except Exception as e:
+            print(f"[strata] prefix store: save of {key[:12]} failed ({e})", flush=True)
+            return
+        fits, size = store.check_image(key)
+        if not fits:
+            store.drop(key)
+            print(f"[strata] prefix store: dropped {key[:12]}: {size / (1 << 20):.0f} MiB is over the "
+                  f"{store.max_image_bytes >> 20} MiB cap (prefix_max_image_mb); the engine stores the whole "
+                  "session, not just the pinned prefix", flush=True)
+            return
+        # the budget follows the disk: a save is the only way the store grows, so this is where a
+        # volume that has filled up (or been freed) is noticed
+        budget = store.refresh_total()
+        dropped = store.evict(keep=key)
+        print(f"[strata] prefix store: saved {key[:12]} {size / (1 << 20):.0f} MiB ({store.note()}, "
+              f"dropped {dropped}, budget {(budget >> 20) or 'none'} MiB)", flush=True)
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
+        store, key = self.prefix_restore(ids, sampling)
+        # the prefix length this request pinned (strata_prefix.tokens): the checkpoint the save writes alone
+        pfx = sampling.get("strata_prefix") if isinstance(sampling, dict) else None
+        prefix_tokens = pfx.get("tokens") if isinstance(pfx, dict) else None
+        if not isinstance(prefix_tokens, int) or isinstance(prefix_tokens, bool) or prefix_tokens <= 0:
+            prefix_tokens = None
         try:
             yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
         finally:
+            if store is not None and key is not None:
+                self.prefix_save(store, key, prefix_tokens)
             if ka is not None:
                 ka.release()
 
@@ -8536,6 +8652,106 @@ def split_joined_args(cfg: dict) -> None:
               'flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
 
 
+# The engine args that name a file or directory the engine must OPEN before it can serve.  A config that points at a
+# model that is not there used to reach the spawn and fail minutes later, with the engine's own message buried in the
+# log; these are checked first so the server can say which path is missing, in the config's own terms.  (--expert-profile
+# and --mtp are left out: the engine may create the profile, and qwen35moe's --mtp is a draft count, not a path.)
+MODEL_PATH_FLAGS = ("--pack", "--native", "--model", "--ple-gguf", "--native-dense-gguf")
+
+
+def missing_model_paths(cfg: dict) -> list[tuple[str, str]]:
+    """The (flag, path) pairs of `cfg`'s args that do not exist on disk, in the order they are written."""
+    args = [str(a) for a in cfg.get("args") or []]
+    missing = []
+    for i, flag in enumerate(args[:-1]):
+        if flag in MODEL_PATH_FLAGS and not Path(args[i + 1]).exists():
+            missing.append((flag, args[i + 1]))
+    return missing
+
+
+# GGUF metadata value widths, by type id (0 BOOL, 1 I8, 2 U8, 3 I16, 4 U16, 5 I32, 6 U32, 7 F32, 10 F64, 11 I64, 12 U64);
+# 8 is a string and 9 an array, which need their own loops.
+_GGUF_FIXED = {0: 1, 1: 1, 2: 1, 3: 2, 4: 2, 5: 4, 6: 4, 7: 4, 10: 8, 11: 8, 12: 8}
+
+
+def gguf_architecture(path) -> str | None:
+    """`general.architecture` from a GGUF v3 header, or None when the file is not a GGUF v3, cannot be read, or does not
+    carry the key.  Header only: the metadata block precedes the tensor data, so this reads a few KB, not the model - the
+    point is to say WHICH engine path a config takes before the engine spends minutes loading."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            magic, version = struct.unpack("<II", f.read(8))
+            if magic != 0x46554747 or version != 3:        # "GGUF" little-endian, v3 is what this tree writes
+                return None
+            _n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+
+            def rd_str() -> str:
+                n, = struct.unpack("<Q", f.read(8))
+                return f.read(n).decode("utf-8", "replace")
+
+            for _ in range(n_kv):
+                key = rd_str()
+                t, = struct.unpack("<I", f.read(4))
+                if key == "general.architecture" and t == 8:
+                    return rd_str()
+                if t == 8:
+                    rd_str()
+                elif t == 9:                               # an array: element type, count, then the elements
+                    et, = struct.unpack("<I", f.read(4))
+                    n, = struct.unpack("<Q", f.read(8))
+                    if et == 8:
+                        for _ in range(n):
+                            rd_str()
+                    elif et in _GGUF_FIXED:
+                        f.seek(_GGUF_FIXED[et] * n, 1)
+                    else:
+                        return None
+                elif t in _GGUF_FIXED:
+                    f.seek(_GGUF_FIXED[t], 1)
+                else:
+                    return None
+    except (OSError, struct.error, ValueError):
+        return None
+    return None
+
+
+def engine_path_note(cfg: dict) -> str:
+    """One line naming the engine path this config will take, and the model's own architecture string when the file has
+    one.  A config pointed at the wrong model (or at a family this build cannot run) is obvious here, before loading."""
+    args = [str(a) for a in cfg.get("args") or []]
+
+    def after(flag: str):
+        for i, a in enumerate(args[:-1]):
+            if a == flag:
+                return args[i + 1]
+        return None
+
+    exe = Path(str(cfg.get("exe") or "")).name.lower()
+    if "dsv41" in exe or "ds4" in exe:
+        pack = after("--pack")
+        return ("DeepSeek-V4.1-Flash (src/dsv41)" + (f" - pack {pack}" if pack else "") +
+                " (its own pack format: no GGUF architecture to read)")
+    model = after("--native") or after("--model")
+    if not model:
+        return "Flash-Next (src/program) - no --model/--native in the config's args"
+    arch = gguf_architecture(model)
+    declared = cfg.get("arch")
+    if arch is None and declared in FAMILY_MODEL_NAMES:   # an unreadable file: the config's own "arch" still says the path
+        arch, unread = declared, " (the config's arch; the file's header could not be read)"
+    else:
+        unread = ""
+    said = f"Flash-Next (src/program) - model {model}, general.architecture = {arch if arch else 'not readable'}"
+    if arch == "qwen35moe":
+        said = f"Qwen3.6-35B-A3B (src/qwen35) - model {model}, general.architecture = qwen35moe"
+    elif arch not in (None, "qwen4exp", "edge0"):
+        said += " - no engine path for that architecture in this build: the file will be refused by name"
+    said += unread
+    if declared and declared in FAMILY_MODEL_NAMES and arch and not unread and FAMILY_MODEL_NAMES[declared] != FAMILY_MODEL_NAMES.get(arch):
+        said += f" (the config says arch {declared}, but the file is what the family switch reads)"
+    return said
+
+
 def read_config(path) -> dict:
     """The run config's JSON.  A mistake in it (a missing comma between two args, a trailing comma) is said with its
     place in the file instead of a traceback (#2267: editing "args" by hand is where it happens)."""
@@ -9076,6 +9292,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     split_joined_args(cfg)
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
+    if cfg and a.engine == "strata":    # which engine path, and the model's own architecture string: before anything loads
+        print(f"[strata] engine path: {engine_path_note(cfg)}", flush=True)
+    if cfg and a.engine == "strata" and (missing := missing_model_paths(cfg)):
+        where = Path(a.config).name if a.config else "the config"
+        listed = "\n".join(f"  {flag}  {path}" for flag, path in missing)
+        ap.error(f"{where}: the engine cannot start, these model paths do not exist:\n{listed}\n"
+                 "put the model there, or point \"args\" at the files you have (the model itself is the --native/--model "
+                 "value: a GGUF shard, or for a pack the --pack directory)")
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
     if a.owner_fd is not None:
@@ -9414,6 +9638,37 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    # prefix_dir (T7): a content-addressed store of shared prompt prefixes.  The engine already pins a prefix
+    # (strata_prefix -> pin=N) and saves/restores its state; this keeps those images under a key derived from the
+    # prefix's own token ids, so the next request that shares one finds it without naming a file.
+    if cfg.get("prefix_dir"):
+        try:
+            from serve.prefix_store import PrefixStore, default_max_files, default_total_bytes, free_bytes
+        except ImportError:
+            from prefix_store import PrefixStore, default_max_files, default_total_bytes, free_bytes
+        try:
+            pdir = slot_save_dir(cfg["prefix_dir"], cfg.get("cwd"))
+            svc.prefix_auto = bool(cfg.get("prefix_auto", True))   # pick the pin boundary ourselves
+            cap_mb = int(cfg.get("prefix_max_image_mb") or 0)     # 0 = no per-image cap
+            total_mb = cfg.get("prefix_max_total_mb")             # unset: derived from the volume's free space
+            if total_mb is None:
+                total_bytes = default_total_bytes(pdir)
+                n_files = int(cfg.get("prefix_max_files") or default_max_files(total_bytes))
+                if total_bytes:
+                    print(f"[strata] prefix store: no prefix_max_total_mb, so {total_bytes >> 20} MiB of the "
+                          f"{free_bytes(pdir) >> 20} MiB free where it lives (re-read at every save)", flush=True)
+                else:
+                    print("[strata] prefix store: free space unreadable; set prefix_max_total_mb to bound it",
+                          flush=True)
+            else:
+                total_bytes = int(total_mb) << 20
+                n_files = int(cfg.get("prefix_max_files") or 8)
+            svc.prefix_store = PrefixStore(pdir, n_files, cap_mb << 20, total_bytes, auto_total=total_mb is None)
+        except (ValueError, OSError, TypeError) as e:
+            raise SystemExit(f"[strata] {e}")
+        _s = svc.prefix_store
+        print(f"[strata] prefix store on: {_s.note()} (content-addressed, prefix_max_files {_s.max_files}, "
+              f"prefix_max_total_mb {_s.max_total_bytes >> 20 or 'none'})", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")

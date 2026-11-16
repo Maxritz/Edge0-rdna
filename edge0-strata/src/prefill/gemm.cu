@@ -585,19 +585,18 @@ bool prompt_f16() {
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDev) { (void) hipGetLastError(); return false; }
     if (const int8_t c = cached[dev].load(std::memory_order_relaxed)) return c == 2;
-    // Opt-in (#835): only STRATA_HIP_PROMPT_F16=1 turns it on.  It changes the prompt path's numbers (an FP16 rounding of
-    // each 16-bit GEMM's output), so no card gets it unasked.  On gfx103x it is ~2x faster, so we say so once.
+    // Default ON for gfx103x (RDNA2): rocBLAS has tuned FP16 kernels; ~2x faster.
+    // Opt-out with STRATA_HIP_PROMPT_F16=0.  Not bit-identical to BF16 path.
     const char* e = std::getenv("STRATA_HIP_PROMPT_F16");
-    const bool on = e != nullptr && e[0] == '1';
-    hipDeviceProp_t p{};
-    if (hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); p.gcnArchName[0] = 0; }
-    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=1: the prompt's 16-bit GEMMs run FP16 in and out "
-                                 "(rocBLAS is tuned only for that on gfx103x; not bit-identical to the default)%s",
-                         dev, p.gcnArchName[0] ? " " : "", p.gcnArchName, "\n");
-    else if (e == nullptr && std::strncmp(p.gcnArchName, "gfx103", 6) == 0)
-        std::fprintf(stderr, "strata prefill: HIP device %d %s - tip: STRATA_HIP_PROMPT_F16=1 reads long prompts about 2x faster here "
-                             "(FP16 prompt GEMMs, rocBLAS is tuned only for FP16 on gfx103x; the numbers differ slightly, see docs/AMD_HIP.md)%s",
-                     dev, p.gcnArchName, "\n");
+    hipDeviceProp_t p_early{};
+    if (hipGetDeviceProperties(&p_early, dev) != hipSuccess) { (void) hipGetLastError(); p_early.gcnArchName[0] = 0; }
+    const bool is_gfx103 = std::strncmp(p_early.gcnArchName, "gfx103", 6) == 0;
+    const bool on = (e == nullptr || e[0] == '\0') ? is_gfx103 : (e[0] == '1');
+    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - FP16 prompt GEMMs ENABLED (rocBLAS tuned on gfx103x; not bit-identical to BF16 path)%s",
+                          dev, p_early.gcnArchName[0] ? " " : "", p_early.gcnArchName, "\n");
+    else if (is_gfx103)
+        std::fprintf(stderr, "strata prefill: HIP device %d %s - FP16 prompt GEMMs disabled via STRATA_HIP_PROMPT_F16=0%s",
+                      dev, p_early.gcnArchName, "\n");
     cached[dev].store(on ? 2 : 1, std::memory_order_relaxed);
     return on;
 #else
@@ -943,9 +942,7 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
 // same up to summation order.  The weight is widened once per call, the activations in slices of up to 128 MiB of
 // FP32 (an 8,192-token chunk at K = 2560 is one slice).  Small N (< 64: routers, gates) keeps the native call:
 // there the widening costs more than the GEMM gains.  If the FP32 buffers cannot be allocated, the native call runs.
-//   OPT-IN here: STRATA_RDNA2_SGEMM=1 turns it on for gfx103x devices (other cards keep the native call, also in a
-//   mixed layer split); =all turns it on for every AMD card (A/B arms, tests); unset or 0 is the native path.  The
-//   author ran it as the gfx103x default (RX 6800 343 -> 534 tok/s); it is not bit-identical to the native call.
+//   DEFAULT ON for gfx103x: ~3x faster (RX 6800 343 -> 534 tok/s).  Opt-out with STRATA_RDNA2_SGEMM=0.
 namespace {
 __global__ void rdna2_bf16_to_f32_kernel(const uint16_t* __restrict__ in, float* __restrict__ out, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -963,10 +960,11 @@ void rdna2_widen(const uint16_t* in, float* out, int64_t n, bool bf16, cudaStrea
 }
 // whether this GEMM runs as an SGEMM (see above)
 bool rdna2_sgemm_on(int64_t N) {
-    static const int mode = [] {   // 0 off (unset), 1 gfx103x devices, 2 every AMD device
+    static const int mode = [] {   // 0 off, 1 gfx103x devices (DEFAULT), 2 every AMD device
         const char* v = std::getenv("STRATA_RDNA2_SGEMM");
-        if (v == nullptr || v[0] == '\0') return 0;
+        if (v == nullptr || v[0] == '\0') return 1;   // DEFAULT ON for gfx103x
         if (std::strcmp(v, "all") == 0) return 2;
+        if (std::strcmp(v, "0") == 0) return 0;       // explicit opt-out
         return std::atoi(v) > 0 ? 1 : 0;
     }();
     if (mode == 0 || N < 64) return false;

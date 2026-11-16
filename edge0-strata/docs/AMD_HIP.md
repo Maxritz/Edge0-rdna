@@ -539,6 +539,61 @@ Other gfx103x and RDNA2-adjacent cards (community reports):
 
 On Windows, setup's ready-made engine runs an RX 6800 beside a 780M iGPU (HIP numbers the RX 6800 as 1).
 
+### Resizable BAR: a property of the machine, not of the engine
+
+A large PCIe aperture lets the host map all of VRAM instead of a 256 MB window, which is what the expert copies to and
+from the device would otherwise go through. Nothing an application sets turns it on, and the engine has no large-BAR code
+path at all (`resizable bar` / `large bar` appear nowhere in `src`, `include` or these notes); `--pcie-frac` tunes the share
+of expert moves sent over PCIe, not the window size.
+
+Measure it with `tools/hip/rebar_probe.cpp`, which prints `hipDeviceProp_t::isLargeBar` (and
+`hipDeviceAttributeIsLargeBar`, the same fact as an attribute), the VRAM size and the PCI bus id. On the RX 6700 XT these
+notes were measured on it reads **0**, while the KMD registry value `KMD_RebarControlMode` is 1: the driver is willing and
+the firmware is not exposing a large aperture. Enable Above-4G Decoding and Re-Size BAR in the firmware (and Smart Access
+Memory in the AMD driver) and it should read 1. Check it before blaming the PCIe path for anything - a 256 MB window is
+the common case, and it is also the case the engine's staging is written for.
+
+### Prefill: the measured model (gfx1031, 120B Q3_K)
+
+What a prompt costs on this backend is a two-term curve, not a single rate. Measured on an RX 6700 XT with the pack below,
+one run a point, greedy, `--max-context 4096 --prefill auto --short-read 0` (the 4,834-token point at `--max-context 8192`):
+
+| Prompt tokens | Prefill rate | Rows per expert |
+| --- | --- | --- |
+| 320 | 57 tok/s | 10 |
+| 1,672 | 94 tok/s | 58 |
+| 2,354 | 96 tok/s | 82 |
+| 2,695 | 100 tok/s | 94 |
+| 4,834 | 100 tok/s | 151 |
+
+**The model:** one prompt token costs about 10 ms above roughly 2,700 tokens, so `t ≈ N / 100` seconds and the rate is flat
+(100 tok/s on 2,695 and on 4,834 alike). Below that the rate falls with the prompt, because the grouped-expert work is
+parallel over the prompt's rows: at 320 tokens only 10 rows land on each expert, too few to amortise the per-group gather and
+launch, so the same work costs more per row. A constant-overhead fit (`t ≈ 2.4 s + N/100`) reproduces the 320-token point and
+the flat tail but over-predicts the middle by 5-7%, so treat it as a description of the two regimes rather than a formula.
+
+**What this rules out as the limit** (each measured, not assumed):
+
+* The decode window is not it: the host gap between windows measured 6-7 ms against a 101 ms window.
+* Speculative depth is not it: `--spec` 4 to 14 changed the rate by 0%, and acceptance caps at 8 tokens.
+* The prompt-read path is not it above ~2,700 tokens: `--short-read 0` (every prompt through the batched chunk) costs 13% on
+  short prompts and nothing on long ones.
+* `STRATA_LATENT_MMQ` is not available as a lever on evidence: the path fails parity against the reference at the first
+  generated tokens on two prompts, is not deterministic between two fresh engines, and gave +0.6% slower prefill here. Keep
+  it at 0.
+
+**Limits of this measurement:** one pack (Q3_K gate/up, IQ4_XS down, latent 1280, 48 layers, 10 routed + 1 shared experts),
+one card, one config, one run per point - the point-to-point noise is not characterised, so the 94 vs 96 vs 100 tok/s spread
+is inside it. It says nothing about contexts beyond 4,096 tokens (the 4,834-token point ran at 8,192), about prompt lengths
+between the points, other quant types, or multi-request batching. These are prefill rates and do not transfer to decode:
+decode on the same setup measured 30.0 tok/s steady state (200 greedy tokens), and is CPU-compute-bound rather than
+bandwidth-bound - 18.5 GB/s of expert reads against a measured 36.8 GB/s ceiling, with about six worker threads pegged.
+
+> **Measured on:** RX 6700 XT 12 GB (gfx1031), `Edge0-120B-q3k` (native experts, 26.66 GiB), Windows, ROCm 7.x, engine built
+> from source with `tools/hip/build_windows_rdna2.bat`; arguments as in `serve/config-rdna2.json` (`--expert-cache auto
+> --prefill auto --short-read 0 --vram-reserve-mib 1024`), with `--max-context 4096` (and 8192 for the last point) in place of
+> the file's 2048, and `STRATA_LAT_FUSED_Q3K=0`, 2026-11-15.
+
 ## gfx906 (Instinct MI50 / MI60, Radeon VII): wave64, built from source
 
 gfx906 is wave64 and has no WMMA and no packed byte arithmetic, so the wave32 backend refuses it. A separate opt-in build

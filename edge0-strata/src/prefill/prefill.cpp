@@ -37,6 +37,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_turbo.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
@@ -179,6 +180,31 @@ constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
+// STRATA_PRUNE_APPLY: the gather-side keep mask's device buffer, grown to the largest chunk seen.  It lives here,
+// above the layer loop, because the moe_combine call that consumes it sits outside the block that fills it.
+namespace {
+uint8_t* g_prune_keep = nullptr;
+int64_t g_prune_keep_cap = 0;
+
+// **THE RANK-PRUNE STREAM PLAN (STRATA_PRUNE_PLAN / STRATA_PRUNE_RECORD), measured with a ZEROED STAND-IN BLOB.**
+// A prune only saves copy time if the pruned expert is never COPIED, and the stream plan is built per chunk before
+// any layer's router has run - so the routing it is filtered by has to come from somewhere else.  Run 1 writes each
+// layer's `ids` (STRATA_PRUNE_RECORD=<dir>); run 2 reads them (STRATA_PRUNE_PLAN=<dir>), drops every expert that no
+// token of that layer routes above the prune rank from the stream plan, and points the kernels at a zeroed blob of
+// the same size instead.  The zeros are what an expert the prune never computed would contribute; the copies are
+// what it saves.  The drift between the two runs' text is the cost.  A pruned expert that run 2 DOES route is read
+// as zeros deliberately: that is the damage a static plan does when the routing moves.
+uint8_t* g_zero_blob = nullptr;      // device: zeros, one blob long (the largest blob of any layer)
+int64_t g_zero_blob_bytes = 0;
+std::vector<uint8_t> g_prune_plan;   // [n_layers * n_expert]: 1 = do not stream it, its blob is zeros
+bool g_prune_plan_on = false;
+int g_prune_plan_rank = 7;
+inline bool prune_plan_hit(int64_t l, int32_t e) {
+    return g_prune_plan_on && (size_t) (l * 4096 + e) < g_prune_plan.size() &&
+           g_prune_plan[(size_t) (l * 4096 + e)] != 0;
+}
+}  // namespace
+
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 // The staged walk's ring when its MMQ groups take the staged experts too: two groups, so a slot is refilled only after
 // the group that read it was gathered (the walk stages at most STAGE_GRP - MMQ_GROUP - 1 entries ahead)
@@ -1217,6 +1243,12 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
     } else if (q0.kv_q4) {
         st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
         st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_turbo) {
+        st.k_turbo = o.take<uint8_t>(rows * strata::kernels::kv_turbo_bytes_per_head((int) s.head_dim), ok);
+        st.v_turbo = o.take<uint8_t>(rows * strata::kernels::kv_turbo_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_rot4) {
+        st.k_rot4 = o.take<uint8_t>(rows * strata::kernels::kv_rot4_bytes_per_head((int) s.head_dim), ok);
+        st.v_rot4 = o.take<uint8_t>(rows * strata::kernels::kv_rot4_bytes_per_head((int) s.head_dim), ok);
     } else if (q0.kv_int8) {
         st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
@@ -1231,6 +1263,8 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     strata::kernels::QsaAttnPools p;
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+    p.k_turbo = h.k_turbo; p.v_turbo = h.v_turbo;
+    p.k_rot4 = h.k_rot4; p.v_rot4 = h.v_rot4;
     p.page_table = table;
     return p;
 }
@@ -2248,6 +2282,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         }
         if (st.kv_q4) {
             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+        } else if (st.kv_turbo) {
+            strata::kernels::kv_append_turbo(st.k_turbo, st.v_turbo, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+        } else if (st.kv_rot4) {
+            strata::kernels::kv_append_rot4(st.k_rot4, st.v_rot4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
         } else {
             kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
@@ -2924,9 +2962,25 @@ struct PfTimer {
     std::vector<cudaEvent_t> ev;
     std::vector<int> ph;
     size_t used = 0;
-    double ms[kPfCount] = {};
+    double ms[kPfCount] = {};        ///< device time between consecutive marks, charged to the phase of the first
+    double host_ms[kPfCount] = {};   ///< HOST time between consecutive marks, charged the same way
+    long long marks[kPfCount] = {};  ///< how many times each phase was opened (per layer, per chunk)
+    Clock::time_point last_host{};
+    bool last_set = false;
     void mark(int phase, cudaStream_t s) {
         if (!on) return;
+        // HOST RADAR: the time the host spent since the previous mark is charged to the phase that was OPEN,
+        // which is the same rule the event gap uses ("a gap where the GPU waits lands on the phase that was
+        // waiting").  Without this the table cannot separate a slow kernel from a slow host step - and for this
+        // engine's expert staging those are opposite fixes.
+        const auto now = Clock::now();
+        if (last_set) {
+            const double dt = std::chrono::duration<double, std::milli>(now - last_host).count();
+            if (used > 0) host_ms[ph[used - 1]] += dt;
+        }
+        last_host = now;
+        last_set = true;
+        ++marks[phase];
         if (used == ev.size()) {
             cudaEvent_t e = nullptr;
             cudaEventCreate(&e);
@@ -3546,6 +3600,61 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         };
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
+        // STRATA_PRUNE_PLAN=<dir>: the recorded routing decides which experts this chunk streams.  Read once, then
+        // every binding site below sends a pruned expert at the zeroed blob instead of a ring slot or a cache slot.
+        if (const char* plan_dir = std::getenv("STRATA_PRUNE_PLAN"); plan_dir != nullptr && !g_prune_plan_on) {
+            static const int plan_rank = [] {
+                const char* v = std::getenv("STRATA_PRUNE_RANK");
+                return v != nullptr ? std::atoi(v) : 7;
+            }();
+            g_prune_plan_rank = plan_rank;
+            const int64_t nl = g.n_layers, ne = m.g->n_expert;
+            g_prune_plan.assign((size_t) nl * 4096, 0);
+            // the zeroed stand-in: one blob, as long as the largest layer's
+            int64_t widest = 0;
+            for (int64_t l = 0; l < nl; ++l) widest = std::max<int64_t>(widest, lay0.blob_bytes(l));
+            if (widest > 0 && (g_zero_blob == nullptr || g_zero_blob_bytes < widest)) {
+                if (g_zero_blob != nullptr) cudaFree(g_zero_blob);
+                g_zero_blob = nullptr;
+                g_zero_blob_bytes = 0;
+                if (cudaMalloc(&g_zero_blob, (size_t) widest) == cudaSuccess &&
+                    cudaMemset(g_zero_blob, 0, (size_t) widest) == cudaSuccess)
+                    g_zero_blob_bytes = widest;
+                else
+                    g_zero_blob = nullptr;
+            }
+            int64_t n_experts_pruned = 0;
+            for (int64_t l = 0; l < nl; ++l) {
+                char p[512];
+                std::snprintf(p, sizeof p, "%s/L%02d-ids.bin", plan_dir, (int) l);
+                std::FILE* f = std::fopen(p, "rb");
+                if (f == nullptr) continue;   // no recording for this layer: it streams everything, as before
+                std::vector<int32_t> ids;
+                int32_t buf[4096];
+                size_t got;
+                while ((got = std::fread(buf, 4, 4096, f)) > 0) ids.insert(ids.end(), buf, buf + got);
+                std::fclose(f);
+                if (ids.empty()) continue;
+                std::vector<uint8_t> prunable((size_t) ne, 1);
+                const size_t rows = ids.size() / (size_t) K;
+                for (size_t r = 0; r < rows; ++r)
+                    for (int j = 0; j < (int) K; ++j) {
+                        const int32_t e = ids[r * (size_t) K + (size_t) j];
+                        if (e >= 0 && e < ne && j < plan_rank) prunable[(size_t) e] = 0;
+                    }
+                for (int64_t e = 0; e < ne; ++e)
+                    if (prunable[(size_t) e]) {
+                        g_prune_plan[(size_t) (l * 4096 + e)] = 1;
+                        if (m.host_res && m.cache && m.host_res[(size_t) (l * ne + e)] >= 0) continue;   // resident: no copy anyway
+                        ++n_experts_pruned;
+                    }
+            }
+            g_prune_plan_on = g_zero_blob != nullptr;
+            std::fprintf(stderr, "strata prefill: STRATA_PRUNE_PLAN rank %d: %lld streamed experts replaced by a zeroed "
+                                 "%.2f MB stand-in blob (%s)\n",
+                         plan_rank, (long long) n_experts_pruned,
+                         (double) g_zero_blob_bytes / 1048576.0, g_prune_plan_on ? "on" : "OFF: no buffer");
+        }
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
         if (stream_all) {
@@ -3573,6 +3682,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                    if (prune_plan_hit(l, e)) continue;   // rank-pruned: never copied, the kernels read the zero blob
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
@@ -4108,6 +4218,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
                                                           host_w, staged ? &m.stage : nullptr);
+                        else if (st.kv_turbo)
+                            strata::kernels::kv_append_turbo(st.k_turbo, st.v_turbo, st.page_table, p0, T, m.Kc, m.Vc,
+                                                             s, m.cs, host_w, staged ? &m.stage : nullptr);
+                        else if (st.kv_rot4)
+                            strata::kernels::kv_append_rot4(st.k_rot4, st.v_rot4, st.page_table, p0, T, m.Kc, m.Vc,
+                                                            s, m.cs, host_w, staged ? &m.stage : nullptr);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
@@ -4489,6 +4605,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (k - k0 == per) break;
                                     blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
                                     ++k;
+                                } else if (prune_plan_hit(l, e)) {   // rank-pruned: zeros stand in for the expert
+                                    blob[e - b.e0] = g_zero_blob;
                                 } else {                  // not streamed: resident (the walk streams all others)
                                     blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
                                     // counted whether routed or not (the routing stays on the GPU): at a streamed
@@ -4596,6 +4714,357 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
+                            // STRATA_PRUNE_RECORD=<dir>: run 1's half of the rank-prune stream experiment - each layer's
+                            // ids, written once per layer at the largest chunk seen, for run 2's stream plan to read.
+                            static const char* rec_dir = std::getenv("STRATA_PRUNE_RECORD");
+                            if (rec_dir != nullptr && T >= 8) {
+                                static std::vector<int64_t> rec_T;
+                                if ((int64_t) rec_T.size() < m.g->n_layers) rec_T.assign((size_t) m.g->n_layers, 0);
+                                if (rec_T[(size_t) l] < T) {
+                                    rec_T[(size_t) l] = T;
+                                    char p[512];
+                                    std::snprintf(p, sizeof p, "%s/L%02d-ids.bin", rec_dir, (int) l);
+                                    if (std::FILE* f = std::fopen(p, "wb")) {
+                                        std::fwrite(ids_h, 4, (size_t) (T * K), f);
+                                        std::fclose(f);
+                                    }
+                                }
+                            }
+                            // STRATA_PRUNE_STATS=R: the token-side accounting of a rank-R prune - how many rows lose an
+                            // expert, how much router weight they lose, and the cost of renormalising what is left.
+                            static const int prune_stats_r = [] {
+                                const char* v = std::getenv("STRATA_PRUNE_STATS");
+                                return v != nullptr ? std::atoi(v) : 0;
+                            }();
+                            if (prune_stats_r > 0) {
+                                // the combine's per-(row, slot) weights live in m.w (device): moe_combine(parts, weights,
+                                // ...).  slot_host/grp_host carry slot indices, so the probe reads the weights back.
+                                std::vector<float> w_host((size_t) (T * K), 0.0f);
+                                if (m.w != nullptr)
+                                    cudaMemcpyAsync(w_host.data(), m.w, (size_t) (T * K) * sizeof(float),
+                                                    cudaMemcpyDeviceToHost, m.cs);
+                                cudaStreamSynchronize(m.cs);
+                                const float* wts = w_host.data();
+                                std::vector<float> kept((size_t) K);
+                                int64_t hit_rows = 0, hit_slots = 0, bad_hit = 0;
+                                double mass_drop = 0.0, mass_keep = 0.0, mass_padding = 0.0;
+                                const auto t_start = Clock::now();
+                                for (int64_t r = 0; r < T; ++r) {
+                                    double kept_sum = 0.0;
+                                    int hit = 0;
+                                    for (int j = 0; j < (int) K; ++j) {
+                                        const int32_t e = ids_h[(size_t) (r * K + j)];
+                                        const float w = wts[(size_t) (r * K + j)];
+                                        // A padding slot carries no expert, so it was never a term the router could
+                                        // drop: its weight is counted separately and never as prune mass.
+                                        if (e < 0 || e >= m.g->n_expert) {
+                                            ++bad_hit;
+                                            stats_.prune_mass_padding += w;
+                                            mass_padding += w;
+                                            continue;
+                                        }
+                                        if (j >= prune_stats_r) {
+                                            ++hit;
+                                            stats_.prune_mass += w;
+                                            mass_drop += w;
+                                            continue;
+                                        }
+                                        kept[(size_t) j] = w;
+                                        kept_sum += w;
+                                    }
+                                    if (hit > 0) {
+                                        ++stats_.prune_rows_hit;
+                                        stats_.prune_slots += hit;
+                                        ++hit_rows;
+                                        hit_slots += hit;
+                                    }
+                                    stats_.prune_kept_mass += kept_sum;
+                                    mass_keep += kept_sum;
+                                    ++stats_.prune_rows;
+                                }
+                                const double rms = ms_since(t_start);
+                                stats_.prune_renorm_ms += rms;
+                                // STRATA_ROUTER_ENTROPY=1: per-layer router shape - the normalised entropy of each
+                                // row's K weights and the mass sitting in the lowest-ranked slots (what a prune costs).
+                                static const bool ent_on = std::getenv("STRATA_ROUTER_ENTROPY") != nullptr;
+                                if (ent_on) {
+                                    double hsum = 0.0, t1 = 0.0, t2 = 0.0;
+                                    const double lnk = std::log((double) K);
+                                    for (int64_t r = 0; r < T; ++r) {
+                                        double h = 0.0;
+                                        for (int j = 0; j < (int) K; ++j) {
+                                            const double w = (double) wts[(size_t) (r * K + j)];
+                                            if (w > 0.0) h -= w * std::log(w);
+                                        }
+                                        hsum += h / lnk;
+                                        t1 += (double) wts[(size_t) (r * K + K - 1)];
+                                        t2 += (double) wts[(size_t) (r * K + K - 2)] + (double) wts[(size_t) (r * K + K - 1)];
+                                    }
+                                    std::fprintf(stderr, "[entropy] L%02d T=%lld H=%.3f tail1=%.2f%% tail2=%.2f%%",
+                                                 (int) l, (long long) T, hsum / (double) T, 100.0 * t1 / (double) T,
+                                                 100.0 * t2 / (double) T);
+                                    std::fputc(0x0A, stderr);
+                                }
+                                float wmin = 1e30f, wmax = -1e30f;
+                                for (int64_t r = 0; r < T; ++r)
+                                    for (int j = 0; j < (int) K; ++j) {
+                                        const float w = wts[(size_t) (r * K + j)];
+                                        wmin = w < wmin ? w : wmin;
+                                        wmax = w > wmax ? w : wmax;
+                                    }
+                                std::fprintf(stderr,
+                                             "[prune] L%02d T=%lld rank=%d drop %lld/%lld slots (%.1f%%), rows hit %.1f%%, "
+                                             "mass %.2f%% of %.4f, w in [%.4f, %.4f], renorm %.2f ms, padding %lld slots %.3f%%",
+                                             (int) l, (long long) T, prune_stats_r, (long long) hit_slots, (long long) (T * K),
+                                             100.0 * (double) hit_slots / (double) (T * K), 100.0 * (double) hit_rows / (double) T,
+                                             100.0 * mass_drop / (mass_drop + mass_keep), mass_drop + mass_keep, wmin, wmax, rms,
+                                             (long long) bad_hit, 100.0 * mass_padding / (mass_drop + mass_keep + mass_padding));
+                                std::fputc(0x0A, stderr);
+                            }
+                        // STRATA_PRUNE_APPLY=1: prune at the GATHER, not in the router.  The router's weights are left
+                        // exactly as it computed them (no renormalisation); instead one keep-flag per (token, slot) goes
+                        // to moe_combine, which leaves a 0 slot's term out of the sum without reading its row.  A pruned
+                        // row then sums to less than 1 - the arithmetic of an expert that was never computed - which is
+                        // the effect a real prune would have.  The experts are still computed (this measures quality).
+                        static const bool prune_apply = std::getenv("STRATA_PRUNE_APPLY") != nullptr;
+                        // STRATA_PRUNE_PLAN_L="7,9,8,...": one rank PER LAYER (comma separated, index = layer), which is
+                        // what a layer-aware budget needs - the measured per-layer mask damage says the cheapest and the
+                        // costliest layers are worth several slots of difference, and a flat rank cannot spend that.
+                        // Unset, or shorter than the block's layer index, falls back to STRATA_PRUNE_STATS.
+                        static const std::vector<int> prune_plan = [] {
+                            std::vector<int> p;
+                            const char* pl = std::getenv("STRATA_PRUNE_PLAN_L");
+                            if (pl != nullptr) {
+                                const char* s = pl;
+                                while (*s != 0) {
+                                    p.push_back(std::atoi(s));
+                                    while (*s != 0 && *s != ',') ++s;
+                                    if (*s == ',') ++s;
+                                }
+                            }
+                            return p;
+                        }();
+                        const int prune_rank = [&] {
+                            if (!prune_plan.empty() && (size_t) l < prune_plan.size()) return prune_plan[(size_t) l];
+                            const char* v = std::getenv("STRATA_PRUNE_STATS");
+                            return v != nullptr ? std::atoi(v) : 0;
+                        }();
+                        static bool prune_plan_reported = false;
+                        if (prune_apply && !prune_plan.empty() && !prune_plan_reported) {
+                            prune_plan_reported = true;
+                            std::fprintf(stderr, "[prune-plan] per-layer ranks: %zu entries, L00=%d L%02d=%d\n",
+                                         prune_plan.size(), prune_plan[0], (int) (prune_plan.size() - 1),
+                                         prune_plan[prune_plan.size() - 1]);
+                            std::fflush(stderr);
+                        }
+                        if (prune_apply && prune_rank > 0) {
+                            const int64_t nk = T * K;
+                            std::vector<uint8_t> keep((size_t) nk, 0);
+                            for (int64_t r = 0; r < T; ++r)
+                                for (int j = 0; j < (int) K; ++j) {
+                                    const int32_t e = ids_h[(size_t) (r * K + j)];
+                                    keep[(size_t) (r * K + j)] =
+                                        (j < prune_rank && e >= 0 && e < m.g->n_expert) ? 1 : 0;
+                                }
+                            // STRATA_PRUNE_DENY=<K>: a DENY-LIST built from THIS prompt's own routing instead of the rank cut.
+                            // Per layer, the K experts most often sitting in the tail (slots >= rank) are denied, and every row
+                            // that routed to one of them loses it whatever its rank.  The statistics come from ids_h, which
+                            // already exist for this chunk, so the cost is one pass over T*K ints and is printed - "cheap
+                            // enough during prefill" is then a measurement, not a claim.  Mass is printed too, because a
+                            // deny-list is only comparable to the rank mask at equal dropped mass.
+                            static const int deny_k = [] {
+                                const char* v = std::getenv("STRATA_PRUNE_DENY");
+                                return v != nullptr ? std::atoi(v) : 0;
+                            }();
+                            if (deny_k > 0) {
+                                const auto deny_t0 = std::chrono::steady_clock::now();
+                                std::vector<std::pair<int64_t, int32_t>> cnt((size_t) m.g->n_expert, {0, 0});
+                                std::vector<float> wdeny((size_t) nk, 0.0f);
+                                bool have_w = m.w != nullptr &&
+                                              cudaMemcpyAsync(wdeny.data(), m.w, (size_t) nk * sizeof(float),
+                                                              cudaMemcpyDeviceToHost, m.cs) == cudaSuccess &&
+                                              cudaStreamSynchronize(m.cs) == cudaSuccess;
+                                for (int32_t e = 0; e < (int32_t) m.g->n_expert; ++e) cnt[(size_t) e].second = e;
+                                for (int64_t r = 0; r < T; ++r)
+                                    for (int j = prune_rank; j < (int) K; ++j) {
+                                        const int32_t e = ids_h[(size_t) (r * K + j)];
+                                        if (e >= 0 && e < m.g->n_expert) ++cnt[(size_t) e].first;
+                                    }
+                                const size_t nk_deny = std::min<size_t>((size_t) deny_k, cnt.size());
+                                std::partial_sort(cnt.begin(), cnt.begin() + nk_deny, cnt.end(),
+                                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+                                std::vector<uint8_t> deny((size_t) m.g->n_expert, 0);
+                                for (size_t i = 0; i < nk_deny; ++i) deny[(size_t) cnt[i].second] = 1;
+                                double mass = 0.0;
+                                int64_t masked = 0, masked_rows = 0;
+                                for (int64_t r = 0; r < T; ++r) {
+                                    bool row_hit = false;
+                                    for (int j = 0; j < (int) K; ++j) {
+                                        const int32_t e = ids_h[(size_t) (r * K + j)];
+                                        const bool drop = !(e >= 0 && e < m.g->n_expert) || deny[(size_t) e] != 0;
+                                        keep[(size_t) (r * K + j)] = drop ? 0 : 1;
+                                        if (drop) {
+                                            ++masked;
+                                            row_hit = true;
+                                            if (have_w) mass += (double) wdeny[(size_t) (r * K + j)];
+                                        }
+                                    }
+                                    if (row_hit) ++masked_rows;
+                                }
+                                const double us = std::chrono::duration<double, std::micro>(
+                                    std::chrono::steady_clock::now() - deny_t0).count();
+                                std::fprintf(stderr,
+                                             "[denyset] L%02d K=%d cost=%.1fus T=%lld masked_slots=%lld rows_hit=%lld mass=%.4f frac=%.4f",
+                                             (int) l, deny_k, us, (long long) T, (long long) masked, (long long) masked_rows,
+                                             mass, mass / (double) T);
+                                for (size_t i = 0; i < nk_deny; ++i)
+                                    std::fprintf(stderr, " %d x%lld", (int) cnt[i].second, (long long) cnt[i].first);
+                                std::fputc(0x0A, stderr);
+                                std::fflush(stderr);
+                            }
+                            // STRATA_PRUNE_SLOTMASS=1: what the mask actually removes.  For each slot position j: the
+                            // mean router weight, the share of rows where it is nonzero, and how many rows carry a
+                            // VALID expert there - the three numbers that say whether slot j is a real expert, a
+                            // padding hole, or a duplicate, which is what decides whether a rank prune of that
+                            // width can be anything but a single-slot perturbation.
+                            static const bool slotmass = std::getenv("STRATA_PRUNE_SLOTMASS") != nullptr;
+                            if (slotmass && m.w != nullptr) {
+                                std::vector<float> wv((size_t) nk, 0.0f);
+                                cudaMemcpyAsync(wv.data(), m.w, (size_t) nk * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                                cudaStreamSynchronize(m.cs);
+                                std::fprintf(stderr, "[slotmass] L%02d T=%lld rank=%d", (int) l, (long long) T, prune_rank);
+                                for (int j = 0; j < (int) K; ++j) {
+                                    double sw = 0.0; int64_t nz = 0, ok = 0, masked_nz = 0;
+                                    for (int64_t r = 0; r < T; ++r) {
+                                        const float w = wv[(size_t) (r * K + j)];
+                                        const int32_t e = ids_h[(size_t) (r * K + j)];
+                                        sw += w;
+                                        if (w > 0.0f) ++nz;
+                                        if (e >= 0 && e < m.g->n_expert) ++ok;
+                                        if (keep[(size_t) (r * K + j)] == 0 && w > 0.0f) ++masked_nz;
+                                    }
+                                    std::fprintf(stderr, " j%d %.4f/%.0f%%/%.0f%%/m%d", j, sw / (double) T,
+                                                 100.0 * (double) nz / (double) T, 100.0 * (double) ok / (double) T,
+                                                 (int) masked_nz);
+                                }
+                                // The rank order verified ROW BY ROW, not on the per-slot means: a row is monotone when
+                                // w[j] >= w[j+1] for every j, which is the property that makes slot j the (j+1)-th
+                                // strongest expert for each token.  A monotone average survives an unsorted top-k or a
+                                // weights/ids mismatch, so `viol` and `worst` (the largest single increase seen) are the
+                                // numbers that can actually falsify the rank interpretation.
+                                int64_t mono = 0, viol = 0;
+                                double worst = 0.0;
+                                for (int64_t r = 0; r < T; ++r) {
+                                    bool mono_row = true;
+                                    for (int j = 0; j + 1 < (int) K; ++j) {
+                                        const double d = (double) wv[(size_t) (r * K + j + 1)] -
+                                                         (double) wv[(size_t) (r * K + j)];
+                                        if (d > 0.0) {
+                                            mono_row = false;
+                                            if (d > worst) worst = d;
+                                        }
+                                    }
+                                    if (mono_row) ++mono; else ++viol;
+                                }
+                                std::fprintf(stderr, " mono=%lld/%lld viol=%lld worst=%.3e", (long long) mono, (long long) T,
+                                             (long long) viol, worst);
+                                std::fputc(0x0A, stderr);
+                            }
+                            // STRATA_PRUNE_SLOTID=<j>: WHO the rank prune removes.  Dropping slot j removes, for every
+                            // row, exactly the expert sitting at rank j, so this prints that expert's id, how many rows
+                            // carried each id at that slot, its mean weight there, and whether the id is unique inside
+                            // its row (it must be - an expert is picked once).  Slot 7 is the expert rank 7 drops and
+                            // rank 8 keeps; slots 8 and 9 are dropped by both.
+                            static const int slotid = [] {
+                                const char* v = std::getenv("STRATA_PRUNE_SLOTID");
+                                return v != nullptr ? std::atoi(v) : -1;
+                            }();
+                            if (slotid >= 0 && slotid < (int) K) {
+                                std::vector<float> wids((size_t) nk, 0.0f);
+                                if (m.w != nullptr &&
+                                    cudaMemcpyAsync(wids.data(), m.w, (size_t) nk * sizeof(float), cudaMemcpyDeviceToHost, m.cs) == cudaSuccess &&
+                                    cudaStreamSynchronize(m.cs) == cudaSuccess) {
+                                    std::map<int32_t, std::pair<int64_t, double>> hist;
+                                    int64_t dup_in_kept = 0, dup_ok = 0, valid = 0;
+                                    for (int64_t r = 0; r < T; ++r) {
+                                        const int32_t e = ids_h[(size_t) (r * K + slotid)];
+                                        const float w = wids[(size_t) (r * K + slotid)];
+                                        if (e < 0 || e >= m.g->n_expert) continue;
+                                        ++valid;
+                                        auto& h = hist[e];
+                                        h.first += 1;
+                                        h.second += w;
+                                        for (int j = 0; j < (int) K; ++j) {
+                                            if (j == slotid) continue;
+                                            if (ids_h[(size_t) (r * K + j)] != e) continue;
+                                            (j < slotid ? dup_in_kept : dup_ok) += 1;
+                                            break;
+                                        }
+                                    }
+                                    std::vector<std::pair<int32_t, std::pair<int64_t, double>>> top(hist.begin(), hist.end());
+                                    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+                                        return a.second.first > b.second.first;
+                                    });
+                                    std::fprintf(stderr, "[slotid] L%02d slot=%d rows=%lld valid=%lld distinct=%zu dup_kept=%lld dup_tail=%lld:",
+                                                 (int) l, slotid, (long long) T, (long long) valid, hist.size(),
+                                                 (long long) dup_in_kept, (long long) dup_ok);
+                                    for (size_t i = 0; i < top.size() && i < 4; ++i)
+                                        std::fprintf(stderr, " id=%d n=%lld w=%.4f", (int) top[i].first,
+                                                     (long long) top[i].second.first,
+                                                     top[i].second.second / (double) top[i].second.first);
+                                    std::fputc(0x0A, stderr);
+                                    std::fflush(stderr);
+                                }
+                            }
+                            // STRATA_PRUNE_SLOTHIST="7,8,9": the FULL id histogram at the named tail slots, per layer and
+                            // per chunk - the raw material a deny-list would have to be built from.  Only ids that occur
+                            // at least once are printed, so one line is ~60-90 entries.
+                            static const std::vector<int> slothist = [] {
+                                std::vector<int> v;
+                                const char* s = std::getenv("STRATA_PRUNE_SLOTHIST");
+                                if (s != nullptr) {
+                                    while (*s != 0) {
+                                        v.push_back(std::atoi(s));
+                                        while (*s != 0 && *s != ',') ++s;
+                                        if (*s == ',') ++s;
+                                    }
+                                }
+                                return v;
+                            }();
+                            if (!slothist.empty() && m.w != nullptr) {
+                                std::vector<float> wh((size_t) nk, 0.0f);
+                                if (cudaMemcpyAsync(wh.data(), m.w, (size_t) nk * sizeof(float), cudaMemcpyDeviceToHost, m.cs) == cudaSuccess &&
+                                    cudaStreamSynchronize(m.cs) == cudaSuccess) {
+                                    for (int j : slothist) {
+                                        if (j < 0 || j >= (int) K) continue;
+                                        std::map<int32_t, int64_t> hist;
+                                        for (int64_t r = 0; r < T; ++r) {
+                                            const int32_t e = ids_h[(size_t) (r * K + j)];
+                                            if (e >= 0 && e < m.g->n_expert) ++hist[e];
+                                        }
+                                        std::fprintf(stderr, "[slothist] L%02d slot=%d n=%lld", (int) l, j, (long long) T);
+                                        for (const auto& kv : hist)
+                                            std::fprintf(stderr, " %d:%lld", (int) kv.first, (long long) kv.second);
+                                        std::fputc(0x0A, stderr);
+                                    }
+                                    std::fflush(stderr);
+                                }
+                            }
+                            if (g_prune_keep_cap < nk) {
+                                if (g_prune_keep != nullptr) cudaFree(g_prune_keep);
+                                g_prune_keep = nullptr;
+                                g_prune_keep_cap = 0;
+                                if (cudaMalloc(&g_prune_keep, (size_t) nk) == cudaSuccess) g_prune_keep_cap = nk;
+                                else g_prune_keep = nullptr;
+                            }
+                            if (g_prune_keep != nullptr) {
+                                if (cudaMemcpyAsync(g_prune_keep, keep.data(), (size_t) nk, cudaMemcpyHostToDevice, m.cs) !=
+                                    cudaSuccess) {
+                                    err = "prefill prune: the keep mask's upload failed";
+                                    return false;
+                                }
+                            }
+                        }
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
                             const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
@@ -4917,6 +5386,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
                                 js.push_back({b, (size_t) lay.blob_bytes(l)});
                             }
+                            // STRATA_PREFILL_PRUNE_PROBE=R: COUNT ONLY.  For every expert this layer would stream, take its
+                            // best rank -- the smallest top-k slot (i % K) the router put it in, over the layer's rows --
+                            // and ask whether a rank prune (an expert whose every row is at rank >= R gets a zeroed
+                            // stand-in instead of its own bytes) would drop it.  The count is the copies and bytes such a
+                            // prune would remove.  Nothing here changes a copy, a pointer or the routing.
+                            static const int prune_probe = [] {
+                                const char* v = std::getenv("STRATA_PREFILL_PRUNE_PROBE");
+                                return v != nullptr ? std::atoi(v) : 0;
+                            }();
+                            if (prune_probe > 0) {
+                                std::vector<int> minrank((size_t) m.g->n_expert, 1 << 20);
+                                for (int64_t i = 0; i < T * K; ++i) {
+                                    const int32_t e = ids_h[(size_t) i];
+                                    if (e < 0 || e >= m.g->n_expert) continue;
+                                    const int r = (int) (i % K);
+                                    if (r < minrank[(size_t) e]) minrank[(size_t) e] = r;
+                                }
+                                for (size_t j = 0; j < order.size(); ++j) {
+                                    const int32_t e = order[j];
+                                    if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                    ++stats_.probe_streamed;
+                                    if (minrank[(size_t) e] >= prune_probe) ++stats_.probe_pruned;
+                                }
+                            }
                             if (m.warmer) {
                                 std::vector<int64_t> cur;
                                 for (size_t j = 0; j < order.size(); ++j)
@@ -4991,8 +5484,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const bool lat_du = lat_du_env && fused::latent_fused_available();
                             // D: each token's 8 group products [T, G*ELL] -> q8_1 rows (xlq)
                             pt.mark(kPfGather, m.cs);
+                            static const bool dprof = std::getenv("STRATA_D_PROF") != nullptr;
+                            cudaEvent_t dev0{}, dev1{};
+                            if (dprof) { cudaEventCreate(&dev0); cudaEventCreate(&dev1); cudaEventRecord(dev0, m.cs); }
                             strata::kernels::quantize_q8_1_rows(m.mixed, T, (int) N, m.lat_xq, m.cs);
-                            if (lat_du) {
+if (lat_du) {
                                 // a colscaled pack (the Q3_K one: scales/l{l}.f32 beside its manifest) needs the
                                 // DU kernel that folds 1/s into the xl columns; v5's pack has no scales and keeps
                                 // the original kernel (its signature and its bits are untouched)
@@ -5013,9 +5509,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     strata::kernels::lat_colscale_rows(m.xl, (int64_t) T * G, (int) ELL, inv, m.cs);
                                 strata::kernels::quantize_q8_1_rows(m.xl, (int64_t) T * G, (int) ELL, m.xlq, m.cs);
                             }
-                            {   // STRATA_LAT_MOE_DUMP (debug): the latent arm's intermediates, layer 0
+                            if (dprof) {
+                                cudaEventRecord(dev1, m.cs);
+                                cudaEventSynchronize(dev1);
+                                float dms = 0.0f;
+                                cudaEventElapsedTime(&dms, dev0, dev1);
+                                std::fprintf(stderr, "[dprof] L%02d T=%lld N=%d out=%d D=%.2f ms", (int) l, (long long) T, (int) N, (int) (G * ELL), (double) dms);
+                                std::fputc(0x0A, stderr);
+                                cudaEventDestroy(dev0); cudaEventDestroy(dev1);
+                            }
+                            {   // STRATA_LAT_MOE_DUMP (debug): the latent arm's intermediates, every layer (L%02d- prefixed files)
                                 static const char* lat_moe_dump = std::getenv("STRATA_LAT_MOE_DUMP");
-                                if (lat_moe_dump && l == 0) {
+                                if (lat_moe_dump) {
                                     std::vector<uint8_t> hb;
                                     auto lat_wr = [&](const char* name, const void* dev, size_t bytes) {
                                         hb.resize(bytes);
@@ -5023,7 +5528,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             cudaStreamSynchronize(m.cs) != cudaSuccess) {
                                             err = std::string("lat moe dump: the copy of ") + name + " failed"; return false;
                                         }
-                                        char p[512]; std::snprintf(p, sizeof p, "%s/%s", lat_moe_dump, name);
+                                        char p[512]; std::snprintf(p, sizeof p, "%s/L%02d-%s", lat_moe_dump, (int) l, name);
                                         std::FILE* fp = std::fopen(p, "wb");
                                         if (fp == nullptr) { err = std::string("lat moe dump: cannot write ") + p; return false; }
                                         std::fwrite(hb.data(), 1, bytes, fp); std::fclose(fp); return true;
@@ -5034,13 +5539,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             {   // STRATA_LAT_MOE_DUMP (debug): the fused kernels' exact inputs, layer 0
                                 static const char* lat_moe_dump4 = std::getenv("STRATA_LAT_MOE_DUMP");
-                                if (lat_moe_dump4 && l == 0) {
+                                if (lat_moe_dump4) {
                                     const int32_t E = (int32_t) m.g->n_expert;
                                     {   // m.cnt / m.off (host)
-                                        char p[512]; std::snprintf(p, sizeof p, "%s/g-cnt.bin", lat_moe_dump4);
+                                        char p[512]; std::snprintf(p, sizeof p, "%s/L%02d-g-cnt.bin", lat_moe_dump4, (int) l);
                                         std::FILE* fp = std::fopen(p, "wb");
                                         if (fp) { std::fwrite(m.cnt.data(), 4, (size_t) E, fp); std::fclose(fp); }
-                                        std::snprintf(p, sizeof p, "%s/g-off.bin", lat_moe_dump4);
+                                        std::snprintf(p, sizeof p, "%s/L%02d-g-off.bin", lat_moe_dump4, (int) l);
                                         fp = std::fopen(p, "wb");
                                         if (fp) { std::fwrite(m.off.data(), 4, (size_t) E + 1, fp); std::fclose(fp); }
                                     }
@@ -5048,7 +5553,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         std::vector<uint8_t> hb(bytes);
                                         if (cudaMemcpyAsync(hb.data(), dev, bytes, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                                             cudaStreamSynchronize(m.cs) != cudaSuccess) return false;
-                                        char p[512]; std::snprintf(p, sizeof p, "%s/%s", lat_moe_dump4, name);
+                                        char p[512]; std::snprintf(p, sizeof p, "%s/L%02d-%s", lat_moe_dump4, (int) l, name);
                                         std::FILE* fp = std::fopen(p, "wb");
                                         if (fp == nullptr) return false;
                                         std::fwrite(hb.data(), 1, bytes, fp); std::fclose(fp); return true;
@@ -5061,12 +5566,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                              m.lat_labels_dev + (size_t) l * m.lat_E, m.lat_E, 0, (int) G, (int) K, m.cs);
                             {   // STRATA_LAT_MOE_DUMP (debug): the plan tables after rewrite, layer 0
                                 static const char* lat_moe_dump5 = std::getenv("STRATA_LAT_MOE_DUMP");
-                                if (lat_moe_dump5 && l == 0) {
+                                if (lat_moe_dump5) {
                                     auto lat_dwr = [&](const char* name, const void* dev, size_t bytes) {
                                         std::vector<uint8_t> hb(bytes);
                                         if (cudaMemcpyAsync(hb.data(), dev, bytes, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                                             cudaStreamSynchronize(m.cs) != cudaSuccess) return false;
-                                        char p[512]; std::snprintf(p, sizeof p, "%s/%s", lat_moe_dump5, name);
+                                        char p[512]; std::snprintf(p, sizeof p, "%s/L%02d-%s", lat_moe_dump5, (int) l, name);
                                         std::FILE* fp = std::fopen(p, "wb");
                                         if (fp == nullptr) return false;
                                         std::fwrite(hb.data(), 1, bytes, fp); std::fclose(fp); return true;
@@ -5579,6 +6084,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     }
                                 };
                                 auto lat_blob = [&](int32_t e) -> const uint8_t* {
+                                    if (prune_plan_hit(l, e)) return g_zero_blob;   // rank-pruned: zeros, not a copy
                                     const bool r0 = m.host_res && m.cache &&
                                                     m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                                     const uint8_t* bp =
@@ -5748,9 +6254,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         } else {
                                             const bool r0 = m.host_res && m.cache &&
                                                             m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                                            const uint8_t* bp = r0
-                                                ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
-                                                : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr);
+                                            // rank-pruned: the zeroed stand-in, so the expert still computes (its
+                                            // entry keeps its place in the plan) but contributes nothing
+                                            const uint8_t* bp = prune_plan_hit(l, e)
+                                                ? g_zero_blob
+                                                : (r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
+                                                      : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr));
                                             if (bp == nullptr) {
                                                 err = "prefill latent: an expert is neither resident, streamed nor on the peer";
                                                 return false;
@@ -5814,10 +6323,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         consumed = ++k;
                                         give_back(consumed);   // the slot frees once this launch is done
                                     } else {
+                                        // a resident blob is not in the staging ring: nothing to flush here now
                                         const bool r0 = m.host_res && m.cache &&
                                                         m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                                        const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
-                                                               : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr);
+                                        const uint8_t* bp = prune_plan_hit(l, e)
+                                            ? g_zero_blob   // rank-pruned: zeros, never a copy
+                                            : (r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
+                                                  : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr));
                                         if (bp == nullptr) {
                                             err = "prefill latent: an expert is neither resident, streamed nor on the peer";
                                             return false;
@@ -5840,6 +6352,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 // event: the staging ring's lookahead overlap is what it is for.
                                 // STRATA_EXPERT_NIBBLE: the cache slots' nib layout on nib layers; a staged
                                 // blob is always the plain GGUF bytes.
+                                //
+                                // BATCHING THIS WALK IS BLOCKED BY THE RING GEOMETRY, measured: with
+                                // STRATA_LAT_STAGED_BATCH=8 every slot was held and stage_one() reused one whose
+                                // blob a queued launch still read - 64,126 -> 8,279 launches, 78.2 vs 65.1 tok/s,
+                                // and WRONG tokens. `lookahead = STAGE - 1` with `STAGE = 8` leaves zero free
+                                // slots by construction, so the prerequisite is STAGE enlarged with
+                                // lookahead = STAGE - batch (docs/perf-log-2026-11-16.md).
                                 size_t nb = 0;
                                 for (size_t j = 0; j < n_order; ++j) {
                                     const int32_t e = order[j];
@@ -5881,13 +6400,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // U: each down latent hits U[labels[expert]]; the H-wide rows are this layer's Dm
                             {   // STRATA_LAT_MOE_DUMP (debug): the A stage's product yl, layer 0
                                 static const char* lat_moe_dump3 = std::getenv("STRATA_LAT_MOE_DUMP");
-                                if (lat_moe_dump3 && l == 0) {
+                                if (lat_moe_dump3) {
                                     std::vector<float> hb((size_t) T * K * (size_t) ELL);
                                     if (cudaMemcpyAsync(hb.data(), m.yl, hb.size() * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                                         cudaStreamSynchronize(m.cs) != cudaSuccess) {
                                         err = "lat moe dump: the yl copy failed"; return false;
                                     }
-                                    char p[512]; std::snprintf(p, sizeof p, "%s/a-yl.bin", lat_moe_dump3);
+                                    char p[512]; std::snprintf(p, sizeof p, "%s/L%02d-a-yl.bin", lat_moe_dump3, (int) l);
                                     std::FILE* fp = std::fopen(p, "wb");
                                     if (fp == nullptr) { err = std::string("lat moe dump: cannot write ") + p; return false; }
                                     std::fwrite(hb.data(), 4, hb.size(), fp); std::fclose(fp);
@@ -6645,8 +7164,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!group_gather || gg_nslots == 0) give_back(consumed);   // its group was gathered
                                 } else {
                                     const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                                    const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
-                                                           : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr);   // over the cap: P2P
+                                    const uint8_t* bp = prune_plan_hit(l, e)
+                                        ? g_zero_blob   // rank-pruned: zeros, never a copy
+                                        : (r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
+                                              : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr));   // over the cap: P2P
                                     if (bp == nullptr) { err = "prefill: an expert is neither resident, streamed nor on the peer"; return false; }
                                     ++stats_.experts_resident;
                                     if (!compute(j, bp, -1, r0 ? m.host_res[(size_t) l * m.g->n_expert + e] : -1)) return false;
@@ -6696,21 +7217,83 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     else
                         {   // STRATA_LAT_MOE_DUMP (debug): Dm entering the combine, layer 0
                             static const char* lat_moe_dump2 = std::getenv("STRATA_LAT_MOE_DUMP");
-                            if (lat_moe_dump2 && l == 0) {
+                            if (lat_moe_dump2) {
                                 const int64_t n_dm = std::min<int64_t>(8, T * K);
                                 std::vector<float> hdm((size_t) n_dm * (size_t) m.g->n_embd);
                                 if (cudaMemcpyAsync(hdm.data(), m.Dm, hdm.size() * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                                     cudaStreamSynchronize(m.cs) != cudaSuccess) {
                                     err = "lat moe dump: the Dm copy failed"; return false;
                                 }
-                                char p[512]; std::snprintf(p, sizeof p, "%s/u-dm.bin", lat_moe_dump2);
+                                char p[512]; std::snprintf(p, sizeof p, "%s/L%02d-u-dm.bin", lat_moe_dump2, (int) l);
                                 std::FILE* fp = std::fopen(p, "wb");
                                 if (fp == nullptr) { err = std::string("lat moe dump: cannot write ") + p; return false; }
                                 std::fwrite(hdm.data(), 4, hdm.size(), fp); std::fclose(fp);
                             }
                         }
-                        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
-                                    use_mmq && !fused_l && !m.latent && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
+                        const float* const comb_sd = use_mmq && !fused_l && !m.latent && lay.native &&
+                                                     lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr;
+                        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs, comb_sd,
+                                    g_prune_keep);   // STRATA_PRUNE_APPLY: null unless the mask was built for this chunk
+                        // STRATA_MOE_DIFF=1: what the mask actually changes in THIS layer's expert sum, measured in one
+                        // pass over the same gathered rows (unmasked and masked sums side by side).  Rank 10 with
+                        // APPLY=1 builds an all-ones keep, so that run is the control and must report exactly zero.
+                        if (std::getenv("STRATA_MOE_DIFF") != nullptr) {
+                            static float* d_full = nullptr;
+                            static float* d_diff = nullptr;
+                            static int64_t mdi_cap = 0;
+                            const int64_t nd = T * m.g->n_embd;
+                            if (mdi_cap < nd) {
+                                if (d_full != nullptr) cudaFree(d_full);
+                                if (d_diff != nullptr) cudaFree(d_diff);
+                                d_full = d_diff = nullptr;
+                                mdi_cap = 0;
+                                if (cudaMalloc(&d_full, (size_t) nd * 4) == cudaSuccess &&
+                                    cudaMalloc(&d_diff, (size_t) nd * 4) == cudaSuccess) {
+                                    mdi_cap = nd;
+                                } else {
+                                    (void) cudaGetLastError();
+                                    if (d_full != nullptr) cudaFree(d_full);
+                                    if (d_diff != nullptr) cudaFree(d_diff);
+                                    d_full = d_diff = nullptr;
+                                }
+                            }
+                            if (d_full != nullptr && d_diff != nullptr) {
+                                std::vector<float> hf((size_t) nd), hd((size_t) nd);
+                                moe_maskdiff(m.Dm, m.slot_dev, m.w, T, m.cs, comb_sd, g_prune_keep, d_full, d_diff);
+                                if (cudaMemcpyAsync(hf.data(), d_full, (size_t) nd * 4, cudaMemcpyDeviceToHost, m.cs) == cudaSuccess &&
+                                    cudaMemcpyAsync(hd.data(), d_diff, (size_t) nd * 4, cudaMemcpyDeviceToHost, m.cs) == cudaSuccess &&
+                                    cudaStreamSynchronize(m.cs) == cudaSuccess) {
+                                    double sum_rel = 0.0, max_rel = 0.0, sum_cos = 0.0;
+                                    int64_t worst = -1;
+                                    for (int64_t t = 0; t < T; ++t) {
+                                        double af = 0.0, ad = 0.0, am = 0.0;
+                                        const float* pf = &hf[(size_t) t * m.g->n_embd];
+                                        const float* pd = &hd[(size_t) t * m.g->n_embd];
+                                        for (int64_t d2 = 0; d2 < m.g->n_embd; ++d2) {
+                                            const double vf = (double) pf[d2];
+                                            const double vd = (double) pd[d2];
+                                            af += vf * vf;
+                                            ad += vd * vd;
+                                            am += (vf - vd) * (vf - vd);
+                                        }
+                                        af = std::sqrt(af);
+                                        ad = std::sqrt(ad);
+                                        am = std::sqrt(am);
+                                        const double rel = af > 0.0 ? ad / af : 0.0;
+                                        sum_rel += rel;
+                                        if (rel > max_rel) { max_rel = rel; worst = t; }
+                                        sum_cos += (af > 0.0 && am > 0.0)
+                                                       ? (af * af + am * am - ad * ad) / (2.0 * af * am)
+                                                       : 1.0;
+                                    }
+                                    std::fprintf(stderr,
+                                                 "[maskdiff] L%02d T=%lld keep=%s mean_rel=%.6e max_rel=%.6e worst_t=%lld mean_cos=%.9f\n",
+                                                 (int) l, (long long) T, g_prune_keep != nullptr ? "on" : "off",
+                                                 sum_rel / (double) T, max_rel, (long long) worst, sum_cos / (double) T);
+                                    std::fflush(stderr);
+                                }
+                            }
+                        }
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
@@ -6977,6 +7560,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         pt.fold();
         double total = 0.0;
         for (double v : pt.ms) total += v;
+        std::fprintf(stderr, "\nprefill component trace (STRATA_PREFILL_TIMING), wall %.0f ms:\n",
+                     stats_.ms_total > 0 ? stats_.ms_total : 0.0);
+        std::fprintf(stderr, "  %-26s %8s %10s %7s %10s %8s\n", "component", "marks", "dev ms", "%dev",
+                     "host ms", "%host");
+        double host_total = 0.0;
+        for (double v : pt.host_ms) host_total += v;
+        for (int i = 0; i < kPfCount; ++i) {
+            if (pt.ms[i] <= 0.0 && pt.host_ms[i] <= 0.0) continue;
+            std::fprintf(stderr, "  %-26s %8lld %10.0f %6.1f%% %10.1f %7.1f%%\n", kPfNames[i],
+                         (long long) pt.marks[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0,
+                         pt.host_ms[i], host_total > 0 ? 100.0 * pt.host_ms[i] / host_total : 0.0);
+        }
+        // The gap between the GPU timeline and the wall is where "the GPU idle / nothing marked" lives. Naming
+        // it stops the table from being read as if it covered the whole prompt.
+        std::fprintf(stderr, "  %-26s %8s %10.0f %6.1f%% %10.1f\n", "sum of marked phases", "", total,
+                     total > 0 ? 100.0 : 0.0, host_total);
+        std::fprintf(stderr, "  %-26s %8s %10.0f %6s %10s\n", "unaccounted (wall - dev)", "",
+                     stats_.ms_total - total, "", "");
         std::string line;
         char b[96];
         for (int i = 0; i < kPfCount; ++i) {
@@ -6984,8 +7585,43 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
             line += b;
         }
-        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
-                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        static const int stats_r = [] {   // STRATA_PRUNE_STATS: the token-side rank-prune accounting
+            const char* v = std::getenv("STRATA_PRUNE_STATS");
+            return v != nullptr ? std::atoi(v) : 0;
+        }();
+        if (stats_r > 0 && stats_.prune_rows > 0) {
+            std::fprintf(stderr,
+                         "strata prune stats: rank-%d prune would drop %lld of %lld (row, slot) pairs (%.1f%%), "
+                         "%lld of %lld rows lose at least one expert (%.1f%%), router mass %.1f%% of %.4f "
+                         "(padding slots excluded: %lld slots carried no expert, %.4f%% of the mass); "
+                         "renormalising the survivors took %.2f ms host",
+                         stats_r, (long long) stats_.prune_slots, (long long) (stats_.prune_rows * K),
+                         100.0 * (double) stats_.prune_slots / (double) (stats_.prune_rows * K),
+                         (long long) stats_.prune_rows_hit, (long long) stats_.prune_rows,
+                         100.0 * (double) stats_.prune_rows_hit / (double) stats_.prune_rows,
+                         100.0 * stats_.prune_mass / (stats_.prune_mass + stats_.prune_kept_mass),
+                         stats_.prune_mass + stats_.prune_kept_mass, (long long) stats_.prune_slots_padding,
+                         100.0 * stats_.prune_mass_padding /
+                             (stats_.prune_mass + stats_.prune_kept_mass + stats_.prune_mass_padding),
+                         stats_.prune_renorm_ms);
+            std::fputc(0x0A, stderr);
+        }
+        static const int probe_r = [] {   // STRATA_PREFILL_PRUNE_PROBE: the count-only rank-prune probe's threshold
+            const char* v = std::getenv("STRATA_PREFILL_PRUNE_PROBE");
+            return v != nullptr ? std::atoi(v) : 0;
+        }();
+        std::string probe;
+        if (probe_r > 0 && stats_.probe_streamed > 0) {
+            char pb[128];
+            std::snprintf(pb, sizeof pb, ", rank-%d prune would drop %lld of %lld streamed blobs (%.1f%%)", probe_r,
+                          (long long) stats_.probe_pruned, (long long) stats_.probe_streamed,
+                          100.0 * (double) stats_.probe_pruned / (double) stats_.probe_streamed);
+            probe = pb;
+        }
+        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms, streamed %lld blobs (%lld by DMA), resident %lld%s:%s\n",
+                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host, (long long) stats_.experts_streamed,
+                     (long long) stats_.experts_dma, (long long) stats_.experts_resident, probe.c_str(),
+                     line.c_str());
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
@@ -8200,6 +8836,12 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             if (st.kv_q4)
                                 strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, cs,
                                                               host_w, staged ? &m.stage : nullptr);
+                            else if (st.kv_turbo)
+                                strata::kernels::kv_append_turbo(st.k_turbo, st.v_turbo, st.page_table, p0, T, m.Kc,
+                                                                 m.Vc, s, cs, host_w, staged ? &m.stage : nullptr);
+                            else if (st.kv_rot4)
+                                strata::kernels::kv_append_rot4(st.k_rot4, st.v_rot4, st.page_table, p0, T, m.Kc, m.Vc,
+                                                                s, cs, host_w, staged ? &m.stage : nullptr);
                             else
                                 kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                           st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs,

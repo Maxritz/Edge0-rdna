@@ -2,6 +2,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_turbo.hpp"
 
 #include <cuda_runtime.h>
 
@@ -44,6 +45,16 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
         const int bytes = rows * (int) kv_q4_bytes_per_head((int) s.head_dim);
         r.src[0] = (const uint8_t*) host.k_q4; r.dst[0] = (uint8_t*) slots.k_q4; r.len[0] = bytes;
         r.src[1] = (const uint8_t*) host.v_q4; r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = bytes;
+        r.n = 2;
+    } else if (fmt == kKvTurbo3) {   // one row per head holds its own f32 sigma, so there is no scale run
+        const int bytes = rows * (int) kv_turbo_bytes_per_head((int) s.head_dim);
+        r.src[0] = (const uint8_t*) host.k_turbo; r.dst[0] = (uint8_t*) slots.k_turbo; r.len[0] = bytes;
+        r.src[1] = (const uint8_t*) host.v_turbo; r.dst[1] = (uint8_t*) slots.v_turbo; r.len[1] = bytes;
+        r.n = 2;
+    } else if (fmt == kKvRot4) {     // the per-32 f16 scale lives inside the row too
+        const int bytes = rows * (int) kv_rot4_bytes_per_head((int) s.head_dim);
+        r.src[0] = (const uint8_t*) host.k_rot4; r.dst[0] = (uint8_t*) slots.k_rot4; r.len[0] = bytes;
+        r.src[1] = (const uint8_t*) host.v_rot4; r.dst[1] = (uint8_t*) slots.v_rot4; r.len[1] = bytes;
         r.n = 2;
     } else if (fmt == kKvInt8) {
         const int codes = rows * (int) s.head_dim, scales = rows * (int) (s.head_dim / KV_Q8_GROUP) * 2;
@@ -202,6 +213,8 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 +
                rows * kv_q4_bytes_per_head((int) s.head_dim);
     if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
+    if (fmt == kKvTurbo3) return rows * kv_turbo_bytes_per_head((int) s.head_dim) * 2;
+    if (fmt == kKvRot4) return rows * kv_rot4_bytes_per_head((int) s.head_dim) * 2;
     return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
                 : rows * (uint64_t) s.head_dim * 2 * 2;
 }

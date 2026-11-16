@@ -219,6 +219,16 @@ struct QsaState {
     bool kv_q4 = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
+    /// Turbo3: 3-bit with Hadamard rotation (Kraken-x default). 3-bit codes + 1 f32 scale per row = ~37% of fp16.
+    bool kv_turbo = false;
+    uint8_t* k_turbo = nullptr;
+    uint8_t* v_turbo = nullptr;
+    float* turbo_scale = nullptr;
+    /// Rot4: 4-bit with Hadamard rotation (experimental). 4-bit nibbles + f16 scale per 32 values.
+    bool kv_rot4 = false;
+    uint8_t* k_rot4 = nullptr;
+    uint8_t* v_rot4 = nullptr;
+    uint16_t* rot4_scale = nullptr;
     /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
     /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
@@ -318,10 +328,20 @@ bool qsa_kv_q4();
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
-/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid).
+/// Turbo3 (`--kv-quant turbo3`): 3-bit with Hadamard rotation (Kraken-x default). 3-bit codes + 1 f32 scale per row = ~37% of fp16.
+void qsa_set_kv_turbo(bool enabled);
+bool qsa_kv_turbo();
+/// Rot4 (`--kv-quant rot4`): 4-bit with Hadamard rotation (experimental). 4-bit nibbles + f16 scale per 32 values.
+void qsa_set_kv_rot4(bool enabled);
+bool qsa_kv_rot4();
+/// The state's KV format for the block-moving functions of kv_stream.hpp.
 inline int qsa_kv_format(const QsaState& st) {
-    if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
-    return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+    if (st.kv_hybrid) return strata::kernels::kKvHybrid;       // K8V4
+    if (st.kv_rot4) return strata::kernels::kKvRot4;           // Rot4 (4-bit Hadamard)
+    if (st.kv_turbo) return strata::kernels::kKvTurbo3;        // Turbo3 (3-bit, default in Kraken-x)
+    if (st.kv_q4) return strata::kernels::kKvQ4;               // Q4_0
+    if (st.kv_int8) return strata::kernels::kKvInt8;           // INT8
+    return strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);

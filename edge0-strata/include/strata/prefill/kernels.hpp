@@ -108,10 +108,19 @@ void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
+/// `keep` (STRATA_PRUNE_APPLY, a quality probe): one flag per (token, slot) slot; a 0 leaves that slot's term out
+/// of the sum ENTIRELY - its row is not read and its weight is not applied.  The weights are the router's own,
+/// un-renormalised, so a pruned row's survivors keep the weight they were given and the row sums to less than 1:
+/// that is the arithmetic of an expert that was never computed, which is what the prune is measuring.
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
-                 int64_t T, void* stream, const float* row_sd = nullptr);
+                 int64_t T, void* stream, const float* row_sd = nullptr, const uint8_t* keep = nullptr);
 /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): acc[t, :] = shared[t, :] * sigmoid(sg[t]) - the shared expert's
 /// part of moe_combine, written before the routed experts are known.
+/// STRATA_MOE_DIFF: moe_combine's expert sum computed twice from the SAME gathered rows - unmasked into `full`, and
+/// (unmasked - masked) into `diff`, T*N floats each, the shared expert excluded from both.  The masked/unmasked
+/// difference of one layer is therefore measured without a second run and without earlier layers' divergence.
+void moe_maskdiff(const float* D, const int32_t* slot, const float* w, int64_t T, void* stream,
+                  const float* row_sd, const uint8_t* keep, float* full, float* diff);
 void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream);
 /// Layer-major prefill: one expert group's rows added into the super-chunk's accumulator, per token in a fixed order
 /// (deterministic, no atomics): for each u < n_u, acc[u_tok[u], :] += sum_{j in [u_off[u], u_off[u+1])} u_w[j] *

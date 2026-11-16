@@ -5,6 +5,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/prune_plan.hpp"
 #include "strata/core/latent_share.hpp"
 #include "strata/core/window_evict.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -322,6 +323,9 @@ void perf_note(const char* what, double ms) {
     std::fprintf(stderr, "strata perf: %-32s %10.1f ms\n", what, ms);
     std::fflush(stderr);
 }
+// The host clock at the last window's end, so the next window can report the gap between them: with the GPU busy for
+// only part of a window, that gap is the host's own work and the first thing to shrink (STRATA_PERF_TRACE only).
+double g_perf_last_end_ms = 0.0;
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
@@ -818,6 +822,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
+    strata::kernels::warm_fp16_cache(wt);   // STRATA_DOT2: fp16 weight images, outside any capture
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -2581,20 +2586,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
+        // STRATA_PRUNE_APPLY: the verify window is where decode's tokens are actually combined when --spec runs,
+        // so the rank cut has to reach this path too or the served text would be pruned only in the drafts.  This
+        // layer's rank comes from STRATA_PRUNE_PLAN_L when that plan is set, exactly as prefill's mask does.
+        const int64_t verify_keep_rank = strata::core::prune_rank_for_layer(l);
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
-                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs,
+                                                    verify_keep_rank);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (hits_in_combine) {
             try {
                 native_moe_combine_multi_hits_added(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
-                                                    shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                                                    shared_ + tb * N, bo_ + tb * N, N, K, n, cs, verify_keep_rank);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs,
+                                         verify_keep_rank);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
@@ -3463,6 +3474,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
             !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
         const Clock::time_point t_launch = Clock::now();
+        if (g_perf_last_end_ms > 0.0)
+            perf_note("host gap since previous window", (double) strata::core::progress_now_ms() - g_perf_last_end_ms);
         cudaError_t le = cudaSuccess;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
@@ -3820,6 +3833,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
 #endif
     perf_note("window total (launch to done)", ms_since(t0));
+    perf_note("window tokens (T)", (double) T);
+    g_perf_last_end_ms = (double) strata::core::progress_now_ms();
     VDBG("window done\n");
     ++windows;
     progress_at("decode");

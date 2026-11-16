@@ -101,7 +101,9 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
 /// One thread per output element, k accumulations each; k is 10 at the real geometry.  This is where the CPU
 /// expert pool's outputs are summed: `ExpertPool` carries a `weight` per job and deliberately does NOT apply
 /// it, because the sum has to happen once over all k and not once per worker.
+/// keep_rank: the decode/MTP rank cut - slots j >= keep_rank are dropped from the sum (weights not renormalised),
+/// exactly as the prefill mask drops them.  0 keeps every slot, so every caller that predates the prune is unchanged.
 void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
-                 int64_t k, void* stream);
+                 int64_t k, void* stream, int64_t keep_rank = 0);
 
 }  // namespace strata::kernels

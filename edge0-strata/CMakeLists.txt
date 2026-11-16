@@ -8,6 +8,13 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
+
+cmake_minimum_required(VERSION 3.24)
+
+# Compiler/ROCm path selection lives in cmake/strata-toolchain.cmake (pass with
+# -DCMAKE_TOOLCHAIN_FILE). This keeps the registry's backslash ROCm path from
+# reaching CMake's HIP detection, which cannot parse 'c:\Rocm10' on Windows.
+
 project(strata VERSION 0.1.55 LANGUAGES CXX)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
@@ -512,6 +519,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
+                          src/kernels/cuda/kv_turbo.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
@@ -1152,6 +1160,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_tests_properties(hip_prefill_rocblas_gemm PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
       list(APPEND _strata_hip_tests hip_prefill_rocblas_gemm)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/hip_rebar_check.cpp")
+      # HIP ReBAR diagnostic: queries isLargeBar, canMapHostMemory, managedMemory, etc.
+      add_executable(hip_rebar_check tests/hip/hip_rebar_check.cpp)
+      target_link_libraries(hip_rebar_check PRIVATE strata_hip_runtime)
+      add_test(NAME hip_rebar_check COMMAND hip_rebar_check)
+      list(APPEND _strata_hip_tests hip_rebar_check)
+    endif()
     if(_strata_hip_tests)
       set_tests_properties(${_strata_hip_tests} PROPERTIES TIMEOUT 60)
     endif()
@@ -1636,6 +1651,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q4_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+  # Turbo3 / Rot4 KV codecs (kv_turbo.hpp): append/gather consistency, scale, distortion, byte ordering.
+  add_executable(kv_turbo_parity src/kernels/kv_turbo_parity.cpp)
+  target_include_directories(kv_turbo_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kv_turbo_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kv_turbo_parity COMMAND kv_turbo_parity)
   # the verify window's one-launch forms (hyper-connection write, PLE post-ops with the commit's
   # history snapshots) vs the per-token launches they replace, bitwise (GPU, synthetic, no model)
   add_executable(verify_batch_parity src/kernels/verify_batch_parity.cpp)

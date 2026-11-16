@@ -18,6 +18,9 @@
 // for the k of a half-block: mma k index 16h + 4t + j stands for weight (and activation) 16h + t + 4j.  The
 // activations are stored in it (perm32), and a lane's two B registers (h = 0 and 1) are adjacent: one 8-byte load.
 #include "strata/prefill/moe_fused.hpp"
+
+#include <cstdlib>
+
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
@@ -1079,7 +1082,30 @@ latent_kernel_q3k(const WideBatch b, const Tables tb, const LatentGeom g, const 
 // sum, d = amax / 127, the code rounding) - the xl FP32 round trip of iq_mmvq + quantize_q8_1_rows never runs.
 // U (<false>): each entry's ylq row against its label's H weight rows (the entries bucketed by label on the
 // host, one tile list per group), FP32 into Dm.
-template <bool DU>
+// STRATA_DD_NOCACHE=1 changes ONLY how the D/U weight blocks reach the SM: the ISA's cache-less load (GLC bypasses
+// L1, SLC bypasses L2, RDNA2 ISA section 2.4) instead of the default policy.  The D stage measured ~20 GB/s on a
+// 384 GB/s card, i.e. latency-bound, and the streaming-read bench showed the policy is worth nothing when memory is
+// saturated - this is the other regime.  Same bytes, same arithmetic: the output must be bit-identical.
+template <bool NC>
+__device__ __forceinline__ unsigned short dd_ld_u16(const unsigned short* p) {
+    return NC ? __builtin_nontemporal_load(p) : *p;
+}
+template <bool NC>
+__device__ __forceinline__ uint8_t dd_ld_u8(const uint8_t* p) {
+    return NC ? __builtin_nontemporal_load(p) : *p;
+}
+
+// Host side: STRATA_DD_NOCACHE=1 picks the cache-less instantiation for the D and U stages.  Both are compiled in,
+// so one session can measure either arm without a rebuild.
+static bool dd_nocache() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DD_NOCACHE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+template <bool DU, bool NC>
 __global__ void __launch_bounds__(LTHREADS, 1)
 latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ xq,
                     const int32_t* __restrict__ rows, const int32_t* __restrict__ goff,
@@ -1142,7 +1168,7 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
             // centred codes are the exact integer form of iq_kernels.cu's q4_0_centred.
             if (fmt == 4) {
             const unsigned short* bp = (const unsigned short*) (wsrc + 18 * (2 * kb + whalf));
-            wd16 = __ushort_as_half(bp[0]);
+            wd16 = __ushort_as_half(dd_ld_u16<NC>(bp));
             const uint8_t* nbp = (const uint8_t*) (bp + 1);
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -1151,7 +1177,7 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
                 for (int k = 0; k < 4; ++k) {
                     const int p = 4 * j + k;   // element p of the block
                     // p < 16: byte p's low nibble; p >= 16: byte (p-16)'s high nibble
-                    const int code = (p < 16) ? (nbp[p] & 0xF) : ((nbp[p - 16] >> 4) & 0xF);
+                    const int code = (p < 16) ? (dd_ld_u8<NC>(nbp + p) & 0xF) : ((dd_ld_u8<NC>(nbp + p - 16) >> 4) & 0xF);
                     v |= ((uint32_t) ((code - 8) & 0xFF)) << (8 * k);   // centred, masked
                 }
                 wq[j] = v;
@@ -1160,9 +1186,10 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
             // one Q8_0 block: {fp16 d; int8 qs[32]} - the qs words assembled from ushort pairs (a block is only
             // 2-byte aligned within its row)
             const unsigned short* bp = (const unsigned short*) (wsrc + 34 * (2 * kb + whalf));
-            wd16 = __ushort_as_half(bp[0]);
+            wd16 = __ushort_as_half(dd_ld_u16<NC>(bp));
 #pragma unroll
-            for (int j = 0; j < 8; ++j) wq[j] = (uint32_t) bp[1 + 2 * j] | ((uint32_t) bp[2 + 2 * j] << 16);
+            for (int j = 0; j < 8; ++j)
+                wq[j] = (uint32_t) dd_ld_u16<NC>(bp + 1 + 2 * j) | ((uint32_t) dd_ld_u16<NC>(bp + 2 + 2 * j) << 16);
             }
             if (tid < 2 * kTileRows) {
                 const uint32_t* ap = (const uint32_t*) (xq + (size_t) srow[arow] * apitch + (size_t) (72 * kb));
@@ -1389,14 +1416,18 @@ const LatentDevInfo& lat_dev() {
            "latent smem gu");
         ck(cudaFuncSetAttribute(latent_kernel_q3k<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) lat_smem_bytes()),
            "latent smem down");
-        ck(cudaFuncSetAttribute(latent_dense_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        ck(cudaFuncSetAttribute(latent_dense_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int) lat_smem_bytes()), "latent dense smem d");
-        ck(cudaFuncSetAttribute(latent_dense_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        ck(cudaFuncSetAttribute(latent_dense_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int) lat_smem_bytes()), "latent dense smem u");
+        ck(cudaFuncSetAttribute(latent_dense_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) lat_smem_bytes()), "latent dense smem d nc");
+        ck(cudaFuncSetAttribute(latent_dense_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) lat_smem_bytes()), "latent dense smem u nc");
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_gu, latent_kernel_q3k<true>, LTHREADS, lat_smem_bytes());
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_d, latent_kernel_q3k<false>, LTHREADS, lat_smem_bytes());
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_dd, latent_dense_kernel<true>, LTHREADS, lat_smem_bytes());
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_du, latent_dense_kernel<false>, LTHREADS, lat_smem_bytes());
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_dd, latent_dense_kernel<true, false>, LTHREADS, lat_smem_bytes());
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_du, latent_dense_kernel<false, false>, LTHREADS, lat_smem_bytes());
         cudaGetLastError();
         d.ok = d.occ_gu >= 1 && d.occ_d >= 1 && d.occ_dd >= 1 && d.occ_du >= 1;
 #endif
@@ -1566,9 +1597,14 @@ void latent_dense_d(const void* w, const void* xq, int64_t M, int K, int G, int6
     const cudaStream_t s = (cudaStream_t) stream;
     const int64_t nwork = ((M + kTileRows - 1) / kTileRows) * (int64_t) (((size_t) G * ell) >> 8);
     const unsigned grid = (unsigned) std::min<int64_t>(nwork, (int64_t) d.sms * d.occ_dd);
-    latent_dense_kernel<true><<<grid, LTHREADS, lat_smem_bytes(), s>>>(
-        (const uint8_t*) w, (const uint8_t*) xq, nullptr, nullptr, outq, nullptr, K, ell, G, 0, 0, M, nwork,
-        fmt, inv);
+    if (dd_nocache())
+        latent_dense_kernel<true, true><<<grid, LTHREADS, lat_smem_bytes(), s>>>(
+            (const uint8_t*) w, (const uint8_t*) xq, nullptr, nullptr, outq, nullptr, K, ell, G, 0, 0, M, nwork,
+            fmt, inv);
+    else
+        latent_dense_kernel<true, false><<<grid, LTHREADS, lat_smem_bytes(), s>>>(
+            (const uint8_t*) w, (const uint8_t*) xq, nullptr, nullptr, outq, nullptr, K, ell, G, 0, 0, M, nwork,
+            fmt, inv);
     ck(cudaGetLastError(), "latent_dense_d");
 }
 
@@ -1585,9 +1621,14 @@ void latent_dense_u(const void* w, const void* yq, const int32_t* rows, const in
     }
     const cudaStream_t s = (cudaStream_t) stream;
     const unsigned grid = (unsigned) std::min<int64_t>(nwork, (int64_t) d.sms * d.occ_du);
-    latent_dense_kernel<false><<<grid, LTHREADS, lat_smem_bytes(), s>>>(
-        (const uint8_t*) w, (const uint8_t*) yq, rows, goff, nullptr, out, K, 0, 0, H, n_groups, M, nwork,
-        fmt, nullptr);
+    if (dd_nocache())
+        latent_dense_kernel<false, true><<<grid, LTHREADS, lat_smem_bytes(), s>>>(
+            (const uint8_t*) w, (const uint8_t*) yq, rows, goff, nullptr, out, K, 0, 0, H, n_groups, M, nwork,
+            fmt, nullptr);
+    else
+        latent_dense_kernel<false, false><<<grid, LTHREADS, lat_smem_bytes(), s>>>(
+            (const uint8_t*) w, (const uint8_t*) yq, rows, goff, nullptr, out, K, 0, 0, H, n_groups, M, nwork,
+            fmt, nullptr);
     ck(cudaGetLastError(), "latent_dense_u");
 }
 

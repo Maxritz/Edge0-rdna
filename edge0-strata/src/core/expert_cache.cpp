@@ -725,12 +725,28 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
     hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
 }
 
+// **STRATA_CPU_EXPERTS_ONLY=1: ONE EXECUTION PATH FOR EVERY EXPERT.**  A hit is computed from the VRAM tier; a miss is
+// computed by the CPU pool, and which one an expert gets depends on whether its copy landed before the layer ran - so
+// two runs of the same prompt can take different kernels for the same expert and disagree in the low bits.  That was
+// the whole of the logits A/B's run-to-run noise at 1200+ tokens (see docs/perf-log-2026-11-15.md).  With this set the
+// residency table is empty for every consumer, so every expert takes the CPU path and the only variable left is the one
+// under test.  Slow by construction: it is a measurement mode, not a default.
+static bool cpu_experts_only() {
+    static const bool on = [] {
+        const char* p = std::getenv("STRATA_CPU_EXPERTS_ONLY");
+        return p != nullptr && p[0] == '1';
+    }();
+    return on;
+}
+
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
+    if (cpu_experts_only()) return kNotResident;
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     return residency_[(size_t) (layer * n_expert_ + expert)];
 }
 
 int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
+    if (cpu_experts_only()) return kNotResident;   // STRATA_CPU_EXPERTS_ONLY: nothing is admitted, so no slot is ever used
     if (sealed_) return kNotResident;   // STRATA_EXPERT_NIBBLE: nothing is admitted (and so filled) after the startup fill
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);

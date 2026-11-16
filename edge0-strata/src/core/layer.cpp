@@ -1,6 +1,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/prune_plan.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
@@ -11,6 +12,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_turbo.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/fuse_decode.hpp"
 #include "strata/kernels/rope.hpp"
@@ -207,7 +209,7 @@ if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset,
 // namespace
 void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
 void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
-namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false; }
+namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false, g_kv_turbo = false, g_kv_rot4 = false; }
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
 void qsa_set_kv_int8_rotate(bool enabled) { g_kv_int8_rot = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
@@ -215,6 +217,10 @@ void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
 bool qsa_kv_q4() { return g_kv_q4; }
 void qsa_set_kv_hybrid(bool enabled) { g_kv_hybrid = enabled; }
 bool qsa_kv_hybrid() { return g_kv_hybrid; }
+void qsa_set_kv_turbo(bool enabled) { g_kv_turbo = enabled; }
+bool qsa_kv_turbo() { return g_kv_turbo; }
+void qsa_set_kv_rot4(bool enabled) { g_kv_rot4 = enabled; }
+bool qsa_kv_rot4() { return g_kv_rot4; }
 uint64_t gdn_buffers_bytes(const ModelGeometry& g) {    const int64_t C = g.ssm_conv_channels;    const int64_t V = g.ssm_value_dim;    const uint64_t parts[] = {        q8k_bytes(g.n_embd),
 // x_q8k
 (uint64_t) (g.n_embd / 32) * 34,
@@ -427,6 +433,25 @@ if (native_router_enabled() && g.n_expert == 512 && k == 10) {
     try { native_router_top10(b.logits, b.ids, b.weights, stream); }
     catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
 } else router_top10(b.logits, 1, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
+// STRATA_ROUTE_DUMP=<path>: the decode-time routing, one line per (layer, token).  Decode is the path the prefill
+// prune mask never reaches, so these ids are what the model actually routes with while it writes the answer - the
+// thing to compare against the prefill table before claiming anything about "the experts this model uses".
+if (static const char* rdump = std::getenv("STRATA_ROUTE_DUMP"); rdump != nullptr) {
+    static int64_t dcall = 0;
+    std::vector<int32_t> hid((size_t) k);
+    std::vector<float> hw((size_t) k);
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if ((cudaStreamIsCapturing((cudaStream_t) stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone) &&
+        cudaMemcpyAsync(hid.data(), b.ids, (size_t) k * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream) == cudaSuccess &&
+        cudaMemcpyAsync(hw.data(), b.weights, (size_t) k * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream) == cudaSuccess &&
+        cudaStreamSynchronize((cudaStream_t) stream) == cudaSuccess) {
+        std::fprintf(stderr, "[droute] L%02d c=%lld ids=", (int) layer, (long long) dcall++);
+        for (int64_t i = 0; i < k; ++i) std::fprintf(stderr, "%s%d", i ? "," : "", (int) hid[(size_t) i]);
+        std::fprintf(stderr, " w=");
+        for (int64_t i = 0; i < k; ++i) std::fprintf(stderr, "%s%.4f", i ? "," : "", hw[(size_t) i]);
+        std::fputc(0x0A, stderr);
+    }
+}
 // ---- THE DOORBELL, AND IT IS THE WHOLE POINT OF THE PROTOCOL.  The routed experts' INPUT (`x`) and the
 //      miss list (`ids`, `weights`) are published to the host HERE, before anything that depends on them,
 //      so a CPU pool can start on them while the GPU keeps working.  Both the copy and the ring are
@@ -469,6 +494,26 @@ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t
     else
         bf16_gemv_fp32_mmvf_cols(x, (const uint16_t*) w_router->data, logits, g.n_embd, g.n_expert, n, stream);
     router_top10(logits, n, (int) g.n_expert, (int) k, ids, weights, stream);
+    // STRATA_ROUTE_DUMP: this batched branch is the one decode/verify actually takes when the native router is off,
+    // so without this the probe sees no decode rows at all.  Same line format as moe_route's dump.
+    if (std::getenv("STRATA_ROUTE_DUMP") != nullptr) {
+        static int64_t wcall = 0;
+        std::vector<int32_t> hid((size_t) n * (size_t) k);
+        std::vector<float> hw((size_t) n * (size_t) k);
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if ((cudaStreamIsCapturing((cudaStream_t) stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone) &&
+            cudaMemcpyAsync(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream) == cudaSuccess &&
+            cudaMemcpyAsync(hw.data(), weights, hw.size() * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream) == cudaSuccess &&
+            cudaStreamSynchronize((cudaStream_t) stream) == cudaSuccess) {
+            for (int t = 0; t < n; ++t) {
+                std::fprintf(stderr, "[droute] L%02d c=%lld ids=", (int) layer, (long long) wcall++);
+                for (int64_t i = 0; i < k; ++i) std::fprintf(stderr, "%s%d", i ? "," : "", (int) hid[(size_t) t * (size_t) k + (size_t) i]);
+                std::fprintf(stderr, " w=");
+                for (int64_t i = 0; i < k; ++i) std::fprintf(stderr, "%s%.4f", i ? "," : "", hw[(size_t) t * (size_t) k + (size_t) i]);
+                std::fputc(0x0A, stderr);
+            }
+        }
+    }
     return true;
 }
 bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,                const float* x, void* stream, std::string& err) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");    const char* missing = !w_ginp ? "ffn_gate_inp_shexp.weight" : !w_sgate ? "ffn_gate_shexp.weight"                          : !w_sup ? "ffn_up_shexp.weight" : !w_sdown ? "ffn_down_shexp.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
@@ -527,8 +572,14 @@ bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const M
 // reason this is a separate function: a caller that passes the previous layer's expert vectors gets
 // `sum_j w_l[j] * expert_{ids_{l-1},j}(x_{l-1})`, which is finite, fluent and not the model.
 try {
-    if (native_moe_combine_enabled()) native_moe_combine(parts, b.weights, b.shared, out, g.n_embd, k, stream);
-    else moe_combine(parts, b.weights, b.shared, out, g.n_embd, k, stream);
+    // STRATA_PRUNE_APPLY at decode: the same rank cut the prompt applies, now on every generated token.  The mask is
+    // a pure function of the slot index (drop j >= rank), so the rank is passed instead of a keep[] buffer, and the
+    // weights stay un-renormalised - identical policy to prefill's moe_combine mask.  The rank is THIS layer's, from
+    // STRATA_PRUNE_PLAN_L when set, so a layer-aware budget is the same budget prompt and generation spend.
+    const int64_t decode_keep_rank = strata::core::prune_rank_for_layer(layer);
+    if (native_moe_combine_enabled())
+        native_moe_combine(parts, b.weights, b.shared, out, g.n_embd, k, stream, decode_keep_rank);
+    else moe_combine(parts, b.weights, b.shared, out, g.n_embd, k, stream, decode_keep_rank);
 } catch (const std::exception& error) {
     err = "blk." + std::to_string(layer) + ".moe_combine" + ": " + error.what();
     return false;
@@ -767,6 +818,8 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
                rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
     }
     if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
+    if (g_kv_turbo) return (uint64_t) pages * s.page_size * strata::kernels::kv_turbo_bytes_per_cell(s) + 64;
+    if (g_kv_rot4) return (uint64_t) pages * s.page_size * strata::kernels::kv_rot4_bytes_per_cell(s) + 64;
     return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
 }
@@ -802,20 +855,27 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
-    st.kv_int8 = g_kv_int8 && !g_kv_q4;
+    st.kv_int8 = g_kv_int8 && !g_kv_q4 && !g_kv_turbo && !g_kv_rot4;
     st.kv_q4 = g_kv_q4;
+    st.kv_turbo = g_kv_turbo;
+    st.kv_rot4 = g_kv_rot4;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
     // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
     if (g_kv_hybrid && ring_cells <= 0) {
         st.kv_hybrid = true;
         st.kv_int8 = false;
         st.kv_q4 = false;
+        st.kv_turbo = false;
+        st.kv_rot4 = false;
     }
-    st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
+    // turbo3 and rot4 are DEFINED in the rotated basis, so they always rotate the query and un-rotate the output.
+    st.kv_rot = st.kv_q4 || st.kv_turbo || st.kv_rot4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    const uint64_t turbo_row = strata::kernels::kv_turbo_bytes_per_head((int) s.head_dim);
+    const uint64_t rot4_row = strata::kernels::kv_rot4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
     if (g_kv_elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
@@ -824,6 +884,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         std::vector<uint64_t> per;   // bytes per page slot of each array, in the order they are assigned below
         if (st.kv_hybrid) per = {slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * q4_row};
         else if (st.kv_q4) per = {slot_rows * q4_row, slot_rows * q4_row};
+        else if (st.kv_turbo) per = {slot_rows * turbo_row, slot_rows * turbo_row};
+        else if (st.kv_rot4) per = {slot_rows * rot4_row, slot_rows * rot4_row};
         else if (st.kv_int8) per = {slot_rows * s.head_dim, slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * scale_row};
         else per = {slot_rows * s.head_dim * 2, slot_rows * s.head_dim * 2};
         auto pool = std::make_unique<ElasticPool>();
@@ -844,6 +906,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t* o = pool->off.data();
         if (st.kv_hybrid) { st.k_q = (int8_t*) (b + o[0]); st.k_scale = (uint16_t*) (b + o[1]); st.v_q4 = b + o[2]; }
         else if (st.kv_q4) { st.k_q4 = b + o[0]; st.v_q4 = b + o[1]; }
+        else if (st.kv_turbo) { st.k_turbo = b + o[0]; st.v_turbo = b + o[1]; }
+        else if (st.kv_rot4) { st.k_rot4 = b + o[0]; st.v_rot4 = b + o[1]; }
         else if (st.kv_int8) {
             st.k_q = (int8_t*) (b + o[0]);
             st.v_q = (int8_t*) (b + o[1]);
@@ -859,6 +923,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     } else if (st.kv_q4) {
         st.k_q4 = c.take<uint8_t>(rows * q4_row);
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
+    } else if (st.kv_turbo) {
+        st.k_turbo = c.take<uint8_t>(rows * turbo_row);
+        st.v_turbo = c.take<uint8_t>(rows * turbo_row);
+    } else if (st.kv_rot4) {
+        st.k_rot4 = c.take<uint8_t>(rows * rot4_row);
+        st.v_rot4 = c.take<uint8_t>(rows * rot4_row);
     } else if (st.kv_int8) {   // st, not the global: the drafter's ring is INT8 under --kv k8v4 too
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.v_q = c.take<int8_t>(rows * s.head_dim);
@@ -931,6 +1001,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         } else if (st.kv_q4) {
             st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);
             st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+        } else if (st.kv_turbo) {
+            st.host.k_turbo = hc.take<uint8_t>(hrows * turbo_row);
+            st.host.v_turbo = hc.take<uint8_t>(hrows * turbo_row);
+        } else if (st.kv_rot4) {
+            st.host.k_rot4 = hc.take<uint8_t>(hrows * rot4_row);
+            st.host.v_rot4 = hc.take<uint8_t>(hrows * rot4_row);
         } else if (st.kv_int8) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
             st.host.v_q = hc.take<int8_t>(hrows * s.head_dim);
@@ -983,6 +1059,12 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     } else if (st.kv_q4) {
         cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+    } else if (st.kv_turbo) {
+        cudaMemsetAsync(st.k_turbo, 0, rows * strata::kernels::kv_turbo_bytes_per_head((int) s.head_dim), cs);
+        cudaMemsetAsync(st.v_turbo, 0, rows * strata::kernels::kv_turbo_bytes_per_head((int) s.head_dim), cs);
+    } else if (st.kv_rot4) {
+        cudaMemsetAsync(st.k_rot4, 0, rows * strata::kernels::kv_rot4_bytes_per_head((int) s.head_dim), cs);
+        cudaMemsetAsync(st.v_rot4, 0, rows * strata::kernels::kv_rot4_bytes_per_head((int) s.head_dim), cs);
     } else if (st.kv_int8) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
@@ -1006,6 +1088,8 @@ strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
     pools.page_table = st.page_table;
     if (st.kv_hybrid) { pools.k_q = st.k_q; pools.k_scale = st.k_scale; pools.v_q4 = st.v_q4; }
     else if (st.kv_q4) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
+    else if (st.kv_turbo) { pools.k_turbo = st.k_turbo; pools.v_turbo = st.v_turbo; }
+    else if (st.kv_rot4) { pools.k_rot4 = st.k_rot4; pools.v_rot4 = st.v_rot4; }
     else if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
     else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
     return pools;
@@ -1230,6 +1314,12 @@ if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV
 }
 if (st.kv_q4) {
     strata::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
+} else if (st.kv_turbo) {
+    strata::kernels::kv_append_turbo_step(st.k_turbo, st.v_turbo, st.page_table, st.step, b.kcur, b.vcur, s, stream,
+                                          &st.host);
+} else if (st.kv_rot4) {
+    strata::kernels::kv_append_rot4_step(st.k_rot4, st.v_rot4, st.page_table, st.step, b.kcur, b.vcur, s, stream,
+                                         &st.host);
 } else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
     try {
         native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
@@ -1278,6 +1368,8 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
                                            b.v_scratch, b.v_scratch, stream);
     }
     else if (st.kv_q4) strata::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+    else if (st.kv_turbo) strata::kernels::kv_gather_turbo_step(st.k_turbo, st.v_turbo, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+    else if (st.kv_rot4) strata::kernels::kv_gather_rot4_step(st.k_rot4, st.v_rot4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
     else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);
     else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);
     if (native_flash_attn_short) {

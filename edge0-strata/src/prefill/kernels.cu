@@ -2315,13 +2315,14 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
                                    const float* __restrict__ sg, float* __restrict__ bo, int64_t T,
-                                   const float* __restrict__ row_sd) {
+                                   const float* __restrict__ row_sd, const uint8_t* __restrict__ keep) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
+        if (keep != nullptr && keep[t * 10 + k] == 0) continue;   // pruned at the gather: the row is not read at all
         const int64_t r = slot[t * 10 + k];
         const float v = row_sd ? Dm[r * N + d] * row_sd[r] : Dm[r * N + d];   // the product scale_down_rows stored
         s = fmaf(w[t * 10 + k], v, s);
@@ -2334,7 +2335,7 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
 __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                     const float* __restrict__ w, const float4* __restrict__ shared,
                                     const float* __restrict__ sg, float4* __restrict__ bo, int64_t T,
-                                    const float* __restrict__ row_sd) {
+                                    const float* __restrict__ row_sd, const uint8_t* __restrict__ keep) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // float4 index
     if (i >= T * (N / 4)) return;
     const int64_t t = i / (N / 4), d = (i % (N / 4)) * 4;
@@ -2343,6 +2344,11 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     float ww[10];
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
+        if (keep != nullptr && keep[t * 10 + k] == 0) {   // pruned at the gather: neither row nor weight is used
+            ww[k] = 0.0f;
+            v[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            continue;
+        }
         ww[k] = w[t * 10 + k];
         const int64_t r = slot[t * 10 + k];
         v[k] = *reinterpret_cast<const float4*>(Dm + r * N + d);
@@ -3271,17 +3277,57 @@ void peer_scatter_add(float* sum, const float* rows, const float* wk, const int3
     check("peer_scatter_add");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
-                 int64_t T, void* stream, const float* row_sd) {
+                 int64_t T, void* stream, const float* row_sd, const uint8_t* keep) {
 #ifndef STRATA_W_NO_COMB
     if (((reinterpret_cast<uintptr_t>(Dm) | reinterpret_cast<uintptr_t>(shared) | reinterpret_cast<uintptr_t>(bo)) & 15) == 0) {
         moe_combine4_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
-            Dm, slot, w, reinterpret_cast<const float4*>(shared), sg, reinterpret_cast<float4*>(bo), T, row_sd);
+            Dm, slot, w, reinterpret_cast<const float4*>(shared), sg, reinterpret_cast<float4*>(bo), T, row_sd, keep);
         check("moe_combine");
         return;
     }
 #endif
-    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, row_sd);
+    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, row_sd, keep);
     check("moe_combine");
+}
+// STRATA_MOE_DIFF: what the prune mask changes INSIDE one layer's MoE combine.  The unmasked and the masked expert
+// sum are accumulated from the SAME gathered rows in the SAME pass, so their difference is attributable to the mask
+// alone: no second run, and no dependence on whether an earlier layer's hidden state diverged.  `full` receives the
+// unmasked expert sum and `diff` receives (unmasked - masked), T*N floats each; the shared expert is left out of both
+// because it is identical either way.  keep == nullptr means no mask, and `diff` is then exactly zero.
+__global__ void moe_maskdiff_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                    const float* __restrict__ w, int64_t T, const float* __restrict__ row_sd,
+                                    const uint8_t* __restrict__ keep, float* __restrict__ full,
+                                    float* __restrict__ diff) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // float4 index
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4), d = (i % (N / 4)) * 4;
+    float4 sa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 sm = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int64_t r = slot[t * 10 + k];
+        float4 v = *reinterpret_cast<const float4*>(Dm + r * N + d);
+        if (row_sd) {
+            const float sd = row_sd[r];
+            v = make_float4(v.x * sd, v.y * sd, v.z * sd, v.w * sd);
+        }
+        const float wk = w[t * 10 + k];
+        sa.x = fmaf(wk, v.x, sa.x); sa.y = fmaf(wk, v.y, sa.y);
+        sa.z = fmaf(wk, v.z, sa.z); sa.w = fmaf(wk, v.w, sa.w);
+        if (keep == nullptr || keep[t * 10 + k] != 0) {
+            sm.x = fmaf(wk, v.x, sm.x); sm.y = fmaf(wk, v.y, sm.y);
+            sm.z = fmaf(wk, v.z, sm.z); sm.w = fmaf(wk, v.w, sm.w);
+        }
+    }
+    reinterpret_cast<float4*>(full)[i] = sa;
+    reinterpret_cast<float4*>(diff)[i] = make_float4(sa.x - sm.x, sa.y - sm.y, sa.z - sm.z, sa.w - sm.w);
+}
+void moe_maskdiff(const float* Dm, const int32_t* slot, const float* w, int64_t T, void* stream,
+                  const float* row_sd, const uint8_t* keep, float* full, float* diff) {
+    if (T <= 0 || full == nullptr || diff == nullptr) return;
+    moe_maskdiff_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, T, row_sd, keep,
+                                                                                    full, diff);
+    check("moe_maskdiff");
 }
 void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
     if (T <= 0) return;

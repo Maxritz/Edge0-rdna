@@ -16,6 +16,8 @@
 
 #include <cstdint>
 
+#include "strata/core/weights.hpp"
+
 namespace strata::kernels {
 
 /// `y[o] = sum_i f32(x[i]) * f32(w[o*n_in + i])`, with both sides bf16-valued so every product is exact in
@@ -56,6 +58,10 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
 /// `bf16_gemv_fp32_mmvf` call on it.
 void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, int ncols,
                               void* stream);
+/// STRATA_DOT2 warm-up: convert the whitelisted BF16InF32 tensors in `wt` once into the fp8 (e4m3)
+/// cache used by the MMVF entry points. Must run outside any stream capture (Verifier::init). After
+/// it, the capture-time GEMV dispatches are pure host-side cache hits.
+void warm_fp16_cache(const core::WeightTable& wt);
 /// bf16_gemv_fp32_mmvf for n_tok (1..8) activation rows x[t * ldx], outputs y[t * ldy + j]; one launch,
 /// the weight read once, every output bit-identical to its own single-row call.
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,

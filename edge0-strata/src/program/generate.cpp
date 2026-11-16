@@ -181,6 +181,42 @@ bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only,
 // Format matches the SYCL port's LP line so one server-side reader serves both.
 // Called only when the request asked (`req_logprobs >= 0`): a request without logprobs never reaches it, so the
 // default path does no work for this and prints exactly what it printed before.
+// **STRATA_NATIVE_LOGITS=PATH: THE FULL LOGITS ROW OF A NATIVE PACK'S HEAD, ONE PER EMITTED TOKEN.**  The non-native
+// loop dumps `--dump-logits` from a host copy of `d_logits`; a native pack never reaches that site (the file stays
+// empty, which is what `--dump-logits` on an IQ pack used to produce), so the only probability data a native run could
+// give was the top-K of an `LP` line.  This site writes the whole row instead, exactly as the head produced it and
+// before sampling, penalties or temperature - the distribution a full-vocabulary KL is measured on.
+//
+// The format streams, so it needs no row count up front: `NLG1`, `int32 vocab`, `int32 reserved`, then per row
+// `int32 position`, `int32 vocab`, `vocab` floats.  A reader walks it to EOF.
+static void native_logits_row(const strata::core::Verifier& ver, int row, int64_t pos) {
+    static std::FILE* f = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        const char* p = std::getenv("STRATA_NATIVE_LOGITS");
+        if (p != nullptr && p[0] != 0) {
+            f = std::fopen(p, "wb");
+            if (f != nullptr) {
+                const int32_t h[2] = {(int32_t) ver.vocab(), 0};
+                std::fwrite("NLG1", 1, 4, f);
+                std::fwrite(h, 4, 2, f);
+            } else {
+                std::fprintf(stderr, "strata generate: cannot write STRATA_NATIVE_LOGITS=%s\n", p);
+            }
+        }
+    }
+    if (f == nullptr) return;
+    static std::vector<float> rowv;
+    rowv.resize((size_t) ver.vocab());
+    if (!ver.copy_logits(row, rowv.data())) return;   // a row the head did not produce: no line for it
+    const int32_t h[2] = {(int32_t) pos, (int32_t) ver.vocab()};
+    std::fwrite(h, 4, 2, f);
+    std::fwrite(rowv.data(), sizeof(float), rowv.size(), f);
+    std::fflush(f);
+}
+
+
 static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token, int k,
                          const std::vector<int32_t>& allowed) {
     if (k < 0) return;
@@ -665,9 +701,19 @@ struct Options {
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once: 64 left the SSD half idle (32K: 303 -> 189 ms)
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
-    std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+    /// KV quant format: f16|int8|turbo3|rot4 (turbo3 = Kraken-x default, 3-bit Hadamard).
+    /// THE DEFAULT IS int8: turbo3/rot4 are parsed and plumbed (KvFormat, QsaState, the appenders' format
+    /// switch) but their block movers and attention readers are not written yet, so selecting one is refused
+    /// below rather than defaulted to.
+    std::string kv = "int8";
+    /// KV quant explicit flag: if true, refusal to use the requested quant is an error
+    bool kv_explicit = false;
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    /// Expert cache budget in MiB (0 = auto, like Kraken-x --expert-cache-mb)
+    int expert_cache_mb = 0;
+    /// Expert cache slot cap (0 = auto, like Kraken-x --expert-cache-slots)
+    int expert_cache_slots = 0;
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -3129,8 +3175,11 @@ int main(int argc, char** argv) {
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
+        else if (a == "--kv-quant") { o.kv = next("--kv-quant"); o.kv_explicit = true; }
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-grow") o.kv_grow = true;
+        else if (a == "--expert-cache-mib") o.expert_cache_mb = std::atoi(next("--expert-cache-mib"));
+        else if (a == "--expert-cache-slots") o.expert_cache_slots = std::atoi(next("--expert-cache-slots"));
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
@@ -3857,17 +3906,38 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "turbo3" && o.kv != "rot4") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4, turbo3, or rot4\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    // TURBO3 / ROT4 (kv_turbo.hpp): 3-bit Lloyd-Max codes over the same Hadamard rotation. 100 B and 112 B per
+    // head at head_dim 256 against q4_0's 144 and int8's 264. Both are DEFINED in the rotated basis, so the
+    // state's kv_rot is set for them in layer.cpp; nothing here has to remember to rotate.
+    strata::core::qsa_set_kv_turbo(o.kv == "turbo3");
+    strata::core::qsa_set_kv_rot4(o.kv == "rot4");
+    strata::core::qsa_set_kv_rot4(o.kv == "rot4");
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
     const char* kv_rot = std::getenv("STRATA_KV_ROT");
-    strata::core::qsa_set_kv_int8_rotate(kv_rot != nullptr && kv_rot[0] == '1');
-    if (kv_rot != nullptr && kv_rot[0] == '1' && o.kv == "int8")
+    bool kv_rot_on = kv_rot != nullptr && kv_rot[0] == '1';
+    // Measured inconsistency (2026-11-15): with STRATA_KV_ROT=1 a fresh prompt and the same prompt resumed from a
+    // mid-prompt checkpoint produce different (each self-consistent) greedy text -- the checkpointed cells and the
+    // rotation disagree somewhere on the resume path, and the fresh run is the one that matches the unrotated
+    // baseline. Until that is fixed, rotation is refused together with a conversation cache / prompt checkpoint
+    // reuse: serving a silently different continuation is worse than not rotating at all.
+    // (serve sizes the cache itself when --conversation-cache-mib is unset, so the test is "serve with a cache",
+    // not "a cache size was typed")
+    if (kv_rot_on && o.serve && o.conversation_cache_mib != 0 && o.conversation_cache_slots > 0) {
+        std::fprintf(stderr,
+                     "strata generate: STRATA_KV_ROT=1 is not used: rotated INT8 K/V is inconsistent with resumed "
+                     "checkpoints (a fresh prompt and its resumed continuation disagree). Drop the conversation cache "
+                     "or STRATA_KV_ROT to serve; the rotation stays off for this run.\n");
+        kv_rot_on = false;
+    }
+    strata::core::qsa_set_kv_int8_rotate(kv_rot_on);
+    if (kv_rot_on && o.kv == "int8")
         std::fprintf(stderr, "strata generate: STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation (opt-in)\n");
     strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
@@ -6536,6 +6606,24 @@ int main(int argc, char** argv) {
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata generate: GPU %d: %s (%s)\n", dev, name, named ? p.gcnArchName : "?");
+        // Resizable BAR: with the card's memory mapped whole, expert blobs cross PCIe directly; with the 256 MB
+        // aperture many boards ship, every blob goes through window copies.  On Windows HIP's isLargeBar often
+        // returns 0 even when ReBAR/SAM is active (Vulkan shows VRAM with DEVICE_LOCAL+HOST_VISIBLE on gfx1031,
+        // and pinned-memory H2D achieves 19 GB/s).  Trust the actual capability: canMapHostMemory=1 means
+        // the PCIe BAR is wide.  Only STRATA_REBAR=0 forces it off.
+        if (named) {
+            bool large_bar = p.canMapHostMemory != 0;  // THIS is the reliable indicator on Windows
+            // Windows gfx103x: SAM/ReBAR is standard; HIP's isLargeBar is broken (returns 0).
+            // Only STRATA_REBAR=0 forces it off.
+            const char* rebar_env = std::getenv("STRATA_REBAR");
+            if (rebar_env && rebar_env[0] == '0') {
+                large_bar = false;
+                std::fprintf(stderr, "strata generate: resizable BAR forced OFF via STRATA_REBAR=0\n");
+            }
+            std::fprintf(stderr, large_bar
+                                     ? "strata generate: resizable BAR on: the card's memory is mapped whole\n"
+                                     : "strata generate: resizable BAR off: using 256 MB aperture window copies\n");
+        }
         // the first prompt's one-time hipBLAS library loads (about 2.5 s), done on a thread while the expert arena loads
         if (named) g_warm_thr = std::thread([dev] { strata::prefill::warm_gemm_libraries(dev); });
         // (RDNA4's matrix-core prompt attention is the default since 148-amd: the engine says so once, at its first prompt;
@@ -7010,7 +7098,24 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2 && native_head.loaded()) mtp_bind += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits, bound after this
 #endif
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
+        // An auto cache fills the card: the reserve is only the driver's and the desktop's slack, because everything
+        // else that the load allocates is priced below (owned prefill buffers, the draft head, kLateAllocMib).  A flat
+        // 1024 MiB reserve - the serve config's --vram-reserve-mib - left 691 slots (0.75 GiB) of this card's free VRAM
+        // unused, and every unused slot is an expert that has to be streamed, i.e. time in the prompt path's copy wait.
+        // An explicit --expert-cache N keeps the reserve as asked.  STRATA_AUTO_FILL_MIB sets the slack.
+        // 1024 MiB is the line the serve path itself calls safe ("only N MiB of VRAM free at the start of this
+        // request", #2065): filling lower than that measured no gain in the copy wait and dropped the free VRAM of
+        // this 12 GiB card from 796 to 575 MiB, so the fill never eats the headroom the request path needs.
+        constexpr int kAutoFillSlackMib = 1024;
+        int64_t reserve_mib = o.vram_reserve_mib;
+        if (o.expert_cache < 0 && reserve_mib > kAutoFillSlackMib) {
+            static const int64_t slack_env = [] {
+                const char* v = std::getenv("STRATA_AUTO_FILL_MIB");
+                return v != nullptr && v[0] != '\0' ? (int64_t) std::atoll(v) : (int64_t) -1;
+            }();
+            reserve_mib = slack_env >= 0 ? slack_env : (int64_t) kAutoFillSlackMib;
+        }
+        const int64_t reserve = ((reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
         // #496: the least a working cache needs (the verify window cannot start without one, #174): a cache too small to lend the prompt path a
         // 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it allocate its own on top
@@ -7040,7 +7145,7 @@ int main(int argc, char** argv) {
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head%s) -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
+                     (double) free_b / 1073741824.0, (int) reserve_mib, (long long) (mtp_bind >> 20),
                      auto_slots.late_priced ? ", +256 MiB for what is allocated after the cache" : "", o.expert_cache);
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
@@ -13714,7 +13819,20 @@ int main(int argc, char** argv) {
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+                std::string rest = line.substr(save ? 5 : 8);
+                // SAVE prefix=<N> <path>: the checkpoint-only write (see `checkpoint_only` below).  The keyword comes
+                // first and the path still runs to the end of the line, so an old `SAVE <path>` parses as before.
+                int64_t save_prefix = -1;
+                if (save && rest.rfind("prefix=", 0) == 0) {
+                    const size_t sp = rest.find(' ');
+                    if (sp != std::string::npos) {
+                        save_prefix = std::atoll(rest.c_str() + 7);
+                        rest = rest.substr(sp + 1);
+                    } else {
+                        save_prefix = 0;   // malformed: refused below, with the path empty too
+                    }
+                }
+                const std::string path = rest;
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -13768,6 +13886,21 @@ int main(int argc, char** argv) {
                 } catch (const std::exception& e) {
                     refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
                     continue;
+                }
+                // A checkpoint-only write: the file carries ONE checkpoint's state and K/V, no live tail and no chain.
+                // The prefix store on the server side wants exactly that - an image the size of the prefix it restores
+                // rather than of the conversation it came from - and it is also the only way to write an image of a
+                // prefix the session has since grown past.
+                const strata::core::ConversationCheckpoint* prefix_ckpt = nullptr;
+                if (save && save_prefix >= 0) {
+                    if (save_prefix <= 0) { refuse("prefix=<N> needs the prefix's token count"); continue; }
+                    for (const strata::core::ConversationCheckpoint& c : checks)
+                        if ((int64_t) c.ids.size() == save_prefix) prefix_ckpt = &c;
+                    if (prefix_ckpt == nullptr) {
+                        refuse("no checkpoint at " + std::to_string((long long) save_prefix) + " tokens: read that prefix "
+                               "first (pin=" + std::to_string((long long) save_prefix) + " on the request does it)");
+                        continue;
+                    }
                 }
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
@@ -13826,15 +13959,31 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         kept = disk_checks.size();
-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
-                                                                         err)) {
-                            refuse(err, strata::core::SessionError::io);
-                            continue;
+                        if (prefix_ckpt != nullptr) {
+                            // checkpoint_only: the view is the prefix alone (same cvec, no chain), so the K/V sources
+                            // are cut at the prefix's token count; conversation_snapshot_sources then copies the LIVE
+                            // running state, which here is the session's tail, so it is replaced by the checkpoint's
+                            // own state - the two are identical up to the prefix, and only the checkpoint is the prefix.
+                            const strata::core::ConversationView pv{prefix_ckpt->ids, prefix_ckpt->imgs, {}, cvec_cached};
+                            if (!strata::core::conversation_snapshot_sources(meta, sources, pv, ss, g, mtp.kv_state(),
+                                                                             err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                continue;
+                            }
+                            meta.live = *prefix_ckpt;
+                            meta.checkpoints.clear();
+                            kept = 0;
+                        } else {
+                            const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                            if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                                                                             err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                continue;
+                            }
                         }
                         capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
@@ -13853,10 +14002,12 @@ int main(int argc, char** argv) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
                         continue;
                     }
-                    std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
-                                 path.c_str(), ms(), capture_ms);
-                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    const size_t saved_tokens = prefix_ckpt != nullptr ? (size_t) save_prefix : live.size();
+                    std::fprintf(stderr, "strata serve: session saved %zu tokens%s, %zu of %zu checkpoints, %zu bytes to "
+                                         "%s in %.1f ms (state %.1f ms)\n",
+                                 saved_tokens, prefix_ckpt != nullptr ? " (checkpoint only: no live tail)" : "", kept,
+                                 checks.size(), bytes, path.c_str(), ms(), capture_ms);
+                    std::printf("SAVED %zu %zu %.1f\n", saved_tokens, bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
@@ -16674,6 +16825,7 @@ int main(int argc, char** argv) {
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         { static auto prev = std::chrono::steady_clock::now(); auto now = std::chrono::steady_clock::now(); std::printf("T %d\n", (int) outp[(size_t) i]); }
                         if (req_logprobs >= 0) emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
+                        native_logits_row(V1(A), i, A.p + i);   // STRATA_NATIVE_LOGITS: the whole row, not the top-K
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
@@ -17130,6 +17282,7 @@ int main(int argc, char** argv) {
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     { static auto prev = std::chrono::steady_clock::now(); auto now = std::chrono::steady_clock::now(); std::printf("T %d\n", (int) outv[(size_t) i]); }
                     if (req_logprobs >= 0) emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
+                    native_logits_row(ver, i, p + i);   // STRATA_NATIVE_LOGITS: the whole row, not the top-K
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
@@ -19066,6 +19219,12 @@ int main(int argc, char** argv) {
                         "  pool phases", wp / per, dr / per, rp / per);
         }
         std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
+        // A BOUNDED GPU WAIT IS NOT A PASSING GRADE.  `wait_flag_ge` now expires instead of spinning forever (which
+        // used to stop the machine), so an expiry shows up here instead of as a dead desktop: the handshake that
+        // layer needed was never answered, and the token built on it is not the model's.
+        if (const unsigned stalls = strata::kernels::wait_flag_stalls(); stalls > 0)
+            std::printf("%-24s %u GPU waits expired (STRATA_WAIT_TIMEOUT_MS): a handshake was never answered; "
+                        "this run's tokens are not the model's\n", "!! STALLED WAITS", stalls);
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
             std::printf("  CUDA%d experts           %lld routed entries computed\n",
                         r + 1, (long long) remote_experts[(size_t) r].computed());

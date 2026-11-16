@@ -22,6 +22,7 @@
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
 #include <cuda_runtime.h>
+#include <vector>
 #include <atomic>
 #include <cfloat>
 #include <cstddef>
@@ -224,6 +225,25 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
     route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    // STRATA_ROUTE_DUMP=1: every single-token routing decision, which in this build is the decode and MTP path (the
+    // prompt goes through the batched kernel instead).  Dumped here because the callers do not all pass through
+    // moe_route: generate.cpp's native loops and the MTP head call this directly.
+    if (std::getenv("STRATA_ROUTE_DUMP") != nullptr) {
+        static long long ncall = 0;
+        int32_t hid[10];
+        float hw[10];
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone) return;
+        if (cudaMemcpyAsync(hid, ids, sizeof(hid), cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream)) == cudaSuccess &&
+            cudaMemcpyAsync(hw, weights, sizeof(hw), cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream)) == cudaSuccess &&
+            cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) == cudaSuccess) {
+            std::fprintf(stderr, "[droute] c=%lld ids=", ncall++);
+            for (int i = 0; i < 10; ++i) std::fprintf(stderr, "%s%d", i ? "," : "", (int) hid[i]);
+            std::fprintf(stderr, " w=");
+            for (int i = 0; i < 10; ++i) std::fprintf(stderr, "%s%.4f", i ? "," : "", hw[i]);
+            std::fputc(0x0A, stderr);
+        }
+    }
 }
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
     if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
@@ -232,6 +252,31 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    // STRATA_ROUTE_DUMP=1: the multi-token window route, the decode path when the window is routed in one launch
+    // (MTP draft windows via native_router_topk and the verify window): every (token, rank) id, so the decode-time
+    // expert distribution can be compared with the prefill one.  Same line format as the single-token dump,
+    // one line per token of the window, numbered cumulatively.
+    // The read-back is skipped while a graph is being captured: a blocking sync there fails the capture.
+    if (std::getenv("STRATA_ROUTE_DUMP") != nullptr) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone) return;
+        static long long ncall = 0;
+        std::vector<int32_t> hid((size_t) n_tok * 10);
+        std::vector<float> hw((size_t) n_tok * 10);
+        if (cudaMemcpyAsync(hid.data(), ids, (size_t) n_tok * 10 * 4, cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream)) == cudaSuccess &&
+            cudaMemcpyAsync(hw.data(), weights, (size_t) n_tok * 10 * 4, cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream)) == cudaSuccess &&
+            cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) == cudaSuccess) {
+            for (int t = 0; t < n_tok; ++t) {
+                std::fprintf(stderr, "[droute] c=%lld ids=", ncall++);
+                for (int i = 0; i < 10; ++i)
+                    std::fprintf(stderr, "%s%d", i ? "," : "", (int) hid[(size_t) t * 10 + (size_t) i]);
+                std::fprintf(stderr, " w=");
+                for (int i = 0; i < 10; ++i)
+                    std::fprintf(stderr, "%s%.4f", i ? "," : "", hw[(size_t) t * 10 + (size_t) i]);
+                std::fputc(0x0A, stderr);
+            }
+        }
+    }
 }
 bool native_router_topk_supported(int n_expert, int k) { return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8); }
 void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {

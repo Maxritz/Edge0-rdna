@@ -76,8 +76,6 @@ inline size_t lat_smem_bytes() {
     return (size_t) 2 * WROWS * LWPITCH + (size_t) 2 * kTileRows * LAPITCH + (size_t) kTileRows * 4;
 }
 
-#if !defined(__HIPCC__)
-
 // 16 bytes at p as four words; `sh` is 0 or 16, from the row's 2-byte misalignment (550 B rows)
 __device__ __forceinline__ void lat_ld4(const uint8_t* p, int sh, uint32_t (&w)[4]) {
     const uint32_t* q = (const uint32_t*) (p - (sh >> 3));
@@ -145,11 +143,21 @@ __global__ void __launch_bounds__(LTHREADS, 1)
 lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* __restrict__ starts, int n_groups,
                         const uint8_t* __restrict__ xq, uint8_t* __restrict__ hbuf,
                         const int32_t* __restrict__ counts, const int32_t* __restrict__ ent_tok) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__HIPCC__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
     extern __shared__ __align__(16) uint8_t smem[];
-    uint8_t* wst[2] = {smem, smem + WROWS * LWPITCH};
-    uint8_t* ast[2] = {smem + 2 * WROWS * LWPITCH, smem + 2 * WROWS * LWPITCH + kTileRows * LAPITCH};
-    int* srow = (int*) (smem + 2 * WROWS * LWPITCH + 2 * kTileRows * LAPITCH);
+    // (assigned, not brace-initialized: clang promotes a pointer array initialized from the LDS base to a static
+    // initializer, and ROCm's amdgcn-link rejects the addrspacecast that needs)
+    uint8_t* wst[2];
+    uint8_t* ast[2];
+    int* srow;
+    {
+        uint8_t* const base = smem;
+        wst[0] = base;
+        wst[1] = base + WROWS * LWPITCH;
+        ast[0] = base + 2 * WROWS * LWPITCH;
+        ast[1] = base + 2 * WROWS * LWPITCH + kTileRows * LAPITCH;
+        srow = (int*) (base + 2 * WROWS * LWPITCH + 2 * kTileRows * LAPITCH);
+    }
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, mg = lane >> 2, tig = lane & 3;
     const int wf = warp & 3, nb0 = 16 * (warp >> 2);
@@ -256,10 +264,36 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                             for (int n = 0; n < 2; ++n) {
                                 if (n == 1 && !on1) break;
                                 int d[4] = {0, 0, 0, 0};
+#if defined(__HIPCC__)
+                                // RDNA2 has no matrix cores, so the m16n8k16 s8 product above is four signed
+                                // byte products at a time (v_dot4_i32_i8 through __dp4a).  The four results are
+                                // the mma's C fragment exactly: (row ra, token 2*tig), (ra, 2*tig + 1),
+                                // (row rb, 2*tig), (rb, 2*tig + 1) - so the scaling below is unchanged.  The
+                                // 16 codes a lane does not hold are read from the staged tile, which holds
+                                // the same bytes the mma's fragments were built from; int32 adds are exact,
+                                // so the result is bit-identical to the CUDA tensor-core path.
+                                (void) a0;
+                                (void) a1;
+                                (void) bq[n];
+                                const uint32_t* wa = (const uint32_t*) (wc8 + (size_t) ra * LWPITCH + 16 * s);
+                                const uint32_t* wb = (const uint32_t*) (wc8 + (size_t) rb * LWPITCH + 16 * s);
+                                const uint8_t* ar0 = ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 16 * s;
+                                const uint8_t* ar1 = ar0 + LAPITCH;
+#pragma unroll
+                                for (int kw = 0; kw < 4; ++kw) {
+                                    const int b0 = (int) *(const uint32_t*) (ar0 + 4 * kw);
+                                    const int b1 = (int) *(const uint32_t*) (ar1 + 4 * kw);
+                                    d[0] = __dp4a((int) wa[kw], b0, d[0]);
+                                    d[1] = __dp4a((int) wa[kw], b1, d[1]);
+                                    d[2] = __dp4a((int) wb[kw], b0, d[2]);
+                                    d[3] = __dp4a((int) wb[kw], b1, d[3]);
+                                }
+#else
                                 asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
                                     "{%0,%1,%2,%3};\n"
                                     : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
                                     : "r"(a0), "r"(a1), "r"(bq[n]));
+#endif
                                 acc[i][n][0] += (da * dx0[n]) * (float) d[0];
                                 acc[i][n][1] += (da * dx1[n]) * (float) d[1];
                                 acc[i][n][2] += (db * dx0[n]) * (float) d[2];
@@ -312,8 +346,6 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
 #endif
 }
 
-#endif  // !__HIPCC__
-
 int lat_sms() {
     static const int sms = [] {
         int dev = 0, n = 0;
@@ -332,16 +364,13 @@ void lat_q3k_fused(const uint8_t* const* blob, const int32_t* starts, int n_grou
                    const int32_t* ent_dst) {
     if (n_groups <= 0 || blob == nullptr || starts == nullptr || xq == nullptr || hbuf == nullptr || out == nullptr)
         return;
-#if defined(__HIPCC__)
-    std::fprintf(stderr, "lat q3k fused: the latent A stage's kernels are CUDA-only\n");
-    std::exit(1);
-#else
-    static const bool once = [] {
+    // (not a static initializer: ROCm's amdgcn-link rejects an LDS address taken in one)
+    static bool smem_set = false;
+    if (!smem_set) {
         dck(cudaFuncSetAttribute(lat_q3k_fused_gu_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int) lat_smem_bytes()), "smem");
-        return true;
-    }();
-    (void) once;
+        smem_set = true;
+    }
     const int sms = lat_sms();
     const unsigned gy = (unsigned) std::min(n_groups, 512);
     const unsigned gz = (sms > 0 && (int) (gy * kItems) < sms) ? 8u : 1u;
@@ -350,7 +379,6 @@ void lat_q3k_fused(const uint8_t* const* blob, const int32_t* starts, int n_grou
     dck(cudaGetLastError(), "launch gu+swiglu+q8_1");
     // the down: the shipped M1 kernel, on the H rows just written (same stream, so ordered)
     lat_q3k_down(blob, starts, n_groups, hbuf, out, ld, (void*) stream, counts, ent_dst);
-#endif
 }
 
 }  // namespace strata::prefill

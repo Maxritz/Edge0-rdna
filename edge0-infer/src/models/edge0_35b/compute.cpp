@@ -1,6 +1,23 @@
 #include "models/edge0_35b/compute.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 namespace edge0::models::edge0_35b {
+// **EDGE0_KV_TYPE: THE ATTENTION CACHE'S ELEMENT TYPE, FOR MEASUREMENT.**  f16 is what this model ships with and what
+// every figure in the docs was measured on.  q8_0 and q4_0 shrink the cache by 2x and 4x; ggml's flash attention
+// accepts both on Vulkan (its fa_kv_ok list) and on CPU (K needs a vec_dot trait, V a to_float trait).  The switch
+// exists so the two arms can be compared on one prompt rather than assumed, and it is an env variable because the
+// cache declaration is built here, before any command-line option could reach it.
+ggml_type attention_cache_type() {
+    const char* value = std::getenv("EDGE0_KV_TYPE");
+    if (value == nullptr || value[0] == 0 || std::strcmp(value, "f16") == 0) return GGML_TYPE_F16;
+    if (std::strcmp(value, "q8_0") == 0) return GGML_TYPE_Q8_0;
+    if (std::strcmp(value, "q4_0") == 0) return GGML_TYPE_Q4_0;
+    std::fprintf(stderr, "edge0: EDGE0_KV_TYPE=%s is not f16, q8_0 or q4_0; using f16\n", value);
+    return GGML_TYPE_F16;
+}
+
 Result<StateDescription> describe_states(const model::ModelDefinition& definition) {
     const auto heads = definition.parameters.find("n_head_kv");
     const auto width = definition.parameters.find("head_dim");
@@ -23,7 +40,7 @@ Result<StateDescription> describe_states(const model::ModelDefinition& definitio
     result.block_snapshot_bytes = result.checkpoint_bytes;
     for (auto layer : attention_layers(definition)) {
         for (const auto* suffix : {"k", "v"}) {
-            result.kv.push_back({"attn." + std::to_string(layer) + "." + suffix, GGML_TYPE_F16,
+            result.kv.push_back({"attn." + std::to_string(layer) + "." + suffix, attention_cache_type(),
                 {static_cast<std::int64_t>(width->second), static_cast<std::int64_t>(heads->second)},
                 1, 256, session::Visibility::causal});
         }

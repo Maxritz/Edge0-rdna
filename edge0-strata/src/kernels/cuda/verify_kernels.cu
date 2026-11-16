@@ -1221,10 +1221,14 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) strata_spin_pause();
-    __threadfence_system();
-}
+// ---- THE GPU-SIDE WAIT IS BOUNDED.  `wait_flag_ge` spins on a flag that ONLY THE HOST can raise, and it runs
+// inside the layer graphs on the GPU that also drives the display.  An unsatisfiable wait therefore does not
+// fail - it stops the machine: no bugcheck, no memory dump, no display-driver TDR, nothing to recover from.
+// The bound below is the SAME CONTRACT wait_handoff_kernel already uses (see the comment on that kernel): spin
+// until *flag >= value, or give up so the GRAPH COMPLETES and no stream is left hanging, then let the host fail
+// the window.  Every expiry is counted so a bounded wait is never a silent one.
+__device__ unsigned int g_wait_stalls = 0;   ///< expiries, read back by wait_flag_stalls()
+constexpr int kWaitClockEvery = 4096;        ///< read the clock every 4096 pauses: free on a spin, fine enough
 
 // the GPU's clock in ns (the same sources as gpu_stamp_kernel)
 __device__ __forceinline__ unsigned long long strata_now_ns() {
@@ -1237,6 +1241,25 @@ __device__ __forceinline__ unsigned long long strata_now_ns() {
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
 #endif
     return t;
+}
+
+// The bounded interlock.  Every site that used to spin forever now goes through this: on expiry it counts the
+// stall and returns, exactly as wait_handoff_kernel does, so the graph completes and the host learns.
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value, unsigned long long timeout_ns) {
+    const unsigned long long t0 = timeout_ns ? strata_now_ns() : 0ull;
+    int n = 0;
+    while (*flag < value) {
+        strata_spin_pause();
+        if (timeout_ns && ++n == kWaitClockEvery) {
+            n = 0;
+            if (strata_now_ns() - t0 > timeout_ns) {
+                atomicAdd(&g_wait_stalls, 1u);
+                __threadfence_system();
+                return;
+            }
+        }
+    }
+    __threadfence_system();
 }
 
 // the overlapped split's hand-off wait, bounded: spin until *flag >= value, or give up after timeout_ns (0: never),
@@ -1280,13 +1303,43 @@ __global__ void handoff_publish_kernel(float* dst, const float* __restrict__ a, 
 
 // wait_flag_ge, with the GPU's clock as it arrives (t_in) and as it leaves (t_out), either may be null
 __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint32_t value, volatile unsigned long long* t_in,
-                                            volatile unsigned long long* t_out) {
+                                            volatile unsigned long long* t_out, unsigned long long timeout_ns) {
     if (t_in != nullptr) *t_in = strata_now_ns();
-    while (*flag < value) strata_spin_pause();
+    const unsigned long long t0 = timeout_ns ? strata_now_ns() : 0ull;
+    int n = 0;
+    while (*flag < value) {
+        strata_spin_pause();
+        if (timeout_ns && ++n == kWaitClockEvery) {
+            n = 0;
+            if (strata_now_ns() - t0 > timeout_ns) { atomicAdd(&g_wait_stalls, 1u); break; }
+        }
+    }
     __threadfence_system();
     if (t_out != nullptr) *t_out = strata_now_ns();
 }
 }  // namespace
+
+// The host-side bound, read once.  **IT MUST STAY WELL UNDER TdrDelay.**  Windows resets a GPU whose kernel
+// stops responding for TdrDelay seconds (2 s by default; this box is configured at 16 s), and a reset with a
+// 26.66 GiB pinned arena and a wedged display adapter is not something the system recovers from - that is how
+// this machine hard-locked.  A legitimate wait in a decode window is the CPU pool's share of ONE LAYER, well
+// under a millisecond, so 1000 ms is ~1000x headroom and 16x under this box's TDR.  STRATA_WAIT_TIMEOUT_MS=0
+// restores the old unbounded spin - that is the configuration that froze the machine, so it exists for an A/B
+// only.  If you raise TdrDelay, check this value against it.
+static unsigned long long wait_timeout_ns() {
+    static const unsigned long long v = []() -> unsigned long long {
+        const char* e = std::getenv("STRATA_WAIT_TIMEOUT_MS");
+        const long long ms = e != nullptr ? std::atoll(e) : 1000;
+        return ms > 0 ? (unsigned long long) ms * 1000000ull : 0ull;
+    }();
+    return v;
+}
+
+unsigned wait_flag_stalls() {
+    unsigned v = 0;
+    if (cudaMemcpyFromSymbol(&v, g_wait_stalls, sizeof v) != cudaSuccess) { (void) cudaGetLastError(); return 0u; }
+    return v;
+}
 
 void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
     wait_handoff_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);
@@ -1493,9 +1546,18 @@ __global__ void resident_plan_par_kernel(const int32_t* __restrict__ ids, int n,
     __syncthreads();
     if (i == 0) *skip = ring;
 }
-__global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
+__global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip,
+                                       unsigned long long timeout_ns) {
     if (*skip == value) return;
-    while (*flag < value) strata_spin_pause();
+    const unsigned long long t0 = timeout_ns ? strata_now_ns() : 0ull;
+    int n = 0;
+    while (*flag < value) {
+        strata_spin_pause();
+        if (timeout_ns && ++n == kWaitClockEvery) {
+            n = 0;
+            if (strata_now_ns() - t0 > timeout_ns) { atomicAdd(&g_wait_stalls, 1u); break; }
+        }
+    }
     __threadfence_system();
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
@@ -1529,7 +1591,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     check("resident_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
-    wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
+    wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip, wait_timeout_ns());
     check("wait_flag_ge_or");
 }
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
@@ -1566,13 +1628,13 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
-    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, wait_timeout_ns());
     check("wait_flag_ge");
 }
 
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
                           void* stream) {
-    wait_flag_ge_stamped_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, t_in, t_out);
+    wait_flag_ge_stamped_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, t_in, t_out, wait_timeout_ns());
     check("wait_flag_ge_stamped");
 }
 

@@ -687,6 +687,12 @@ constexpr int LTHREADS = 512;             // as the Q2_0 kernel: 4 warps along t
 constexpr int LSTAGES = 2;                // the decode / permute stages (plain loads: the bytes go through registers)
 constexpr int LWPITCH = 76;               // a decoded weight row of a stage: 64 int8 codes, 4 fp16 sub-scales, pad
 constexpr int LAPITCH = 80;               // a staged activation row: 16 codes per sub-block, {d0, d1} fp16, pad
+// the D/U dense kernel's token tile: 64 is what its 4 warp groups x 16 rows cover, 128 stages one weight block
+// and lets TWO sub-tiles consume it, halving how often a layer's D weight section is re-read (docs/D_TILE_REDESIGN.md)
+constexpr int kDenseRows = 128;
+inline size_t lat_dense_smem_bytes() {
+    return (size_t) LSTAGES * WROWS * LWPITCH + (size_t) LSTAGES * kDenseRows * LAPITCH + (size_t) kDenseRows * 4;
+}
 inline size_t lat_smem_bytes() {
     return (size_t) LSTAGES * WROWS * LWPITCH + (size_t) LSTAGES * kTileRows * LAPITCH + (size_t) kTileRows * 4;
 }
@@ -983,8 +989,8 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
     const int ipg = (int) (ell >> 8);             // the item rows per output group (7)
     extern __shared__ __align__(16) uint8_t smem[];
     uint8_t* wst[2] = {smem, smem + WROWS * LWPITCH};
-    uint8_t* ast[2] = {smem + 2 * WROWS * LWPITCH, smem + 2 * WROWS * LWPITCH + kTileRows * LAPITCH};
-    int* srow = (int*) (smem + 2 * WROWS * LWPITCH + 2 * kTileRows * LAPITCH);   // [64] the act row of each tile row
+    uint8_t* ast[2] = {smem + 2 * WROWS * LWPITCH, smem + 2 * WROWS * LWPITCH + kDenseRows * LAPITCH};
+    int* srow = (int*) (smem + 2 * WROWS * LWPITCH + 2 * kDenseRows * LAPITCH);   // [64] the act row of each tile row
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, mg = lane >> 2, tig = lane & 3;
     const int wf = warp & 3, nb0 = 16 * (warp >> 2);
@@ -999,25 +1005,25 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
         int base, nrows;
         const uint8_t* wsec;
         if (DU) {
-            base = 64 * t;
-            nrows = min(kTileRows, (int) (M - base));
+            base = kDenseRows * t;
+            nrows = min(kDenseRows, (int) (M - base));
             wsec = w;
         } else {
             int g = 0, tb = 0;
             while (g < n_groups) {
-                const int nt = (goff[g + 1] - goff[g] + 63) >> 6;
+                const int nt = (goff[g + 1] - goff[g] + kDenseRows - 1) / kDenseRows;
                 if (t < tb + nt) break;
                 tb += nt;
                 ++g;
             }
             if (g >= n_groups) continue;
-            base = goff[g] + 64 * (t - tb);
-            nrows = min(kTileRows, goff[g + 1] - base);
+            base = goff[g] + kDenseRows * (t - tb);
+            nrows = min(kDenseRows, goff[g + 1] - base);
             wsec = w + (size_t) g * (size_t) H * wrowb;
         }
         const uint8_t* wsrc = wsec + (size_t) (256 * fb + wrow) * wrowb;
         __syncthreads();                                              // the previous item is done with the buffers
-        if (tid < kTileRows) {
+        if (tid < kDenseRows) {
             const int r = base + min(tid, nrows - 1);                // rows past the tile's end repeat its last one
             srow[tid] = DU ? r : rows[r];
         }
@@ -1052,7 +1058,7 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
 #pragma unroll
             for (int j = 0; j < 8; ++j) wq[j] = (uint32_t) bp[1 + 2 * j] | ((uint32_t) bp[2 + 2 * j] << 16);
             }
-            if (tid < 2 * kTileRows) {
+            if (tid < 2 * kDenseRows) {
                 const uint32_t* ap = (const uint32_t*) (xq + (size_t) srow[arow] * apitch + (size_t) (72 * kb));
 #pragma unroll
                 for (int i = 0; i < 8; ++i) aq[i] = ap[1 + 9 * ahalf + i];
@@ -1077,7 +1083,7 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
             // (all four slots as before was a write race that lost the second block's scale)
             *(__half*) (wr + 68 + 4 * whalf) = wd16;
             *(__half*) (wr + 70 + 4 * whalf) = wd16;
-            if (tid < 2 * kTileRows) {
+            if (tid < 2 * kDenseRows) {
                 uint8_t* ar = ast[kb & 1] + (size_t) arow * LAPITCH;
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
@@ -1097,28 +1103,36 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
         raw_load(0);
         stage_store(0);
         if (NCH > 1) raw_load(1);
-        const bool on0 = nb0 < nrows, on1 = nb0 + 8 < nrows;
-        float acc[4][2][4];
+        // kDenseRows / 64 sub-tiles share each weight pass: masks and accumulators carry the sub-tile
+        bool on0[kDenseRows / 64], on1[kDenseRows / 64];
+#pragma unroll
+        for (int sti = 0; sti < kDenseRows / 64; ++sti) {
+            on0[sti] = nb0 + 64 * sti < nrows;
+            on1[sti] = nb0 + 64 * sti + 8 < nrows;
+        }
+        float acc[4][2][4][kDenseRows / 64];
 #pragma unroll
         for (int i = 0; i < 4; ++i)
 #pragma unroll
             for (int n = 0; n < 2; ++n)
 #pragma unroll
-                for (int q = 0; q < 4; ++q) acc[i][n][q] = 0.0f;
+                for (int q = 0; q < 4; ++q)
+                    for (int sti = 0; sti < kDenseRows / 64; ++sti) acc[i][n][q][sti] = 0.0f;
         for (int kb = 0; kb < NCH; ++kb) {
             __syncthreads();
-            if (on0) {
+            for (int st = 0; st < kDenseRows / 64; ++st) {
+                if (!on0[st]) continue;
                 const uint8_t* wc = wst[kb & 1];
                 const uint8_t* ac = ast[kb & 1];
                 for (int s = 0; s < 4; ++s) {
                     uint32_t bq[2];
                     float dx0[2], dx1[2];               // the OUTPUT rows' (2 tig, 2 tig + 1) own ds
                     for (int n = 0; n < 2; ++n) {
-                        if (n == 1 && !on1) break;
-                        const uint8_t* ar = ac + (size_t) (nb0 + 8 * n + mg) * LAPITCH;
+                        if (n == 1 && !on1[st]) break;
+                        const uint8_t* ar = ac + (size_t) (nb0 + 64 * st + 8 * n + mg) * LAPITCH;
                         bq[n] = *(const uint32_t*) (ar + 16 * s + 4 * tig);
-                        const half2 ds0 = *(const half2*) (ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 64);
-                        const half2 ds1 = *(const half2*) (ac + (size_t) (nb0 + 8 * n + 2 * tig + 1) * LAPITCH + 64);
+                        const half2 ds0 = *(const half2*) (ac + (size_t) (nb0 + 64 * st + 8 * n + 2 * tig) * LAPITCH + 64);
+                        const half2 ds1 = *(const half2*) (ac + (size_t) (nb0 + 64 * st + 8 * n + 2 * tig + 1) * LAPITCH + 64);
                         dx0[n] = __half2float((s & 2) ? ds0.y : ds0.x);
                         dx1[n] = __half2float((s & 2) ? ds1.y : ds1.x);
                     }
@@ -1129,13 +1143,13 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
                         const float da = __half2float(*(const __half*) (wc + (size_t) ra * LWPITCH + 68 + 2 * s));
                         const float db = __half2float(*(const __half*) (wc + (size_t) rb * LWPITCH + 68 + 2 * s));
                         for (int n = 0; n < 2; ++n) {
-                            if (n == 1 && !on1) break;
+                            if (n == 1 && !on1[st]) break;
                             int d[4] = {0, 0, 0, 0};
                             mma_s8_k16(d, a0, a1, bq[n]);
-                            acc[i][n][0] += (da * dx0[n]) * (float) d[0];
-                            acc[i][n][1] += (da * dx1[n]) * (float) d[1];
-                            acc[i][n][2] += (db * dx0[n]) * (float) d[2];
-                            acc[i][n][3] += (db * dx1[n]) * (float) d[3];
+                            acc[i][n][0][st] += (da * dx0[n]) * (float) d[0];
+                            acc[i][n][1][st] += (da * dx1[n]) * (float) d[1];
+                            acc[i][n][2][st] += (db * dx0[n]) * (float) d[2];
+                            acc[i][n][3][st] += (db * dx1[n]) * (float) d[3];
                         }
                     }
                 }
@@ -1146,16 +1160,17 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
                 if (kb + 2 < NCH) raw_load(kb + 2);
             }
         }
-        if (!on0) continue;
+        for (int st = 0; st < kDenseRows / 64; ++st) {
+        if (!on0[st]) continue;
         if (DU) {
             // the warp's 64 outputs are two q8_1 blocks of the (token, group) xl row: quantized as q8_1_store
             // (the amax and the sum over the block's 32 values, d = amax / 127, the code rounding, ds = {d, sum})
             const int g_out = fb / ipg, rr = fb % ipg;               // the output group, the item within it
             const size_t xrowb = (size_t) eblk * 36;                 // an xlq row
             for (int n = 0; n < 2; ++n) {
-                if (n == 1 && !on1) break;
+                if (n == 1 && !on1[st]) break;
                 for (int qc = 0; qc < 2; ++qc) {
-                    const int r_t = nb0 + 8 * n + 2 * tig + qc;      // the token's tile row
+                    const int r_t = nb0 + 64 * st + 8 * n + 2 * tig + qc;      // the token's tile row
                     // every lane runs the full-warp shuffles below; a row past the tile's end only feeds itself
                     const bool valid = r_t < nrows;
                     const int t_tok = srow[r_t];
@@ -1164,9 +1179,9 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
                         float am = 0.0f, sm = 0.0f;
 #pragma unroll
                         for (int h = 0; h < 2; ++h) {
-                            am = fmaxf(am, fabsf(acc[2 * b + h][n][qc]));
-                            am = fmaxf(am, fabsf(acc[2 * b + h][n][2 + qc]));
-                            sm += acc[2 * b + h][n][qc] + acc[2 * b + h][n][2 + qc];
+                            am = fmaxf(am, fabsf(acc[2 * b + h][n][qc][st]));
+                            am = fmaxf(am, fabsf(acc[2 * b + h][n][2 + qc][st]));
+                            sm += acc[2 * b + h][n][qc][st] + acc[2 * b + h][n][2 + qc][st];
                         }
                         am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 16));
                         am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 8));
@@ -1179,8 +1194,8 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
                         if (!valid) continue;
 #pragma unroll
                         for (int h = 0; h < 2; ++h) {
-                            ob[4 + 16 * h + mg] = (uint8_t) lat_q8(acc[2 * b + h][n][qc], d, am);
-                            ob[4 + 16 * h + 8 + mg] = (uint8_t) lat_q8(acc[2 * b + h][n][2 + qc], d, am);
+                            ob[4 + 16 * h + mg] = (uint8_t) lat_q8(acc[2 * b + h][n][qc][st], d, am);
+                            ob[4 + 16 * h + 8 + mg] = (uint8_t) lat_q8(acc[2 * b + h][n][2 + qc][st], d, am);
                         }
                         if (mg == 0) *(half2*) ob = strata::kernels::q8_1_ds(d, sm);
                     }
@@ -1191,16 +1206,17 @@ latent_dense_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ x
             for (int i = 0; i < 4; ++i)
 #pragma unroll
                 for (int n = 0; n < 2; ++n) {
-                    if (n == 1 && !on1) break;
+                    if (n == 1 && !on1[st]) break;
 #pragma unroll
                     for (int q = 0; q < 4; ++q) {
-                        const int r_t = nb0 + 8 * n + 2 * tig + (q & 1);
+                        const int r_t = nb0 + 64 * st + 8 * n + 2 * tig + (q & 1);
                         if (r_t < nrows)
                             outf[(size_t) srow[r_t] * H + 256 * fb + 64 * wf + 16 * i + mg + 8 * (q >> 1)] =
-                                acc[i][n][q];
+                                acc[i][n][q][st];
                     }
                 }
         }
+        }   // the sub-tiles
     }
 #endif
 }
@@ -1265,13 +1281,13 @@ const LatentDevInfo& lat_dev() {
         ck(cudaFuncSetAttribute(latent_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) lat_smem_bytes()),
            "latent smem down");
         ck(cudaFuncSetAttribute(latent_dense_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                (int) lat_smem_bytes()), "latent dense smem d");
+                                (int) lat_dense_smem_bytes()), "latent dense smem d");
         ck(cudaFuncSetAttribute(latent_dense_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                (int) lat_smem_bytes()), "latent dense smem u");
+                                (int) lat_dense_smem_bytes()), "latent dense smem u");
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_gu, latent_kernel<true>, LTHREADS, lat_smem_bytes());
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_d, latent_kernel<false>, LTHREADS, lat_smem_bytes());
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_dd, latent_dense_kernel<true>, LTHREADS, lat_smem_bytes());
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_du, latent_dense_kernel<false>, LTHREADS, lat_smem_bytes());
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_dd, latent_dense_kernel<true>, LTHREADS, lat_dense_smem_bytes());
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_du, latent_dense_kernel<false>, LTHREADS, lat_dense_smem_bytes());
         cudaGetLastError();
         d.ok = d.occ_gu >= 1 && d.occ_d >= 1 && d.occ_dd >= 1 && d.occ_du >= 1;
 #endif
@@ -1307,7 +1323,7 @@ bool requested() {
 
 size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) (cols / 64) * AB; }
 size_t group_bytes(int64_t n, int n_expert) {
-    return tiles_at(n_expert) + ((size_t) (n + kTileRows - 1) / kTileRows + (size_t) n_expert) * sizeof(int2);
+    return tiles_at(n_expert) + ((size_t) (n + kDenseRows - 1) / kDenseRows + (size_t) n_expert) * sizeof(int2);
 }
 
 void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
@@ -1342,7 +1358,7 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
     const cudaStream_t s = (cudaStream_t) stream;
     const Tables tb = tables(const_cast<void*>(scratch), n_expert);
     // the most tiles the batch can have: every row in it, plus a partial tile per expert
-    const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
+    const int64_t tiles = (n + kDenseRows - 1) / kDenseRows + (b.e1 - b.e0);
 #if defined(__HIPCC__)
     const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (1280 / W_ROWS), (int64_t) d.sms * wgp_blocks(d.occ_gu));
     const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (2560 / W_ROWS), (int64_t) d.sms * wgp_blocks(d.occ_d));
@@ -1383,8 +1399,8 @@ void group_latent(const int32_t* cnt, const int32_t* off, int n_expert, void* ho
     int t = 0;
     for (int e = 0; e < n_expert; ++e) {
         ts_d[e] = t;
-        const int c = cnt[e], nt = (c + kTileRows - 1) / kTileRows;
-        for (int i = 0; i < nt; ++i) tiles[t + i] = make_int2(e, off[e] + i * kTileRows);
+        const int c = cnt[e], nt = (c + kDenseRows - 1) / kDenseRows;
+        for (int i = 0; i < nt; ++i) tiles[t + i] = make_int2(e, off[e] + i * kDenseRows);
         t += nt;
     }
     ts_d[n_expert] = t;
@@ -1407,7 +1423,7 @@ void experts_latent(const WideBatch& b, const LatentGeom& g, int n_expert, int64
 #if !defined(__HIPCC__)
     const Tables tb = tables(const_cast<void*>(scratch), n_expert);
     // the most tiles the batch can have: every row in it, plus a partial tile per expert
-    const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
+    const int64_t tiles = (n + kDenseRows - 1) / kDenseRows + (b.e1 - b.e0);
     const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * 5, (int64_t) d.sms * d.occ_gu);
     const unsigned g_d = (unsigned) std::min<int64_t>(tiles * 7, (int64_t) d.sms * d.occ_d);
     latent_kernel<true><<<g_gu, LTHREADS, lat_smem_bytes(), s>>>(b, tb, g, (const uint8_t*) xa, src,
@@ -1438,9 +1454,9 @@ void latent_dense_d(const void* w, const void* xq, int64_t M, int K, int G, int6
         std::exit(1);
     }
     const cudaStream_t s = (cudaStream_t) stream;
-    const int64_t nwork = ((M + kTileRows - 1) / kTileRows) * (int64_t) (((size_t) G * ell) >> 8);
+    const int64_t nwork = ((M + kDenseRows - 1) / kDenseRows) * (int64_t) (((size_t) G * ell) >> 8);
     const unsigned grid = (unsigned) std::min<int64_t>(nwork, (int64_t) d.sms * d.occ_dd);
-    latent_dense_kernel<true><<<grid, LTHREADS, lat_smem_bytes(), s>>>(
+    latent_dense_kernel<true><<<grid, LTHREADS, lat_dense_smem_bytes(), s>>>(
         (const uint8_t*) w, (const uint8_t*) xq, nullptr, nullptr, outq, nullptr, K, ell, G, 0, 0, M, nwork,
         fmt);
     ck(cudaGetLastError(), "latent_dense_d");

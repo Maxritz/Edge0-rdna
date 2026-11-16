@@ -62,8 +62,6 @@ inline size_t lat_smem_bytes() {
     return (size_t) 2 * WROWS * LWPITCH + (size_t) 2 * kTileRows * LAPITCH + (size_t) kTileRows * 4;
 }
 
-#if !defined(__HIPCC__)
-
 // One 16-value sub-block's 4 code words of 4 qs words (q[m] = values 4m .. 4m + 3, the natural order) permuted into
 // the staged order: out[k]'s byte c is the sub-block's value 4c + k.
 __device__ __forceinline__ void lat_stage_codes(const uint32_t* A, uint32_t (&out)[4]) {
@@ -77,11 +75,21 @@ __global__ void __launch_bounds__(LTHREADS, 1)
 lat_q3k_down_kernel(const uint8_t* const* __restrict__ blob, const int32_t* __restrict__ starts, int n_groups,
                     const uint8_t* __restrict__ act, float* __restrict__ out, int64_t ld,
                     const int32_t* __restrict__ counts, const int32_t* __restrict__ ent_dst) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__HIPCC__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
     extern __shared__ __align__(16) uint8_t smem[];
-    uint8_t* wst[2] = {smem, smem + WROWS * LWPITCH};
-    uint8_t* ast[2] = {smem + 2 * WROWS * LWPITCH, smem + 2 * WROWS * LWPITCH + kTileRows * LAPITCH};
-    int* srow = (int*) (smem + 2 * WROWS * LWPITCH + 2 * kTileRows * LAPITCH);   // [64] the act row of each tile row
+    // (assigned, not brace-initialized: clang promotes a pointer array initialized from the LDS base to a static
+    // initializer, and ROCm's amdgcn-link rejects the addrspacecast that needs)
+    uint8_t* wst[2];
+    uint8_t* ast[2];
+    int* srow;   // [64] the act row of each tile row
+    {
+        uint8_t* const base = smem;
+        wst[0] = base;
+        wst[1] = base + WROWS * LWPITCH;
+        ast[0] = base + 2 * WROWS * LWPITCH;
+        ast[1] = base + 2 * WROWS * LWPITCH + kTileRows * LAPITCH;
+        srow = (int*) (base + 2 * WROWS * LWPITCH + 2 * kTileRows * LAPITCH);
+    }
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, mg = lane >> 2, tig = lane & 3;
     const int wf = warp & 3, nb0 = 16 * (warp >> 2);
@@ -212,10 +220,35 @@ lat_q3k_down_kernel(const uint8_t* const* __restrict__ blob, const int32_t* __re
                             for (int n = 0; n < 2; ++n) {
                                 if (n == 1 && !on1) break;
                                 int d[4] = {0, 0, 0, 0};
+#if defined(__HIPCC__)
+                                // RDNA2 has no matrix cores: the m16n8k16 s8 product as four signed byte products
+                                // at a time (v_dot4_i32_i8 through __dp4a).  The results are the mma's C fragment:
+                                // (row ra, token 2*tig), (ra, 2*tig + 1), (row rb, 2*tig), (rb, 2*tig + 1), so the
+                                // scaling below is unchanged, and int32 adds are exact: the values are the
+                                // CUDA tensor-core path's, bit for bit.  A lane reads the 12 codes of its 16 it
+                                // does not hold from the staged tile the mma's fragments came from.
+                                (void) a0;
+                                (void) a1;
+                                (void) bq[n];
+                                const uint32_t* wa = (const uint32_t*) (wc + (size_t) ra * LWPITCH + 16 * s);
+                                const uint32_t* wb = (const uint32_t*) (wc + (size_t) rb * LWPITCH + 16 * s);
+                                const uint8_t* ar0 = ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 16 * s;
+                                const uint8_t* ar1 = ar0 + LAPITCH;
+#pragma unroll
+                                for (int kw = 0; kw < 4; ++kw) {
+                                    const int b0 = (int) *(const uint32_t*) (ar0 + 4 * kw);
+                                    const int b1 = (int) *(const uint32_t*) (ar1 + 4 * kw);
+                                    d[0] = __dp4a((int) wa[kw], b0, d[0]);
+                                    d[1] = __dp4a((int) wa[kw], b1, d[1]);
+                                    d[2] = __dp4a((int) wb[kw], b0, d[2]);
+                                    d[3] = __dp4a((int) wb[kw], b1, d[3]);
+                                }
+#else
                                 asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
                                     "{%0,%1,%2,%3};\n"
                                     : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
                                     : "r"(a0), "r"(a1), "r"(bq[n]));
+#endif
                                 acc[i][n][0] += (da * dx0[n]) * (float) d[0];
                                 acc[i][n][1] += (da * dx1[n]) * (float) d[1];
                                 acc[i][n][2] += (db * dx0[n]) * (float) d[2];
@@ -250,23 +283,18 @@ lat_q3k_down_kernel(const uint8_t* const* __restrict__ blob, const int32_t* __re
 #endif
 }
 
-#endif  // !__HIPCC__
-
 }  // namespace
 
 void lat_q3k_down(const uint8_t* const* blob, const int32_t* starts, int n_groups, const void* hq, float* out,
                   int64_t ld, void* stream, const int32_t* counts, const int32_t* ent_dst) {
     if (n_groups <= 0 || blob == nullptr || starts == nullptr || hq == nullptr || out == nullptr) return;
-#if defined(__HIPCC__)
-    std::fprintf(stderr, "lat q3k down: the latent A stage's kernels are CUDA-only\n");
-    std::exit(1);
-#else
-    static const bool once = [] {
+    // (not a static initializer: ROCm's amdgcn-link rejects an LDS address taken in one)
+    static bool smem_set = false;
+    if (!smem_set) {
         dck(cudaFuncSetAttribute(lat_q3k_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int) lat_smem_bytes()), "smem");
-        return true;
-    }();
-    (void) once;
+        smem_set = true;
+    }
     static const int sms = [] {
         int dev = 0, n = 0;
         return cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) ==
@@ -281,7 +309,6 @@ void lat_q3k_down(const uint8_t* const* blob, const int32_t* starts, int n_group
     lat_q3k_down_kernel<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
         blob, starts, n_groups, (const uint8_t*) hq, out, ld, counts, ent_dst);
     dck(cudaGetLastError(), "launch");
-#endif
 }
 
 }  // namespace strata::prefill

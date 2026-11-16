@@ -2,3 +2,36 @@
 .DS_Store
 
 # The engine in edge0-infer/ has its own .gitignore for its build output.
+
+# ---------------------------------------------------------------------------
+# Local benchmark / probe output (the gfx1031 Windows box).
+#
+# The scripts, the probe SOURCES, the docs and the engine code are tracked.
+# What they generate is not: 264 files / ~149 MB of logs, response dumps,
+# routing captures, token dumps and crash dumps were sitting in the tree.
+# `git status --porcelain | grep '^??'` should stay readable.
+# ---------------------------------------------------------------------------
+*.log
+*.out
+*.dmp
+*.exe
+*.dll
+
+# root-level scratch fixtures
+/prompt*.txt
+/routing_*.bin
+/cmake_out.txt
+
+# engine scratch: response dumps, token dumps, routing / capture dumps
+edge0-strata/*.json
+edge0-strata/*.txt
+edge0-strata/.kpack/
+edge0-strata/dump_*/
+edge0-strata/ptok-*
+edge0-strata/plp-*
+edge0-strata/shtok-*
+edge0-strata/dtok-*
+edge0-strata/tok-*
+edge0-strata/tok_*
+edge0-strata/logpos-*
+edge0-strata/out_*

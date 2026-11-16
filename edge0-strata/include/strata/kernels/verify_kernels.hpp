@@ -72,7 +72,14 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
 /// native_quantize_q8_1(y + t_out_begin * value_dim, xq_out, value_dim, n_tok - t_out_begin) would write.)
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
+///
+/// **BOUNDED.**  The spin expires after STRATA_WAIT_TIMEOUT_MS (default 1000 - it MUST stay under TdrDelay, or
+/// Windows resets the display GPU instead) and then RETURNS, so the graph completes and no stream is left
+/// hanging; `wait_flag_stalls()` counts the expiries.  This is not a tuning knob: an unbounded device spin on a
+/// host-raised flag takes the machine down with it, because the GPU that spins is the GPU that drives the display.
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// How many bounded waits have expired since the process started (device counter, read back on the host).
+unsigned wait_flag_stalls();
 /// wait_flag_ge and copy_i32_from_mapped in ONE launch (143-amdk): thread 0 spins on *flag >= value, the block then
 /// copies dst[0, n) = src[0, n) (mapped host memory, volatile reads).  One kernel node fewer per layer: a dependent
 /// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).
