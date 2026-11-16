@@ -330,6 +330,39 @@
 > cache (VRAM is fully committed) or the CPU share (which cannot arm: the Windows commit limit leaves
 > 1.3 GiB where the share needs 4.0 GiB - a machine setting, not a code one).
 
+> ### 0.8 Decode, measured instead of inferred: the round's 89.45 ms, split
+>
+> The two buckets decode's table blamed (`pcie/uWait` 24.15 ms, `cpu/uCopy` 14.73 ms) each held three
+> things, so nothing could be attacked with confidence.  `STRATA_VERIFY_U_PROF=1` now divides them with
+> stream stamps (slots 33-35, total-preserving: the buckets are subtracted as the parts are added, and
+> the round still sums to 89.45 ms).  At T4, per round, `v5.log`:
+>
+> | part | GDN | QSA | total | share |
+> |---|---|---|---|---|
+> | `u: gemv` - the q8_1 of H + the **GPU-rows U** (`latent_u_grouped`) | 9.916 | 3.315 | **13.23** | 15 % |
+> | `u: pool wait` - the CPU pool's rows for this group | 8.696 | 1.590 | **10.29** | 12 % |
+> | `u: hqcp+matvec+hits` - the hq copy, the CPU-rows U, the hit rows | 11.131 | 3.668 | **14.80** | 17 % |
+>
+> So the expert path in decode is 38.3 ms of 89.45 (43 %), and the single largest piece is **not** the
+> pool wait (10.3 ms, not 24) but the two U-shaped pieces around it (28.0 ms).  A stamp lesson worth
+> recording: the first version of this probe used `cudaEventSynchronize` inside the verify window and the
+> run died with `wait_flag_ge: operation failed due to a previous error during capture` - a host CUDA call
+> inside the capture window is the issue #31 driver-lock hazard the same function warns about.
+>
+> **The prefill tile does not help decode's U, measured.**  `STRATA_VERIFY_U_TILE=1` routes the GPU-rows
+> U through `latent_u_tiled`: `u: gemv` 13.23 -> 13.23 (T4 table identical, decode 25.38 vs 24.79 tok/s,
+> inside the noise).  The reason is the shape, not the kernel: `cap` is **10 rows a layer** here, so with
+> ~1 row per label the tile's 64-row pad stages more than the per-row kernel does (52 MB vs 35 MB a
+> layer) while computing 64x the rows it needs.  At that size the per-row kernel is bound by **block
+> count** - 320 blocks a row x 10 rows x 48 layers = ~154k blocks a round at ~86 ns each = 13.2 ms - not
+> by bytes.  The fix is therefore a decode-shaped tile (8-16 rows, one block per label x column tile,
+> ~150 blocks a layer), not the prefill tile turned up.
+>
+> Machine context for the RAM question: `kq_cpu_bench` (unpinned, cold 4 GB) measures this box's ceiling
+> at **37.2-37.6 GB/s** (DDR4-3000, 2 channels), while the pinned pool reaches 30.5-32.2 = 86 % of it.
+> 3000 -> 3200 MT/s is +6.7 % on paper and would move decode by ~1.4 %; the pool kernel has at most
+> ~15 % of headroom.  Neither is the lever the round's own split points at.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

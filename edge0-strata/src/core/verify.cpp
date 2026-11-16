@@ -2466,9 +2466,30 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                   lat_yl_grp, cs, kPcieGroupRows);   // the PCIe share
             // U: route r reads yl[r] and U[labels[ids[r]]]; the result is parts_ (one K*N block per group, route order)
             quantize_q8_1_rows(lat_yl_grp, cap, (int) lat_ELL_, lat_uq_, cs);
+            // STRATA_VERIFY_U_PROF=1: split this layer's expert path across profile slots 32..35 (free in this
+            // branch; the SEG_SPLIT diagnostic reuses them, and the two are never on together) so the round's
+            // table can say what the `pcie/uWait` window actually holds: U, the hq copy, the U matvec, the hits.
+            // Slots are stream stamps, never a host synchronise - a host CUDA call inside the capture window is
+            // the issue #31 driver-lock hazard this very block warns about two lines down.
+            static const bool v_up = std::getenv("STRATA_VERIFY_U_PROF") != nullptr;
+            // STRATA_VERIFY_U_TILE=1: decode's GPU-rows U on the staged tile (the kernel that took prefill's U
+            // from 23.7 to 2.7 ms a layer).  The per-row kernel re-reads a label's whole U slice once per
+            // routed row - ~40 rows x 3.5 MB x 48 layers a round - which is the same defect the tile fixed.
+            static const bool v_ut = [] {
+                const char* v = std::getenv("STRATA_VERIFY_U_TILE");
+                return v != nullptr && v[0] == '1';
+            }();
+            if (v_up) stamp(l, 33, grp);        // slot 33 = this layer's U
+            if (v_ut)
+                strata::kernels::latent_u_tiled(lat_u_ + (size_t) l * lat_dense_.u_bytes(), (const uint8_t*) lat_uq_,
+                                                ids_ + (size_t) tb * K, lat_labels_dev_ + (size_t) l * (size_t) lat_E_,
+                                                lat_E_, cap, (int) lat_ELL_, (int) N, hit_out, hit_scratch_, cs,
+                                                lat_fmt_, lat_G_);
+            else
             latent_u_grouped(lat_u_ + (size_t) l * lat_dense_.u_bytes(), (const uint8_t*) lat_uq_, ids_ + (size_t) tb * K,
                              lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, cap, (int) lat_ELL_, (int) N,
                              hit_out, cs, lat_fmt_);
+            if (v_up) stamp(l, 34, grp);        // slot 34 = the hq copy
             // The CPU pool's share: its full N-dim contributions land in the mapped rows (m_ymiss_); copy them into
             // parts_ (the GPU's own rows are zeroed there), then add the GPU's U-stage rows computed above into hit_out.
             static const bool seg_split = std::getenv("STRATA_SEG_SPLIT") != nullptr;   // the copy-segment breakdown
@@ -2487,11 +2508,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // bytes with no host CUDA call (the engine's own remedy for this path, generate.cpp:10329-10333).
                 strata::kernels::copy_bytes_from_mapped(hq_dev_, m_ymiss_ + (size_t) tb * K * N,
                                                         (size_t) cap * ((size_t) lat_ELL_ / 32 * 36), cs);
+                if (v_up) stamp(l, 35, grp);        // slot 35 = the U matvec + the hit rows
                 strata::kernels::latent_u_matvec(lat_u_ + (size_t) l * lat_dense_.u_bytes(),
                                                  (const uint8_t*) hq_dev_,
                                                  ids_ + (size_t) tb * K, lat_labels_dev_ + (size_t) l * (size_t) lat_E_,
                                                  p_dst, p_counts + 1, (int64_t) lat_E_, cap,
                                                  (int) lat_ELL_, (int) N, (int) lat_G_, parts_out, cs, lat_fmt_);
+                if (v_up) stamp(l, 35, grp);        // slot 35 = the hit rows
                 moe_hit_set(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);   // knife-0: assign, as u0 does
                 stamp(l, 23, grp);   // the hq copy + the U matvec + the hit rows are done; `copy+combine` is the combine
                 if (trace_m_ != nullptr) gpu_stamp(trace_m_, (l * kProfPer + 38) * 2, cs);   // T-TRI breadcrumb
@@ -2787,7 +2810,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
 std::string Verifier::profile_by_t_report() {
     if (!prof_on_) return std::string();
-    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "ymWait", "ymCopy", "ymAdd"};
+    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "u: gemv", "u: pool wait", "u: hqcp+matvec+hits"};
     std::string out;
     char b[96];
     for (int T = 1; T <= 8; ++T) {
@@ -3274,7 +3297,23 @@ void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
             }
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
-        const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
+        {   // STRATA_VERIFY_U_PROF: the latent U path split inside the two buckets that shared it.  The window
+            // stamps 21 -> 33 -> 34 -> 22 -> 35 -> 23 (quantize, the GPU-rows U, the pool's row wait, the hq copy
+            // + the U matvec, the hit rows), so 22 and 23 are divided out of it - the table's total is unchanged,
+            // which is the rule every slot on this page follows.
+            const double uq = gap(at(l, 33), at(l, 21));
+            const double uu = gap(at(l, 34), at(l, 33));
+            const double uw = gap(at(l, 22), at(l, 34));
+            const double uc = gap(at(l, 35), at(l, 22));
+            const double uh = gap(at(l, 23), at(l, 35));
+            if (uu > 0 || uc > 0) {
+                prof_sum_[kind][33] += uq + uu;    // "u: gemv"     (the q8_1 of H + the GPU-rows U)
+                prof_sum_[kind][34] += uw;         // "u: pool wait" (the pool's rows for this group)
+                prof_sum_[kind][35] += uc + uh;    // "u: hqcp+matvec+hits"
+                prof_sum_[kind][22] -= uq + uu + uw;
+                prof_sum_[kind][23] -= uc + uh;
+            }
+        }        const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
         if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
             prof_sum_[kind][27] += dn;      // hc-read0: norm
             prof_sum_[kind][28] += dd;      //           down

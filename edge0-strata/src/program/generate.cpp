@@ -6996,7 +6996,12 @@ int main(int argc, char** argv) {
 #endif
     if (o.pool_measure)
         o.pool_affinity = measure_pool_affinity(srcp, o.pool_workers, !o.no_host_worker, o.pool_tasks);
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
+    // STRATA_POOL_NO_PIN=1: let the OS place the pool's threads instead of the plan's core set.  The
+    // engine's own expert-row benchmark (kq_cpu_bench, unpinned) reaches ~37 GB/s with 8 threads on this
+    // box while the pinned pool measures 30-32 with 6, so placement is worth an A/B rather than an
+    // assumption: the pool's bandwidth is exactly what decode's pcie/uWait is spent on.
+    const bool pool_pin = std::getenv("STRATA_POOL_NO_PIN") == nullptr;
+    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/pool_pin, /*host_works=*/!o.no_host_worker,
                                         o.pool_affinity, o.pool_tasks);
     std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
                  o.pool_tasks ? o.pool_tasks : 3 * (pool.workers() + (pool.host_works() ? 1 : 0)),
