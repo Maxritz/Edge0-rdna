@@ -5528,6 +5528,27 @@ if (lat_du) {
                                     fused::latent_dense_d(m.lat_d_dev + (size_t) l * m.lat_d.d_bytes(), m.lat_xq, T,
                                                           (int) N, (int) G, ELL, m.xlq, m.cs, m.lat_fmt);
                             } else {
+                                // STRATA_LATENT_D_TILE=1: the D projection on the staged tile (no groups, 8
+                                // full tiles at T=512), then the same q8_1 of the f32 xl rows.  D is
+                                // 3,600 ms of the prompt via iq_mmvq; this writes the identical layout.
+                                // STRATA_LATENT_D_TILE=0 turns OFF the staged tile for D (default ON).
+                                // D is 3,643 ms of the prompt via iq_mmvq; the tile does it in 892 ms
+                                // (19.2 TFLOP in 0.892 s = 21.5 TFLOP/s, 30 % of int8 peak) because the
+                                // D GEMM has no groups and T=512 gives 8 full 64-row tiles - no padding.
+                                // Measured 191.40 -> 220.64 / 219.54 tok/s, `output` identical.
+                                static const int lat_d_tile = [] {
+                                    const char* v = std::getenv("STRATA_LATENT_D_TILE");
+                                    return (v != nullptr && v[0] == '0') ? 0 : 1;
+                                }();
+                                if (lat_d_tile > 0 && m.lat_fmt == 8 && (N % 64) == 0) {
+                                    strata::kernels::latent_d_tiled(m.lat_d_dev + (size_t) l * m.lat_d.d_bytes(),
+                                                                    m.lat_xq, T, (int) N, (int64_t) G * ELL, m.xl,
+                                                                    m.cs, m.lat_fmt);
+                                    if (const float* inv = strata::kernels::lat_gu_colscale_dev((int) l, (int) ELL))
+                                        strata::kernels::lat_colscale_rows(m.xl, (int64_t) T * G, (int) ELL, inv,
+                                                                          m.cs);
+                                    strata::kernels::quantize_q8_1_rows(m.xl, (int64_t) T * G, (int) ELL, m.xlq, m.cs);
+                                } else {
                                 strata::kernels::iq_mmvq(strata::kernels::lat_dense_fmt_to_type(m.lat_fmt),
                                         m.lat_d_dev + (size_t) l * m.lat_d.d_bytes(), m.lat_xq, m.xl, (int) N,
                                         (int) (G * ELL), T, m.cs);   // Q4DU: fmt->ggml type (8 Q8_0 / 2 Q4_0)
@@ -5536,6 +5557,7 @@ if (lat_du) {
                                 if (const float* inv = strata::kernels::lat_gu_colscale_dev((int) l, (int) ELL))
                                     strata::kernels::lat_colscale_rows(m.xl, (int64_t) T * G, (int) ELL, inv, m.cs);
                                 strata::kernels::quantize_q8_1_rows(m.xl, (int64_t) T * G, (int) ELL, m.xlq, m.cs);
+                                }
                             }
                             if (dprof) {
                                 cudaEventRecord(dev1, m.cs);

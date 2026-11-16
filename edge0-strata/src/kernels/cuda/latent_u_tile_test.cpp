@@ -124,6 +124,38 @@ int main() {
         std::printf("FAIL: the run kernel is not bit-identical (%zu of %zu)\n", bit_exact_run, ref.size());
         ok = false;
     }
+
+    // The D projection rides the same tile with rows == nullptr (one weight matrix, identity row order).
+    // Its reference is the per-row kernel with every row in group 0, which is the same arithmetic.
+    std::vector<int32_t> ids0(kRows, 0), lab0(1, 0);
+    int32_t* dids0 = nullptr;
+    int32_t* dlab0 = nullptr;
+    CK(cudaMalloc(&dids0, kRows * 4));
+    CK(cudaMalloc(&dlab0, 4));
+    CK(cudaMemcpy(dids0, ids0.data(), kRows * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dlab0, lab0.data(), 4, cudaMemcpyHostToDevice));
+    strata::kernels::latent_u_grouped(dw, da, dids0, dlab0, 1, kRows, kELL, kH, dref, nullptr, 8, 0);
+    strata::kernels::latent_d_tiled(dw, da, kRows, kELL, kH, dtile, nullptr, 8);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(ref.data(), dref, ref.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(tile.data(), dtile, tile.size() * 4, cudaMemcpyDeviceToHost));
+    double d_max_rel = 0.0, d_sum_rel = 0.0, d_dot = 0.0, d_nr = 0.0, d_nt = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double dv = std::fabs((double) tile[i] - (double) ref[i]);
+        const double rel = dv / (std::fabs((double) ref[i]) + 1e-6);
+        if (rel > d_max_rel) d_max_rel = rel;
+        d_sum_rel += rel;
+        d_dot += (double) ref[i] * (double) tile[i];
+        d_nr += (double) ref[i] * (double) ref[i];
+        d_nt += (double) tile[i] * (double) tile[i];
+    }
+    const double d_mean_rel = d_sum_rel / (double) ref.size();
+    const double d_cos = d_dot / (std::sqrt(d_nr) * std::sqrt(d_nt) + 1e-30);
+    std::printf("D (no groups): mean_rel %.3e  max_rel %.3e  cos %.9f\n", d_mean_rel, d_max_rel, d_cos);
+    if (!(d_mean_rel < 1e-5) || !(d_cos > 0.9999999)) {
+        std::printf("FAIL: the D tile (identity rows) is not numerically equal\n");
+        ok = false;
+    }
     std::printf("%s\n", ok ? "PASS latent_u_tile_test" : "FAIL latent_u_tile_test");
     return ok ? 0 : 1;
 }

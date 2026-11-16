@@ -321,7 +321,7 @@ inline size_t u_tile_smem_bytes() {
 __global__ void __launch_bounds__(kUTileThreads, 2)
 latent_u_tile_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq,
                 const int32_t* __restrict__ rows, const int32_t* __restrict__ goff, int n_groups, int ELL,
-                int H, float* __restrict__ out) {
+                int H, float* __restrict__ out, int64_t n_ident) {
     extern __shared__ __align__(16) uint8_t smem[];
     uint8_t* wst = smem;                                  // kUTileCols staged weight rows
     uint8_t* ast = smem + (size_t) kUTileCols * kUPitch;  // kUTileRows staged activation rows
@@ -330,19 +330,28 @@ latent_u_tile_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ yl
     const size_t wrowb = (size_t) (ELL / 32) * 34;   // a Q8_0 weight row {half d; int8 qs[32]}
     const size_t arowb = (size_t) (ELL / 32) * 36;   // a q8_1 activation row {half d; half s; int8 qs[32]}
 
-    // this tile's group (the rows of one label share their U slice) and its first routed row
-    int tile = blockIdx.x, g = 0;
-    for (; g < n_groups; ++g) {
-        const int cnt = goff[g + 1] - goff[g];
-        const int nt = (cnt + kUTileRows - 1) / kUTileRows;
-        if (tile < nt) break;
-        tile -= nt;
+    // this tile's group (the rows of one label share their U slice) and its first routed row.
+    // rows == nullptr means "one weight matrix for every row, in row order" - the D projection, which
+    // has no groups at all: the tile then serves tokens 0..n-1 against the one [G*ELL, N] matrix.
+    int tile = blockIdx.x, g = 0, base = 0, nrows = 0, cnt = 0;
+    if (rows == nullptr || goff == nullptr) {
+        cnt = (int) n_ident;
+        base = tile * kUTileRows;
+        if (base >= cnt) return;
+        nrows = min(kUTileRows, cnt - base);
+    } else {
+        for (; g < n_groups; ++g) {
+            const int c = goff[g + 1] - goff[g];
+            const int nt = (c + kUTileRows - 1) / kUTileRows;
+            if (tile < nt) break;
+            tile -= nt;
+        }
+        if (g >= n_groups) return;
+        cnt = goff[g + 1] - goff[g];
+        base = goff[g] + tile * kUTileRows;
+        nrows = min(kUTileRows, cnt - tile * kUTileRows);
+        if (nrows <= 0) return;
     }
-    if (g >= n_groups) return;
-    const int cnt = goff[g + 1] - goff[g];
-    const int base = goff[g] + tile * kUTileRows;
-    const int nrows = min(kUTileRows, cnt - tile * kUTileRows);
-    if (nrows <= 0) return;
 
     const int col0 = (int) blockIdx.y * kUTileCols;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, mg = lane >> 2, tig = lane & 3;
@@ -373,8 +382,9 @@ latent_u_tile_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ yl
         }
         if (tid < 2 * kUTileRows) {
             const int r = base + min(arow, nrows - 1);     // the tail's spare rows repeat the last
+            const int rr = rows != nullptr ? rows[r] : r;
             const int b = 2 * kb + ahalf;
-            const uint8_t* xp = ylq + (size_t) rows[r] * arowb + (size_t) b * 36;
+            const uint8_t* xp = ylq + (size_t) rr * arowb + (size_t) b * 36;
             uint8_t* as = ast + (size_t) arow * kUPitch + ahalf * 32;
             *(__half*) (ast + (size_t) arow * kUPitch + 64 + 2 * ahalf) = *(const __half*) xp;
             const uint8_t* qs = xp + 4;                    // q8_1's values are 4-byte aligned
@@ -429,7 +439,7 @@ latent_u_tile_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ yl
                 if (tr >= nrows) continue;
                 const int col = col0 + 64 * wf + 16 * i + mg + (q < 2 ? 0 : 8);
                 if (col >= H) continue;
-                out[(size_t) rows[base + tr] * (size_t) H + col] = acc[i][n][q];
+                out[(size_t) (rows != nullptr ? rows[base + tr] : base + tr) * (size_t) H + col] = acc[i][n][q];
             }
 }
 
@@ -481,8 +491,32 @@ void latent_u_tiled(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids,
     }
     const int64_t ntiles = (n + kUTileRows - 1) / kUTileRows + G;
     dim3 grid((unsigned) ntiles, (unsigned) ((H + kUTileCols - 1) / kUTileCols));
-    latent_u_tile_k<<<grid, kUTileThreads, u_tile_smem_bytes(), s>>>(u_q8, ylq, rows, goff, G, ELL, H, out);
+    latent_u_tile_k<<<grid, kUTileThreads, u_tile_smem_bytes(), s>>>(u_q8, ylq, rows, goff, G, ELL, H, out, n);
     u_run_ck(cudaGetLastError(), "latent_u_tile");
+}
+
+void latent_d_tiled(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, int64_t n_out, float* out,
+                    void* stream, int fmt) {
+    // The D projection: every token against the whole [G*ELL, N] dense matrix, no groups (each token
+    // uses G*ELL outputs whatever its route), so the same staged tile serves it with rows == nullptr -
+    // identity row order.  T=512 gives 8 full 64-row tiles, i.e. no padding at all, where the U side
+    // runs at 39 % fill.
+    if (M <= 0 || K <= 0 || n_out <= 0 || fmt != 8 || (K & 63) != 0) return;
+    if (w_q8 == nullptr || xq == nullptr || out == nullptr) {
+        std::fprintf(stderr, "latent_d_tiled: NULL pointer\n");
+        std::abort();
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    static bool attr = false;
+    if (!attr) {
+        u_run_ck(cudaFuncSetAttribute(latent_u_tile_k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      (int) u_tile_smem_bytes()), "d tile smem");
+        attr = true;
+    }
+    dim3 grid((unsigned) ((M + kUTileRows - 1) / kUTileRows), (unsigned) ((n_out + kUTileCols - 1) / kUTileCols));
+    latent_u_tile_k<<<grid, kUTileThreads, u_tile_smem_bytes(), s>>>(w_q8, xq, nullptr, nullptr, 1, K, (int) n_out,
+                                                                    out, M);
+    u_run_ck(cudaGetLastError(), "latent_d_tile");
 }
 
 void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,

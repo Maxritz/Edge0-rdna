@@ -292,6 +292,44 @@
 > padding.  That is a tile-shape question for that kernel (the same reason a 32-row tile lost there is
 > that it halves the compute without halving the weight staging), not another launch knob.
 
+> ### 0.7 The same tile for D, and where the prompt stands: 229 tok/s
+>
+> The D projection ("gather" in the ledger) is a plain GEMM - every token against the whole
+> [G*ELL = 19,200, N = 2,560] matrix, no groups at all - so the U tile serves it with `rows == nullptr`
+> (identity row order, one weight matrix).  At T = 512 that is 8 full 64-row tiles, i.e. **no padding**,
+> and K = 2,560 doubles the work per staged byte.  It is the fastest thing in the engine:
+>
+> | | ledger `gather` | rate | prefill |
+> |---|---|---|---|
+> | `iq_mmvq` (shipped) | 3,643 ms | 5.3 TFLOP/s | 191.40 tok/s |
+> | staged tile | **892 / 860 ms** | **21.5 TFLOP/s (30 % of int8 peak)** | **220.64 / 219.54** |
+>
+> (both arms with `STRATA_D_PROF=1`, which synchronises once a layer, so the pair is like for like;
+> the 8 tokens are identical in both.  `latent_u_tile_test` now also covers this branch against the
+> per-row kernel with every row in one group: mean_rel 4.301e-07, cos 1.000000000.)
+>
+> **The prompt at 17,690 ms / 229.29 tok/s (`final1.log`, 32 tokens identical):**
+>
+> | phase | ms | share | before today |
+> |---|---|---|---|
+> | gemm gate/up = the A stage | 5,618 | 31.8 % | 8,424 |
+> | wait copy | 3,391 | 19.2 % | 4,387 |
+> | gdn | 2,995 | 16.9 % | 3,593 |
+> | gemm down = U | 1,068 | 6.0 % | 8,954 |
+> | gather = D | 860 | 4.9 % | 3,609 |
+> | qsa 621+358, hc reads 1,104, router+shared 488, host grouping 184, rest ~140 | 2,895 | 16.4 % | |
+>
+> So the two dense latent projections together went from 12,563 ms to 1,928 ms (-85 %), and prefill from
+> 123.7 to 229.3 tok/s over the day (127 -> 142 by the launch width, 142 -> 199 by the U tile, 199 ->
+> 229 by the D tile; TTFT 32.4 -> 18.2 s; reference row 430).
+>
+> What is left is the expert path itself: A (5,618 ms, 1.71 TFLOP/s) plus the copy wait that feeds it
+> (3,391 ms).  Both are bounded by streaming ~73 GB of expert blobs per prompt - chunk 1024 raised the
+> tile fill from 39 % to 78 % and made `gemm gate/up` 70 % *worse* while the blob count rose 28 %,
+> which is what says this phase is bytes-bound and not MAC-bound.  The levers there are the expert
+> cache (VRAM is fully committed) or the CPU share (which cannot arm: the Windows commit limit leaves
+> 1.3 GiB where the share needs 4.0 GiB - a machine setting, not a code one).
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
