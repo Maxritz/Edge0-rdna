@@ -662,6 +662,30 @@
 > two shape toggles that were available (batch 32 vs 16/48, tile 32 vs 64) are now measured and neither
 > moves it.  That rewrite is the next step and it is a new kernel, not a knob.
 
+> ### 0.20 Correction: the A stage is occupancy-bound at 4 waves/SIMD, not spill-bound
+>
+> 0.19 said "the gap is occupancy: 256 VGPRs with 28 spilled".  The spill half of that is wrong, and the
+> compiler says so directly.  The 32-row-tile variant (kTileRows 32, nb0 = 8*(warp>>2), second row-half
+> disabled) compiles to:
+>
+> | | VGPRs | spills | scratch | occupancy |
+> |---|---|---|---|
+> | 64-row tile (shipped) | 256 | 28 | 196 B/lane | 4 waves/SIMD = **1 block/CU** |
+> | 32-row tile | **193** | **0** | 84 B/lane | 4 waves/SIMD = **1 block/CU** |
+>
+> Zero spills, and the engine measured that build NEUTRAL (gemm gate/up 4,991 / 4,987 against the 64-row
+> arm's 4,865-4,975).  So spills are not the cost, and the kernel is limited by having only 16 warps a CU
+> to hide the staged-load/dp4a/acc chain across ~20 barriers - i.e. by **4 waves/SIMD**, which is what one
+> 512-thread block at 193 VGPRs (or 256) gives.
+>
+> The distance to the fix is exact: 2 blocks a CU needs <=128 VGPRs (512 x 128 = 65,536 = half the
+> register file), i.e. 65 fewer than the current 193 and 128 fewer than the shipped 256.  A cap
+> (`amdgpu_num_vgpr(128)`) has already been measured and loses (234 spills, 8,424 -> 19,926 ms), so the
+> only way there is a kernel whose live state is small by construction: acc[2][4] instead of [4][2][4],
+> the two staged decode chunks held in one buffer instead of two, and the Q3_K decode writing straight to
+> shared instead of through `GuStaged` registers.  That is the rewrite, and it now has a number to hit
+> (<=128, 0 spills) rather than a hope.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
