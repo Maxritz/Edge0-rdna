@@ -116,6 +116,41 @@
 > `lat_q3k_down_test` (built for HIP in `387ce0a`) compares against a double-precision host reference and
 > **PASSES**, while reporting the shape sensitivity that motivates the work: the fused down kernel is
 > 3.59× slower than the native one at 4 entries per group and slightly faster at 200+.
+>
+> ### §0.4 The tiling redesign, done and measured — and it is a loss
+>
+> The redesign the audit asked for was implemented in `lat_q3k_down_kernel`: `kTileRows` 64 → 32,
+> `nb0 = 8*(warp>>2)` instead of 16, and `acc[4][2][4]` → `acc[4][4]` (no `n` dimension), with the smem
+> sizing and `arows` granularity following.  It did exactly what it was meant to do to the resources:
+>
+> | | before | after |
+> |---|---|---|
+> | VGPRs | 256 (cap) | **183** |
+> | VGPR spill | 53 | **0** |
+> | scratch | 120 B/lane | **0** |
+> | occupancy | 4 waves/SIMD | 5 |
+>
+> `lat_q3k_down_test` **PASSES** with it (rel_mean 1.174e-07, bit-identical to the old tile), and its
+> shape sweep moves the right way where the tile is small enough — epg 4: 2.060 → 1.844 µs/entry
+> (−10 %) — but the wrong way above it (epg 32: 0.495 → 0.682, epg 200: 0.446 → 0.674), because a
+> 32-row tile needs **two tiles** for a group larger than 32 and each tile re-stages that expert's whole
+> weight block.
+>
+> The engine then settles it, on the canonical ledger and with the baseline re-measured immediately
+> afterwards to rule out drift (the machine had drifted ~1.7 % slower by then):
+>
+> | | gate/up | down | total | prefill |
+> |---|---|---|---|---|
+> | 32-row tile | 9,777 | 9,344 | 33,701 | 120.46 tok/s |
+> | 64-row tile (reverted) | 8,420 | 9,718 | **32,828** | **123.66 tok/s** |
+>
+> So it is **−2.6 %** and was reverted in full.  The lesson is worth more than the change: the engine's
+> groups are around **50 entries** (5120 entries over ~100 groups), not the 16–26 assumed from 200
+> distinct experts, so a 64-row tile already covers a group in ONE tile and a 32-row tile doubles the
+> weight staging.  The tiling was already right; the spills were the cheaper side of the trade, and the
+> down kernel's remaining gap is not a register problem.  A larger tile (128 rows) would only pay if
+> groups grew past 64, which they do not at a 512-token chunk.
+
 
 
 
