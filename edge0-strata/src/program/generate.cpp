@@ -6939,9 +6939,28 @@ int main(int argc, char** argv) {
         if (!arena_src.ram_warning().empty())   // #633: said before the load's numbers, which it explains
             std::fprintf(stderr, "strata generate: WARNING: %s\n", arena_src.ram_warning().c_str());
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
+        {   // where the VRAM budget went: the arena's page-lock (cudaHostRegister on tens of GiB) runs just before the
+            // expert-cache sizer, and the sizer then reports far less free VRAM than the loaded weights account for.
+            // This line and the sizer's are the two ends of that gap (mem_path.cu measures the same budget for health).
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess)
+                std::fprintf(stderr, "strata generate: VRAM after the arena page-lock: %.2f GiB free of %.2f GiB\n",
+                             (double) fb / 1073741824.0, (double) tb / 1073741824.0);
+            else
+                (void) cudaGetLastError();
+        }
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
+        {   // the other end of the arena window: this line against the one before it and the cache sizer's own
+            // reading says which step of the load takes VRAM (the pin does not: capping it to 8 GiB changed nothing).
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess)
+                std::fprintf(stderr, "strata generate: VRAM after the arena load (filled): %.2f GiB free of %.2f GiB\n",
+                             (double) fb / 1073741824.0, (double) tb / 1073741824.0);
+            else
+                (void) cudaGetLastError();
+        }
         // A rate under ~0.2 GiB/s is not the hardware.  Task Scheduler / service contexts throttle this
         // read+fill about 24x (measured 0.05 vs 1.42 GiB/s for the same binary, args and cache state; the
         // scheduler's defaults - Below normal priority and a least-privilege token - were the only

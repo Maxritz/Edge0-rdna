@@ -2424,11 +2424,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
-        {
-            static std::atomic<int> br_n{0};
-            int bn = br_n.fetch_add(1, std::memory_order_relaxed);
-            if (bn < 12) std::fprintf(stderr, "BRANCH l=%lld grp=%d latent=%d ar_on=%d\n", (long long) l, (int) grp, (int) latent_, (int) ar_on());
-        }
         if (latent_) {
             static const bool u_gpu_mode = [] { const char* v = std::getenv("STRATA_LATENT_U_GPU"); return v != nullptr && std::atoi(v) != 0; }();
             if (device_plan_ && !u_gpu_mode) {   // the non-u_gpu tail ends in moe_hit_add_mapped's fused wait: no
