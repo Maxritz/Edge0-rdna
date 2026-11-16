@@ -1651,11 +1651,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q4_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
-  # Turbo3 / Rot4 KV codecs (kv_turbo.hpp): append/gather consistency, scale, distortion, byte ordering.
+  # Turbo3 / Rot4 KV codecs (kv_turbo.hpp): append/gather consistency, scale, distortion, byte ordering, and -
+  # when the vendored Kraken-x tree is present - the byte-for-byte oracle against krk::pk_quant_row. The arm is
+  # optional at configure time and SKIPS (exit 77) when absent, so a missing oracle never reads as a pass.
   add_executable(kv_turbo_parity src/kernels/kv_turbo_parity.cpp)
   target_include_directories(kv_turbo_parity PRIVATE ${_strata_gpu_include_directories})
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Kraken-x/include/krk/turbo_kv.hpp")
+    target_include_directories(kv_turbo_parity PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Kraken-x/include")
+    message(STATUS "kv_turbo_parity: Kraken-x oracle enabled (third_party/Kraken-x/include)")
+  else()
+    message(STATUS "kv_turbo_parity: Kraken-x oracle ABSENT, the codec arm will SKIP")
+  endif()
   target_link_libraries(kv_turbo_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_turbo_parity COMMAND kv_turbo_parity)
+  set_tests_properties(kv_turbo_parity PROPERTIES SKIP_RETURN_CODE 77)
   # the verify window's one-launch forms (hyper-connection write, PLE post-ops with the commit's
   # history snapshots) vs the per-token launches they replace, bitwise (GPU, synthetic, no model)
   add_executable(verify_batch_parity src/kernels/verify_batch_parity.cpp)
