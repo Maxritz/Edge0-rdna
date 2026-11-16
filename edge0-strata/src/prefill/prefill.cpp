@@ -6502,10 +6502,27 @@ if (lat_du) {
                                 static const bool uprof = std::getenv("STRATA_DU_PROF") != nullptr;
                                 cudaEvent_t uev0{}, uev1{};
                                 if (uprof) { cudaEventCreate(&uev0); cudaEventCreate(&uev1); cudaEventRecord(uev0, m.cs); }
-                                strata::kernels::latent_u_grouped(m.lat_u_dev + (size_t) l * m.lat_d.u_bytes(), m.ylq, m.ids_p,
-                                                 m.lat_labels_dev + (size_t) l * m.lat_E, m.lat_E, (int64_t) (T * K),
-                                                 (int) ELL, (int) N, m.Dm, m.cs, m.lat_fmt, (int) G);
-                                if (uprof) {
+                                // STRATA_LATENT_U_RUN=R: the weight-reuse U kernel (one block per RUN of R
+                                // routed rows sharing a label, an output column's weights in registers).
+                                // The per-row kernel re-reads a group's whole U matrix once per routed row
+                                // - 20 GB a layer at this shape, ~850 GB/s of Infinity Cache, 1.42 TFLOP/s -
+                                // so R=8 is ~4x less traffic for the same arithmetic, in the same term
+                                // order (bit-identical outputs).  0 keeps the per-row kernel.
+                                static const int lat_u_run = [] {
+                                    const char* v = std::getenv("STRATA_LATENT_U_RUN");
+                                    const int r = v != nullptr ? std::atoi(v) : 0;
+                                    return r > 0 ? r : 0;
+                                }();
+                                if (lat_u_run > 0 && m.lat_fmt == 8 && m.lat_scratch != nullptr)
+                                    strata::kernels::latent_u_runs(
+                                        m.lat_u_dev + (size_t) l * m.lat_d.u_bytes(), m.ylq, m.ids_p,
+                                        m.lat_labels_dev + (size_t) l * m.lat_E, m.lat_E, (int64_t) (T * K), (int) ELL,
+                                        (int) N, m.Dm, m.lat_scratch, m.cs, m.lat_fmt, lat_u_run, (int) G);
+                                else
+                                    strata::kernels::latent_u_grouped(
+                                        m.lat_u_dev + (size_t) l * m.lat_d.u_bytes(), m.ylq, m.ids_p,
+                                        m.lat_labels_dev + (size_t) l * m.lat_E, m.lat_E, (int64_t) (T * K), (int) ELL,
+                                        (int) N, m.Dm, m.cs, m.lat_fmt, (int) G);                                if (uprof) {
                                     cudaEventRecord(uev1, m.cs);
                                     cudaEventSynchronize(uev1);
                                     float ums = 0.0f;
@@ -6516,6 +6533,13 @@ if (lat_du) {
                                     cudaEventDestroy(uev1);
                                 }
                             }
+                            // The ledger's phase names in THIS branch are one ahead of the work: kPfGemmGU opens
+                            // the whole A stage (the fused call runs gate/up + SwiGLU + down in one host call), and
+                            // kPfGemmD - printed as "gemm down" - opens at quantize_q8_1(H), so it is the U
+                            // projection, not the down kernel.  Closing it here makes "gemm down" mean exactly
+                            // q8_1(H) + U, which is what it was always being read as, and leaves the tail (the
+                            // combine and the hyper-connection write) on kPfCombine where it belongs.
+                            pt.mark(kPfCombine, m.cs);
                         } else
                         // pf_wmma: this layer's groups on the FP16 tensor-core tiles (single GPU, native pack, Q2_0 / IQ4_NL down)
                         {

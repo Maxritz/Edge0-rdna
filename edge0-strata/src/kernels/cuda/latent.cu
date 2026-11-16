@@ -1,4 +1,4 @@
-﻿// src/kernels/cuda/latent.cu - the latent MoE's engine-side kernels (new file).
+// src/kernels/cuda/latent.cu - the latent MoE's engine-side kernels (new file).
 //
 // Bit-identical dot to iq_mmvq(8)'s vec_dot_q8_0_q8_1: per block
 //   acc += dx * dw * sum_k(xs[k] * ws[k])
@@ -9,7 +9,9 @@
 #include "strata/kernels/latent.hpp"
 #include "strata/kernels/dp4a.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -153,6 +155,141 @@ __global__ void latent_u_walk_k(const uint8_t* __restrict__ u_q8, const uint8_t*
         for (int off = 16; off > 0; off >>= 1) facc += __shfl_down_sync(0xffffffffu, facc, off);
         if (lane == 0) o[h] = facc;
     }
+}
+
+// ---- the weight-reuse U kernel ------------------------------------------------------------------
+//
+// latent_u_k's blocks are (one routed row, 8 output columns): each block reads its 8 weight rows (8 x
+// 1360 B = 10.9 KB) and every ROW of a group re-reads that group's whole U matrix, so a layer reads
+// ~20 GB through the Infinity Cache to produce 5120 x 2560 outputs (measured: 23.7 ms a layer at an
+// ~850 GB/s IC rate, 1.42 TFLOP/s, ~2 % of the card's int8 peak).  The fix is what the header of
+// latent_u_grouped has always described: keep an output column's weights in REGISTERS and reuse them
+// over the run of routed rows that share its label.
+//
+// Per (run, h) the lane's terms and their order are latent_u_k's, and the reduction is the same tree,
+// so every output is bit-identical to the per-row kernel (the test compares with memcmp).
+//
+// The run length matters in both directions: long runs cut the weight traffic but starve the device of
+// independent blocks, which is why the "scan the whole group" form measured 8 % slower in the engine.
+// R is the knob (STRATA_LATENT_U_RUN); the label-bucketed row list is built on the device, in the
+// caller's scratch, so no per-layer host upload is needed.
+__global__ void lat_u_run_count_k(const int32_t* __restrict__ ids, const int32_t* __restrict__ labels,
+                                 int64_t n, int E, int G, int32_t* __restrict__ goff) {
+    for (int64_t p = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; p < n;
+         p += (int64_t) blockDim.x * gridDim.x) {
+        const int32_t e = ids[p];
+        const int g = (e >= 0 && e < E) ? labels[e] : 0;
+        atomicAdd(&goff[g], 1);
+    }
+}
+
+// counts -> the group prefix (one thread: G <= 1024 and this runs once a layer)
+__global__ void lat_u_run_off_k(int32_t* __restrict__ goff, int G) {
+    if (threadIdx.x != 0) return;
+    int s = 0;
+    for (int g = 0; g < G; ++g) {
+        const int c = goff[g];
+        goff[g] = s;
+        s += c;
+    }
+    goff[G] = s;
+}
+
+__global__ void lat_u_run_place_k(const int32_t* __restrict__ ids, const int32_t* __restrict__ labels,
+                                  int64_t n, int E, int32_t* __restrict__ cur, int32_t* __restrict__ rows) {
+    for (int64_t p = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; p < n;
+         p += (int64_t) blockDim.x * gridDim.x) {
+        const int32_t e = ids[p];
+        const int g = (e >= 0 && e < E) ? labels[e] : 0;
+        rows[atomicAdd(&cur[g], 1)] = (int32_t) p;
+    }
+}
+
+// One block per (run, 8 output columns).  `goff` is the group prefix; a run is up to R consecutive
+// rows of one group's list.  The block resolves its own group from its run index, so no run table
+// has to be built: ceil(n / R) + G bounds the launch (each group pads one partial run).
+__global__ void latent_u_run_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq,
+                               const int32_t* __restrict__ rows, const int32_t* __restrict__ goff,
+                               int n_groups, int ELL, int H, float* __restrict__ out, int R) {
+    const int lane = threadIdx.x & 31;
+    const int h = (int) (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5));
+    if (h >= H) return;
+    int run = blockIdx.x, g = 0;
+    for (; g < n_groups; ++g) {
+        const int cnt = goff[g + 1] - goff[g];
+        const int nruns = (cnt + R - 1) / R;
+        if (run < nruns) break;
+        run -= nruns;
+    }
+    if (g >= n_groups) return;
+    const int cnt = goff[g + 1] - goff[g];
+    const int base = goff[g] + run * R;
+    const int nr = min(R, cnt - run * R);
+    if (nr <= 0) return;
+
+    const int nb = ELL / 32;
+    const int wrow = nb * 34;                       // Q8_0: {half d; int8 qs[32]} a block
+    const uint8_t* wb = u_q8 + (size_t) g * (size_t) H * (size_t) wrow + (size_t) h * (size_t) wrow;
+    // this lane's share of the weight row, in registers: latent_u_k's own term order
+    float wdw[16];
+    int wword[16], tb[16], tj[16];
+    int nt = 0;
+    for (int wi = lane; wi < nb * 8; wi += 32, ++nt) {
+        const int b = wi >> 3, j = (wi & 7) * 4;
+        tb[nt] = b;
+        tj[nt] = j;
+        wdw[nt] = __half2float(*(const __half*) (wb + (size_t) b * 34));
+        wword[nt] = latent_ld4_i8(wb + (size_t) b * 34 + 2 + j);
+    }
+    for (int i = 0; i < nr; ++i) {
+        const int r = rows[base + i];
+        const uint8_t* x = ylq + (size_t) r * (size_t) (nb * 36);
+        float facc = 0.0f;
+        for (int t = 0; t < nt; ++t) {
+            const int b = tb[t];
+            const float dx = __half2float(*(const __half*) (x + (size_t) b * 36));
+            const int xw = *(const int*) (x + (size_t) b * 36 + 4 + tj[t]);
+            facc += dx * wdw[t] * (float) __dp4a(xw, wword[t], 0);
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) facc += __shfl_down_sync(0xffffffffu, facc, off);
+        if (lane == 0) out[(size_t) r * (size_t) H + h] = facc;
+    }
+}
+
+namespace {
+inline void u_run_ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "latent_u_runs: %s: %s\n", what, cudaGetErrorString(e));
+        std::abort();
+    }
+}
+}  // namespace
+
+void latent_u_runs(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
+                   int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
+                   int R, int G) {
+    if (n <= 0 || R <= 0 || fmt != 8 || G <= 0) return;
+    if (u_q8 == nullptr || ylq == nullptr || ids == nullptr || labels_dev == nullptr || out == nullptr ||
+        scratch == nullptr) {
+        std::fprintf(stderr, "latent_u_runs: NULL pointer (scratch is required for the run tables)\n");
+        std::abort();
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    int32_t* goff = (int32_t*) scratch;                          // [G + 1]
+    int32_t* cur = (int32_t*) ((uint8_t*) scratch + 256);        // [G]
+    int32_t* rows = (int32_t*) ((uint8_t*) scratch + 1024);      // [n]
+    u_run_ck(cudaMemsetAsync(goff, 0, (size_t) (G + 1) * 4, s), "u run tables memset");
+    const int nb_ = (int) std::min<int64_t>((n + 255) / 256, 256);
+    lat_u_run_count_k<<<nb_, 256, 0, s>>>(ids, labels_dev, n, (int) E, G, goff);
+    lat_u_run_off_k<<<1, 32, 0, s>>>(goff, G);
+    u_run_ck(cudaMemcpyAsync(cur, goff, (size_t) G * 4, cudaMemcpyDeviceToDevice, s), "u run cursors");
+    lat_u_run_place_k<<<nb_, 256, 0, s>>>(ids, labels_dev, n, (int) E, cur, rows);
+    const int warps = 8;
+    const int64_t nrun = (n + R - 1) / R + G;
+    dim3 grid((unsigned) nrun, (unsigned) ((H + warps - 1) / warps));
+    latent_u_run_k<<<grid, warps * 32, 0, s>>>(u_q8, ylq, rows, goff, G, ELL, H, out, R);
+    u_run_ck(cudaGetLastError(), "latent_u_run");
 }
 
 void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,

@@ -25,6 +25,16 @@ void latent_u_grouped(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* 
                       int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt = 8,
                       int n_groups = 0);
 
+/// The weight-reuse U projection (latent_u_grouped's documented `n_groups` variant, made explicit and
+/// tunable): the same outputs, bit for bit, from blocks that hold one output column's weights in
+/// registers and reuse them over a RUN of R routed rows sharing that column's label.  The per-row kernel
+/// re-reads a group's whole U matrix once per routed row (~20 GB a layer at the engine's shape); R = 8
+/// cuts that ~4x while keeping ~200k independent blocks.  `scratch` is a device buffer of at least
+/// 1024 + 4*(G) + 4*n bytes (the label-bucketed row list, built here so no host upload is needed).
+void latent_u_runs(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* ids, const int32_t* labels_dev,
+                   int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
+                   int R, int G);
+
 /// knife-0 (STRATA_LATENT_U_GPU): the CPU share's U computed on the GPU into parts_ directly.
 /// One block per routed entry; a GPU row (r in dst[0..count)) copies hit_out, a CPU row computes U[labels[ids[r]]] . hq[r].
 void latent_u_matvec(const uint8_t* u_q8, const uint8_t* hq, const int32_t* ids, const int32_t* labels_dev,

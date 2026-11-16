@@ -79,8 +79,8 @@
 >
 > | phase | ms | share |
 > |---|---|---|
-> | gemm down (latent expert) | 8,954 | 31.3 % |
-> | gemm gate/up (latent expert) | 5,817 | 20.4 % |
+> | gemm down **= U projection** (q8_1 of H + latent_u_grouped) | 8,954 | 31.3 % |
+> | gemm gate/up **= the whole A stage** (the fused call runs gu + SwiGLU + down) | 5,817 | 20.4 % |
 > | gather | 3,609 | 12.6 % |
 > | wait copy | 3,442 | 12.0 % |
 > | gdn (conv+gates+recurrence+out) | 3,606 | 12.6 % |
@@ -179,9 +179,64 @@
 > down kernel's remaining gap is not a register problem.  A larger tile (128 rows) would only pay if
 > groups grew past 64, which they do not at a 512-token chunk.
 
-
-
-
+> ### 0.5 What "gemm down" actually is, and where the prompt now goes (measured)
+>
+> The fused latent path runs gate/up + SwiGLU + down inside ONE host call, and the ledger's marks were laid
+> out for the older, separate-kernel path, so two of its phase names were one ahead of the work:
+> `gemm gate/up` opens the whole A stage, and `gemm down` - the largest row in the table - opens at
+> `quantize_q8_1(H)` and is the **U projection**.  Three independent measurements say so:
+>
+> | evidence | result |
+> |---|---|
+> | `STRATA_DU_PROF=1` (the U kernel's own events) | 23.7 ms a layer; 23.7 x 48 x 8 = **9,101 ms** against the ledger's 8,954 |
+> | `STRATA_LATENT_U_WALK=1` (a *different* U kernel) | U 23.7 -> 29.2 ms a layer, ledger `gemm down` 8,954 -> **11,349 ms** (+27 % against +23 %) |
+> | `STRATA_LATENT_U_RUN=16` (a third U kernel) | U -> 27.9 ms, `gemm down` -> 11,184 ms (and R=4: 13,231) |
+>
+> A mark has been added after the U launch (`kPfCombine`) so the bucket is bounded exactly from now on.
+>
+> **Where the 28.5 s goes, in FLOP terms.**  Per routed entry the A stage moves 2.46 M MAC (gate/up 1.64 M
+> + down 0.82 M), U 3.28 M (1280 -> 2560), D 1280 x 19200 per token; 1.95 M entries and 4,063 tokens in
+> this prompt:
+>
+> | stage | TFLOP | ms | TFLOP/s | % of int8 peak (~73) |
+> |---|---|---|---|---|
+> | A (gu + SwiGLU + down) | 9.6 | 5,817 | 1.65 | 2.3 % |
+> | U | 12.8 | 8,954 | 1.42 | 1.9 % |
+> | D (`iq_mmvq`) | 19.3 | 3,609 | 2.68 | 3.7 % |
+> | **whole prompt** | **41.7** | **28,568** | **1.46** | **2 %** |
+>
+> So all three expert-path stages are ~2-4 % of the card's int8 throughput, and D - the ggml-optimised
+> `iq_mmvq`, not this engine's code - is the fastest of them at 2.68 TFLOP/s.  That is the realistic
+> ceiling band for this class of kernel on gfx1031: the engine's own best tiled kernel,
+> `lat_q3k_down`, reaches 1.65 T-MAC/s = 3.3 TFLOP/s at large groups.
+>
+> **The U weight-reuse redesign, implemented and measured - it loses.**  The obvious hypothesis is that U
+> is Infinity-Cache-bandwidth-bound: the per-row kernel re-reads a group's whole U matrix once per routed
+> row (~20 GB a layer at ~850 GB/s, above DRAM, i.e. an IC-bound figure).  `latent_u_runs`
+> (`STRATA_LATENT_U_RUN=R`) makes one block own a RUN of R routed rows that share a label and holds an
+> output column's weights in registers, cutting that traffic ~4x at R=8.  It is **bit-identical** (the
+> same terms in the same order, the same reduction tree; all arms produced
+> `248046 198 248045 74455 198 248068 198 760`) and its resources are clean (77 VGPRs, 0 spills,
+> 12 waves/SIMD) - and it is slower at every run length:
+>
+> | U kernel | ms a layer | prefill |
+> |---|---|---|
+> | per-row (shipped) | **23.7** | **142.07 tok/s** |
+> | reuse, R=4 | 33.8 | 124.41 |
+> | reuse, R=8 | 29.8 | 130.52 |
+> | reuse, R=16 | 27.9 | 132.79 |
+> | reuse, R=32 | 26.9 | 135.46 |
+> | row-walk (`U_WALK=1`, the older alternative) | 29.2 | 132.23 |
+>
+> Traffic was never the limit: U is **instruction-throughput-bound**.  Its inner term costs ~9 instructions
+> per 4 MAC (a 4-byte activation word, two 2-byte scale loads, the weight word built from two unaligned
+> ushorts, one `__dp4a`, two multiplies), i.e. ~0.5 MAC per issue slot against a dp4a peak of 128.  Cutting
+> the bytes cannot help that; only a staged, 16-byte-aligned layout with the scale hoisted per 32-value
+> block can - which is what `lat_q3k_down` does, and what its 3.3 TFLOP/s ceiling buys (U 9.1 s -> ~4 s at
+> that rate, ~16 % of the prompt).  That is the next engineering step, and it is a kernel, not a knob.
+>
+> The reuse kernel and the walk switch are kept behind their env flags, default off, because a measured
+> negative is worth more than a deleted one.
 
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
