@@ -2607,6 +2607,21 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_mmq_parity COMMAND hip_prefill_mmq_parity)
     set_tests_properties(hip_prefill_mmq_parity PROPERTIES TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_mmq_parity)
+
+    # The latent Q3_K A-stage kernels' parity tests (lat_q3k_gu_test / lat_q3k_down_test /
+    # lat_q3k_fused_test).  Their sources are already built into this arm's strata_mmq (line 2561), but the
+    # executables were only ever added under STRATA_ENABLE_CUDA - so the two kernels that are 54.6% of a
+    # prompt (gemm gate/up 8.4 s + gemm down 9.2 s of 32.3 s) had NO parity test on the platform they ship
+    # on, which is why any tiling or register change to them would have been unverifiable.  Same sources as
+    # the CUDA arm, gated on the same double-precision host reference.
+    foreach(_lat_t lat_q3k_gu_test lat_q3k_down_test lat_q3k_fused_test)
+      add_executable(${_lat_t} src/prefill/${_lat_t}.cpp)
+      target_include_directories(${_lat_t} PRIVATE include "${_strata_gg}/include")
+      target_link_libraries(${_lat_t} PRIVATE strata_mmq strata_kernels strata_kernels_cpu ggml-base strata_hip_runtime)
+      add_test(NAME ${_lat_t} COMMAND ${_lat_t})
+      set_tests_properties(${_lat_t} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      list(APPEND _strata_hip_tests ${_lat_t})
+    endforeach()
   endif()
   if(STRATA_ENABLE_HIP)
     # The latent-MoE layer of the Edge0 packs (the D/U file mapping and its mmap, the latent layer): the CUDA
