@@ -481,6 +481,27 @@
 >    structure without its 64-row tile.  Realistic target the DRAM floor, 6.5-8.3 ms (+13-16 % decode).
 > 3. at T = 4 all 15 labels are needed (40 routed entries), so there is no routed-subset saving to take.
 
+> ### 0.13 Deeper speculation does not amortise D (and the window stays T4 anyway)
+>
+> Since the D stage costs 52 MB a layer *per window*, a wider speculative window would halve its cost per
+> token.  Measured, `--spec 4 / 6 / 8`, alternating:
+>
+> | spec | decode | drafts accepted | tokens a round | verifier window |
+> |---|---|---|---|---|
+> | 4 | **25.21 / 25.60 tok/s** | 19 of 26 (0.73) | 2.46 | T4 |
+> | 6 | 21.81 | 19 of 36 (0.53) | 2.46 | T4 |
+> | 8 | 20.26 / 19.00 | 19 of 46 (0.41) | 2.46 | T4 |
+>
+> The window never grows past T4 - the drafter proposes ~2.5 tokens a round, so the extra depth is drafted
+> and rejected, which is pure cost.  The engine's own `--spec 4` is the operating point, and D's bytes
+> cannot be amortised this way.
+>
+> So decode's remaining options are both structural: a **decode-shaped D kernel** (M = 4 rows, no padding,
+> 16-byte staging, deep MLP - the tile's structure without its 64-row tile, target 6.5-8.3 ms = +13-16 %),
+> or **fewer D bytes** (Q4_0 instead of Q8_0: ~2x on 21.46 ms and ~1.2 GB of VRAM back, but it changes the
+> model's arithmetic and there is no KL/NLL gate to accept it).  Every parameter-level lever around decode
+> has now been measured: window depth, pcie split, pool width, pool placement, and three U shapes.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
