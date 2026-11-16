@@ -6483,9 +6483,26 @@ if (lat_du) {
                                                       (int) G, unw, (int64_t) (T * K), (int) ELL, (int) N, m.Dm, m.cs,
                                                       m.lat_fmt);
                             } else {
+                                // STRATA_DU_PROF=1: the U projection's own time.  The component table charges the
+                                // D projection, this, the q8_1 of H and the combine to two rows named "gather" and
+                                // "gemm down", which is how 23.5 s of the trace sat without an owner; these event
+                                // pairs name it per layer.
+                                static const bool uprof = std::getenv("STRATA_DU_PROF") != nullptr;
+                                cudaEvent_t uev0{}, uev1{};
+                                if (uprof) { cudaEventCreate(&uev0); cudaEventCreate(&uev1); cudaEventRecord(uev0, m.cs); }
                                 strata::kernels::latent_u_grouped(m.lat_u_dev + (size_t) l * m.lat_d.u_bytes(), m.ylq, m.ids_p,
                                                  m.lat_labels_dev + (size_t) l * m.lat_E, m.lat_E, (int64_t) (T * K),
-                                                 (int) ELL, (int) N, m.Dm, m.cs, m.lat_fmt);
+                                                 (int) ELL, (int) N, m.Dm, m.cs, m.lat_fmt, (int) G);
+                                if (uprof) {
+                                    cudaEventRecord(uev1, m.cs);
+                                    cudaEventSynchronize(uev1);
+                                    float ums = 0.0f;
+                                    cudaEventElapsedTime(&ums, uev0, uev1);
+                                    std::fprintf(stderr, "[uprof] L%02d T=%lld rows=%lld H=%d U=%.2f ms\n", (int) l,
+                                                 (long long) T, (long long) (T * K), (int) N, (double) ums);
+                                    cudaEventDestroy(uev0);
+                                    cudaEventDestroy(uev1);
+                                }
                             }
                         } else
                         // pf_wmma: this layer's groups on the FP16 tensor-core tiles (single GPU, native pack, Q2_0 / IQ4_NL down)

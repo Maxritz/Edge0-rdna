@@ -965,8 +965,15 @@ template<int TY> inline constexpr bool kSplit = false;
 // The K-quant / Q8_0 / Q5_1 formats (UD-Q4_K_XL) have Split traits (SplitK below), but their decode-once multi kernels
 // run only with STRATA_KQ_SPLIT=1 until the A/B on the measured cards decides (bitwise the old kernels either way).
 template<int TY> inline constexpr bool kq_type = (TY == 12 || TY == 13 || TY == 8);   // not Q5_1: its Split apply is not bitwise the old dot (FMA contraction), see notes-151-amd
-inline bool g_kq_split = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); return v != nullptr && v[0] == '1'; }();
-template<int TY> inline bool split_off() { return kq_type<TY> && !g_kq_split; }
+// STRATA_KQ_SPLIT=0: off for every format.  Unset: Q8_0 only.  =1: every kq_type.
+// Measured on gfx1031, 4K prompt (4,063 tokens), same session, bit-identical tokens:
+//   Q8_0 per-column 51,644 ms / 78.67 tok/s  ->  Q8_0 decode-once 45,863 ms / 88.59 tok/s  (-11.2 %),
+// the D stage being the one caller with ncols > 1.  Q4_K/Q5_K stay opt-in until the same A/B runs for them.
+inline int g_kq_split = [] {
+    const char* v = std::getenv("STRATA_KQ_SPLIT");
+    return v == nullptr ? 1 : (v[0] != '0' ? 2 : 0);
+}();
+template<int TY> inline bool split_off() { return kq_type<TY> && !(TY == 8 ? g_kq_split >= 1 : g_kq_split >= 2); }
 template<int TY> inline constexpr bool kTqType = (TY == 144 || TY == 145 || TY == 146);
 // the trellis types stage their int8 codebook (4 KB) too, but only where it pays: tq_stage_on() below (compute capability 6.0)
 template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 21 || TY == 22 || TY == 29 || kTqType<TY>);

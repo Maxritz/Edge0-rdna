@@ -18,8 +18,12 @@ void latent_plan_rows(int32_t* tok, const int32_t* dst, const int32_t* counts, c
 
 /// One block per routed entry (cap_entries of them): quantized yl rows (q8_1) times the route's
 /// U[group] slice (Q8_0 or Q4_0 rows [G*H, ELL], fmt 8 or 4); the H-wide result lands at out[r*H .. r*H+H].
+/// `n_groups` (= lat_G, the distinct U matrices a layer has) switches to the weight-reuse kernel, which
+/// keeps an output column's weights in registers and reuses them over every routed row of that group;
+/// 0 keeps the per-row kernel (verify.cpp's and the parity harness's behaviour is then unchanged).
 void latent_u_grouped(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* ids, const int32_t* labels_dev,
-                      int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt = 8);
+                      int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt = 8,
+                      int n_groups = 0);
 
 /// knife-0 (STRATA_LATENT_U_GPU): the CPU share's U computed on the GPU into parts_ directly.
 /// One block per routed entry; a GPU row (r in dst[0..count)) copies hit_out, a CPU row computes U[labels[ids[r]]] . hq[r].

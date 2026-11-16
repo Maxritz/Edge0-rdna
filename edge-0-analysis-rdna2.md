@@ -98,14 +98,38 @@ RDNA2 has **no matrix cores**. Any `mma.sync` path is CUDA-only by definition, w
 
 Reproduce: `bench4k.bat`, or `strata` with `STRATA_PREFILL_TIMING=1`.
 
-Two independent readings of the same run agree, which is why the numbers are trusted:* `tr_512.log` (chunk 512, NPROF on): `latfq3kprof: calls=64,080 ms=10,742 entries=1,948,496 us/entry=5.51` — i.e. the A-stage kernels themselves are **10.7 s** of the 65 s perturbed wall, while the *component table of the same run* charges `gemm gate/up 21,658 + gemm down 12,691 + gather 11,095 = 45.4 s`. **The gap is per-launch overhead, not arithmetic.**
+Two independent readings of the same run agree, which is why the numbers are trusted:
+
+* `tr_512.log` (chunk 512, NPROF on): `latfq3kprof: calls=64,080 ms=10,742 entries=1,948,496 us/entry=5.51` — i.e. the A-stage kernels themselves are **10.7 s** of the 65 s perturbed wall, while the *component table of the same run* charges `gemm gate/up 21,658 + gemm down 12,691 + gather 11,095 = 45.4 s`. **The gap is per-launch overhead, not arithmetic.**
 * `tr_2048.log`: `latfq3kprof ... us/entry=3.6–3.7` at ~90 entries/call, against `5.51` at 30 entries/call (chunk 512) — the per-entry cost falls as the group grows, which is the occupancy signature of a launch that is too small.
 
 Decode, from the repo's own `STRATA_VERIFY_PROFILE` table (4K, served window T=4, 95.99 ms/round): `copy+combine` 40.22 ms (41.1 %), `hc1 up` (the latent D stage) 24.27 ms (24.8 %), everything else 34.2 % with no single item above 4 %.
 
-### 4.1 The ranking **after** the landed A-stage fix (`pf_now.log`, same prompt, shipped path)
+### 4.2 Why TTFT is what it is: the ledger after the three fixes (`pf_why.log`, 46,412 ms)
 
-The trace above is the pre-fix path. Re-running it with the fused in-place A stage and batched launches moves the ranking — and not to the item the earlier audit ranked first:
+One `(layer, chunk)` pass happens **384 times** (48 layers × 8 chunks of 512). Every per-layer cost below is therefore paid 384 times, and that multiplier is the first thing to understand about TTFT.
+
+| stage | dev ms | % | work it moves | effective rate | measured cause |
+|---|---|---|---|---|---|
+| **U projection** (`gemm down`) | **12,815** | **27.6 %** | 384 × 33.6 GFLOP = 1.61 TFLOP; 805 GB read | 128 GFLOP/s, 64 GB/s | F15 — one warp per scalar output, 32→1 reduce per value; the register-reuse variant was measured **slower** |
+| **A stage** (`gemm gate/up`) | **9,585** | **20.7 %** | 1.95 M (token,expert) × 4.92 MFLOP = 9.6 TFLOP | 1.0 TFLOP/s | F1 (fixed: batch 4, 4,864 launches/layer-chunk) — still 25 launches per pass at `blocks/cu = 1` |
+| **D projection** (`gather`) | **5,442** | **11.7 %** | 384 × 25.5 GFLOP = 1.23 TFLOP | 237 GFLOP/s | F14 (fixed: `KQ_SPLIT` was selecting the per-column kernel; −51 % of this row) |
+| gdn (attention + recurrence, 36 layers) | 4,876 | 10.5 % | | | |
+| **wait copy** | **4,243** | **9.1 %** | the staging ring | | host 18,359 ms in the same phase |
+| hc (5 phases) | 3,525 | 7.6 % | | | |
+| qsa proj + attn (12 layers) | 2,386 | 5.1 % | | | |
+| router+shared | 1,040 | 2.2 % | | | |
+| combine / ple / gdn extras / embed | ~2,500 | 5.4 % | | | |
+| host grouping | 228 (dev) | 0.5 % | | | **13,071 host** |
+| **wall** | **46,412** | | **≈ 12.5 TFLOP** | **269 GFLOP/s end to end** | ~1 % of this card |
+
+**Read the bottom row.** The prompt is 12.5 TFLOP of arithmetic on a card that does ~26 TFLOP/s fp16 and several times that in int8. TTFT is 46 s because the three projections that hold 60 % of that arithmetic execute at **128 GFLOP/s, 1.0 TFLOP/s and 237 GFLOP/s** — each for a *different, measured* reason, and none of them for lack of a kernel: each had a faster variant in the tree (batched launches, the decode-once Q8_0 kernel, the weight-reuse U kernel) that was either gated off, unreachable, or — for U — measurably worse.
+
+**Where the remaining time is not:** the expert stream. 63.6 k blobs = 74 GB cross PCIe per prompt, and `wait copy` is 9.1 % — the link is not the wall. Neither is the expert cache (2.8 % residency) for prefill. The wall is three dense projections plus 36 attention layers.
+
+### 4.1 The intermediate ranking, before the D-stage fix (kept for the before/after)
+
+The trace above is the pre-fix path. Re-running it with the fused in-place A stage and batched launches moves the ranking - and not to the item the earlier audit ranked first:
 
 | component | marks | dev ms | % dev | what it actually is |
 |---|---|---|---|---|
@@ -389,25 +413,41 @@ const size_t lookahead = group_resident ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) :
 
 ---
 
-### F14 — P1 / CONFIRMED — the latent **D stage** runs a matvec kernel over the prompt's tokens (11.1 s, 21.2 %)
+### F14 — P1 / CONFIRMED — the latent **D stage** runs at 111 GFLOP/s (11.1 s, 21.2 %)
 
-**Where:** `prefill.cpp:5502-5521`, `pt.mark(kPfGather)` then `strata::kernels::iq_mmvq(...)` — the `gather` row of the phase table is this, not the expert gather.
+**Where:** `prefill.cpp:5502-5521`, `pt.mark(kPfGather)` then `strata::kernels::iq_mmvq(..., ncols = T, ...)` — the `gather` row of the phase table is this, not the expert gather.
 
-**Observed (current shipped path, `pf_now.log`, 52,163 ms wall):** `gather` = **11,076 ms over 384 marks** = 28.8 ms per (layer, chunk). That is 512 tokens × `iq_mmvq` of D (`N` → `G·ELL` = 8·640 outputs) — llama.cpp's **matrix-vector** kernel, called once per token, so each token re-reads the whole D matrix. 512 × 4,864 × 5,120 × 2 = 25.5 GFLOP per layer, 1.2 TFLOP per prompt at **110 GFLOP/s**.
+**Observed (current shipped path, `pf_now.log`, 52,163 ms wall):** `gather` = **11,076 ms over 384 marks** = 28.8 ms per (layer, chunk) for 512 tokens × the D matrix (4864 → `G·ELL` = 5120). That is 25.5 GFLOP per layer, **1.23 TFLOP per prompt at 111 GFLOP/s**.
 
-**Why it is slow:** a matvec reads `K·N` weight bytes for `n=1` token (intensity ≈ 0.5 FLOP/byte). The prompt has 512 tokens per chunk that all share the same D matrix; a GEMM tiles 8–32 of them so each weight byte is used 8–32 times. llama.cpp ships *both* kernels (`vec_dot` for n=1, the tiled GEMM for n>1); **this port kept only the matvec** and calls it n times.
+**Correction to the first version of this finding (kept visible on purpose):** I wrote that it "calls a matvec once per token so each token re-reads the whole D matrix". **That is half right, for a reason the code hides.** `iq_mmvq` *does* have a decode-once multi-column kernel (`mmvq_multi_kernel<NC=8>`, `iq_kernels.cu:1937-1970`, "bitwise equal" per column at `:958`, parity-checked by `iq_multi_parity`) — but for Q8_0 it is **not selected**: `split_off<8>()` is true because `kq_type<8>` is in the set whose multi kernels "run only with `STRATA_KQ_SPLIT=1` until the A/B on the measured cards decides" (`:965-969`). No such A/B had been run on gfx1031, so the per-column `mmvq_kernel` (`:946-949`, `for c in 0..ncols` re-reading the weight row each time) was the shipped path — which is exactly the "matvec called per token" behaviour, arrived at through a *dispatch flag* rather than a missing kernel.
 
-**Fix:** route D through the int8 matrix-matrix path the engine already has (`mmq::Product` / `run_p`, used by the A stage) or a tiled dp4a GEMM. **Caveat: the partial-sum order changes**, so this is numerically equivalent within fp32, not necessarily bit-identical → needs the quality gate of F16/T14.
+**The A/B, run:** `STRATA_KQ_SPLIT=1`
 
-### F15 — P1 / CONFIRMED — the latent **U stage** re-reads each expert's matrix once per routed row (12.5 s, 23.9 %)
+| arm | prefill | tok/s | tokens |
+|---|---|---|---|
+| per-column (`KQ_SPLIT=0`) | 51,644 ms | 78.67 | canonical list |
+| **decode-once (`KQ_SPLIT=1`)** | **45,863 ms** | **88.59** | **identical** |
 
-**Where:** `src/kernels/cuda/latent.cu:70-105` (`latent_u_k`), launched by `latent_u_grouped` at `:107-122`; called from `prefill.cpp:6486` under `pt.mark(kPfGemmD)` — the `gemm down` row of the table.
+**−11.2 %, bit-identical.** The phase table confirms it in the right place: `gather` 11,076 → **5,442 ms** (−51 %) while every other row held. `STRATA_KQ_SPLIT` now defaults to Q8_0-on, all-off with `=0`, all-on with `=1`; the K-quant formats (Q4_K/Q5_K) stay opt-in until the same A/B runs for them.
 
-**Observed:** `gemm down` = **12,464 ms over 384 marks** = 32.5 ms per (layer, chunk). The kernel is `grid = (cap_entries, H/8)`, one block per (routed row, 8 output columns), **each warp computing one scalar `o[h]`** with a 32-lane `__shfl_down` tree over the 640-element reduction. Weight bytes read per layer: `rows × H × ELL` = 5,120 × 4,864 × 640 B = **15.9 GB**, 765 GB per prompt — because the same expert's 640×H matrix is re-read **once per routed row** (~30 times).
+**What is left of the D stage (~5.4 s at 237 GFLOP/s):** the same treatment again — `mmvq_multi_kernel<8,8>` is 35 VGPRs / 0 spills, so it is not register-bound; the remaining 2× needs the occupancy/instruction-mix read (its `NC` could go 8 → 16, and the Q8_0 `Split::load`/`apply` could drop the per-block `half2float` of `dw`). → T15.
 
-**Why it is slow:** the rows of one expert are already bucketed (`latent_dense_u_tables` builds `goff`/`rows`), and the CUDA path (`latent_dense_kernel<false>`) consumes exactly that tiling — but it is `#if !defined(__HIPCC__)`, so HIP takes `latent_u_grouped`, which throws the bucketing away. Its name says "grouped"; its body is a per-row GEMV with a warp reduction on the critical path.
+### F15 — P1 / CONFIRMED — the latent **U stage** runs at 128 GFLOP/s and 64 GB/s (12.5 s, 27.6 %)
 
-**Fix:** one tiled GEMM per (expert, output tile) over that expert's rows: weight traffic falls ~30× (765 GB → 25 GB), the warp-reduce disappears into an accumulator. Same numerical caveat as F14.
+**Where:** `src/kernels/cuda/latent.cu:70-105` (`latent_u_k`), launched by `latent_u_grouped` (`:107`); called from `prefill.cpp:6486` under `pt.mark(kPfGemmD)` — the `gemm down` row of the table.
+
+**Measured with its own per-layer events** (`STRATA_DU_PROF=1`, `pf_why.log`): **12,551 ms over 384 (layer, chunk) calls**, mean 32.7 ms, min 26.1, max 41.6 — i.e. essentially all of `gemm down`'s 12,815 ms. Geometry from the new `latent u:` line: `fmt=8 n_groups=8 nt=10 H=2560 rows=5120 ELL=1280`.
+
+**So the arithmetic:** 5,120 rows × 2,560 outputs × 1,280 values × 2 = **33.6 GFLOP per layer, 1.61 TFLOP per prompt at 128 GFLOP/s**, reading 5,120 × 2,560 × 1,280 B ≈ **16.8 GB of weights per layer, 805 GB per prompt at 64 GB/s**.
+
+**Two fixes tried, both bit-identical, one of them refuted:**
+
+| variant | result | why |
+|---|---|---|
+| **weight-reuse kernel** (one block per (group, 8 columns), weights in registers, reused over every routed row of the group; `KTAIL` raised to 16 so `nt=10` fits) | **49,879 ms vs 46,196 = 8 % SLOWER** (`ab_ureuse.log` vs `ab_urow.log`), tokens identical | it cuts weight bytes ~80× but replaces 1.3 M small blocks with 4,864 long ones, each scanning all 5,120 rows and skipping 7/8 of them. **Refuted: this stage is not weight-traffic-bound.** |
+| the same kernel with `KTAIL = 8` | **0.08 %** — and the new `latent u:` line proved the kernel never ran (`nt=10 > KTAIL=8`) | recorded on purpose: "no change" there was a *configuration no-op*, not evidence. Without that one-line kernel-selection print this would have been logged as a refutation. |
+
+**What is left is the shape, not the traffic.** One warp produces **one scalar output** from a 32→1 reduction over 1,280 values (10 dp4a per lane), so the reduction is never amortised across outputs and x is re-read once per output. A real tiled int8 GEMM (M = the group's rows, N = H, K = 1,280, int32 accumulate) is the shape that fixes it — a kernel project, not a tweak. → T16, with the per-layer instrument already in place to score it.
 
 **Both F14 and F15 in one sentence:** prefill's remaining 45 % is two dense projections executed as **matvec/GEMV kernels** — 2.7 TFLOP at ~110 GFLOP/s (0.2 % of the card). The A stage, which the earlier audit ranked first, is now 19 %.
 
