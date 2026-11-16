@@ -1161,6 +1161,48 @@
 > staged tile loses at M=4: 21.3 vs 15.3-17.4 ms") is confirmed on this card. **No speedup in this item** - but
 > the target is now named: a small-M GEMV at M=4 over `[G*ELL, N]`, ~16-22 ms a round, about a fifth of decode.
 
+> ### 0.36 Baseline reconciliation: it reproduces at equal cache size, and the 249 needs VRAM this box no longer has
+>
+> The recorded 249.0/248.5 was taken at **796-803 cache slots (1.89-1.90 GiB free)**.  The box now reports
+> **1.81-1.83 GiB free**, so `--expert-cache auto` lands on 720-742 and the containment was mistaken for a
+> regression.  Re-running the canonical harness unmodified, and the same harness with the cache pinned to the
+> recorded working set:
+>
+> | arm | slots | chunk | prefill | decode | output |
+> |---|---|---|---|---|---|
+> | canonical `auto`/`auto` | 720 | 256 | 167.41 | 19.40 | valid |
+> | canonical `auto`/`auto` (again) | 723 | 256 | 167.53 | 19.92 | valid |
+> | `--expert-cache 800`, chunk 512 | 800 | 512 | 238.94 | 19.20 | **ALL ZEROS** |
+> | `--expert-cache 800`, chunk 512 (again) | 800 | 512 | 239.62 | 19.24 | **ALL ZEROS** |
+> | earlier clean arms, 735 slots | 735 | 512 | 236.48 / 236.83 | 20.68 / 20.02 | valid |
+> | recorded `trace_full.log` (this box, 04:10) | 742 | 512 | **239.68** | 19.44 | valid |
+> | recorded `final1`/`final2.log` (04:01) | 973 / 980 | 256 | 178.02 / 172.51 | 20.34 / 20.26 | valid |
+>
+> **Prefill reproduces**: 236.5-239.7 today against the recorded 239.68 at the same 735-742 slots - 1.3 %.
+> The 249 needs ~80 MB more VRAM than the box has now, so it is machine state, not a code change, and nothing
+> in this stretch regressed.  **Decode reproduces too**: 19.2-20.7 today against 19.44-20.34 in the recorded
+> logs.  The "25-26 tok/s" that the reconciliation brief compared against is **not in any canonical log** - the
+> only 25.38 in this document (0.19) is `STRATA_VERIFY_U_TILE`'s A/B from a different session state, and the
+> "~26 -> ~32 unprofiled" at 0.32 was my own projection, later read back as if it were a measurement.
+>
+> **A real bug surfaced while trying to force the recorded state.**  `--expert-cache 800` is accepted
+> ("expert cache 800 slots, 0.87 GiB of VRAM") when the budget only affords ~800 MiB, and then the loader
+> **refuses 8,177 expert loads and the model produces all zeros** - the engine's own stats line:
+>
+> ```
+> R4 expert-cache hits   6560 of 14737 = 0.4451   (0 admitted, 8177 refused, cache 100.0000% full)
+> output  : 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+> ```
+>
+> A pinned cache that does not fit must fail loudly, not emit zeros; that exit code was 0 and the throughput
+> lines were reported as if they meant something.  This is the one thing in this section that needs a code
+> change, and it is a guard in the `--expert-cache <N>` path (compare the requested slots against the same
+> budget `auto` computes, and refuse the start), not a kernel.
+>
+> Also noted: under `--expert-cache auto` the stats report `0 of 0 ... 0 admitted, 0 refused, cache 0.0000 %
+> full`, i.e. the R4 counters are not being driven at all on that path, while the pinned path drives them
+> (14,737 lookups).  Whoever next reasons about cache hit rate from that line under `auto` will be misled.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
