@@ -35,6 +35,16 @@ void latent_u_runs(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* ids
                    int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
                    int R, int G);
 
+/// The staged U tile: 256 output columns x 64 routed rows a block, both operands staged into 4-byte
+/// aligned shared rows (64 codes + two half scales) and the scale applied once per 16-value sub-block,
+/// so the inner loop is four __dp4a per sub-block on aligned smem words instead of the per-row kernel's
+/// ~9 instructions a 4-value term.  Same outputs as latent_u_grouped up to fp32 rounding (the int32 sums
+/// are exact; the scale is hoisted from 4 values to 16).  23,040 B of smem a block, so 2 blocks a CU.
+/// `scratch` is the same buffer latent_u_runs takes.  Requires fmt 8, ELL % 64 == 0.
+void latent_u_tiled(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* ids, const int32_t* labels_dev,
+                    int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
+                    int G);
+
 /// knife-0 (STRATA_LATENT_U_GPU): the CPU share's U computed on the GPU into parts_ directly.
 /// One block per routed entry; a GPU row (r in dst[0..count)) copies hit_out, a CPU row computes U[labels[ids[r]]] . hq[r].
 void latent_u_matvec(const uint8_t* u_q8, const uint8_t* hq, const int32_t* ids, const int32_t* labels_dev,

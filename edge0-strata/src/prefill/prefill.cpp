@@ -6502,18 +6502,27 @@ if (lat_du) {
                                 static const bool uprof = std::getenv("STRATA_DU_PROF") != nullptr;
                                 cudaEvent_t uev0{}, uev1{};
                                 if (uprof) { cudaEventCreate(&uev0); cudaEventCreate(&uev1); cudaEventRecord(uev0, m.cs); }
-                                // STRATA_LATENT_U_RUN=R: the weight-reuse U kernel (one block per RUN of R
-                                // routed rows sharing a label, an output column's weights in registers).
-                                // The per-row kernel re-reads a group's whole U matrix once per routed row
-                                // - 20 GB a layer at this shape, ~850 GB/s of Infinity Cache, 1.42 TFLOP/s -
-                                // so R=8 is ~4x less traffic for the same arithmetic, in the same term
-                                // order (bit-identical outputs).  0 keeps the per-row kernel.
+                                // STRATA_LATENT_U_TILE=0 turns OFF the staged tile (default ON): 256 output
+                                // columns x 64 routed rows a block, both operands 4-byte aligned in shared,
+                                // the scale hoisted per 16 values.  Measured on gfx1031, 4,063-token prompt,
+                                // two pairs: U 23.70 -> 2.70 / 2.62 ms a layer (-8.8x), ledger `gemm down`
+                                // 8,954 -> 1,110 ms, prefill 142.2 -> 197.6 / 198.9 tok/s, `output` identical.
+                                // STRATA_LATENT_U_RUN=R keeps the weight-reuse run kernel (measured slower).
+                                static const int lat_u_tile = [] {
+                                    const char* v = std::getenv("STRATA_LATENT_U_TILE");
+                                    return (v != nullptr && v[0] == '0') ? 0 : 1;
+                                }();
                                 static const int lat_u_run = [] {
                                     const char* v = std::getenv("STRATA_LATENT_U_RUN");
                                     const int r = v != nullptr ? std::atoi(v) : 0;
                                     return r > 0 ? r : 0;
                                 }();
-                                if (lat_u_run > 0 && m.lat_fmt == 8 && m.lat_scratch != nullptr)
+                                if (lat_u_tile > 0 && m.lat_fmt == 8 && m.lat_scratch != nullptr && (ELL % 64) == 0)
+                                    strata::kernels::latent_u_tiled(
+                                        m.lat_u_dev + (size_t) l * m.lat_d.u_bytes(), m.ylq, m.ids_p,
+                                        m.lat_labels_dev + (size_t) l * m.lat_E, m.lat_E, (int64_t) (T * K), (int) ELL,
+                                        (int) N, m.Dm, m.lat_scratch, m.cs, m.lat_fmt, (int) G);
+                                else if (lat_u_run > 0 && m.lat_fmt == 8 && m.lat_scratch != nullptr)
                                     strata::kernels::latent_u_runs(
                                         m.lat_u_dev + (size_t) l * m.lat_d.u_bytes(), m.ylq, m.ids_p,
                                         m.lat_labels_dev + (size_t) l * m.lat_E, m.lat_E, (int64_t) (T * K), (int) ELL,

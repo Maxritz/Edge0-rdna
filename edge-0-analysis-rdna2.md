@@ -67,9 +67,9 @@
 > `STRATA_EMBED_VRAM=0`, which changes the U width (H 2560→10240) and costs decode 9%; the cache win
 > alone is not reachable without freeing ~644 MiB of VRAM elsewhere.
 >
-> The baseline to beat, then, on the healthy device: **decode ≈ 25.4 tok/s, TTFT ≈ 29.0 s**, and
-> prefill **142.1 tok/s** as of `fb1a943` (it was 127 before the launch-width fix in §0.3; reference
-> row: 62.4 / 430 / —, i.e. 2.5× and 3.0× away).
+> The baseline to beat, then, on the healthy device: **decode ~26.2 tok/s, TTFT ~20.9 s**, and
+> prefill **199.0 tok/s** - 127 before the launch-width fix (0.3), 142 after it, and 199 after the
+> staged U tile (0.6).  Reference row: 62.4 / 430 / -, i.e. 2.4x on decode and 2.2x on prefill.
 >
 > ### §0.2 The prefill ledger, re-taken after the launch-width fix (`final1.log`, `STRATA_PREFILL_TIMING=1`)
 >
@@ -243,6 +243,54 @@
 >
 > The reuse kernel and the walk switch are kept behind their env flags, default off, because a measured
 > negative is worth more than a deleted one.
+
+> ### 0.6 The staged U tile: 23.70 -> 2.70 ms a layer, and prefill 142 -> 199 tok/s
+>
+> The measurements in 0.5 said U's inner term costs ~9 instructions per 4 MAC and that its 20 GB a layer
+> through the Infinity Cache was a plausible ceiling.  Both are true, and the staged tile fixes both:
+>
+>   staged weight row (kUPitch 72):  64 codes | {half d(block 0), half d(block 1)} | pad
+>   staged act row    (kUPitch 72):  64 codes | {half d(block 0), half d(block 1)} | pad
+>
+> 256 output columns x 64 routed rows a block, 512 threads, one 64-value chunk at a time, both operands
+> copied into 4-byte-aligned shared rows so the inner loop is four `__dp4a` per 16-value sub-block on
+> aligned dwords and the scale product is one FMA per sub-block instead of two multiplies per 4 values.
+> The fragment mapping and the store pattern are `lat_q3k_down_kernel`'s (already verified by
+> `lat_q3k_down_test`).  23,040 B of smem and 222 VGPRs, 0 spills - one block a CU, because the backend
+> still ignores `__launch_bounds__`'s second argument, so the win is NOT occupancy.
+>
+> | | U a layer | ledger `gemm down` | prefill | tokens |
+> |---|---|---|---|---|
+> | per-row kernel | 23.70 ms | 8,954 ms | 142.2 tok/s | baseline |
+> | **staged tile** | **2.70 / 2.62** | **1,045 / 1,046** | **198.59 / 198.96** | **identical (32)** |
+>
+> -8.8x on U, -13.4 s on the prompt, +40 % prefill, TTFT 29.0 -> 20.9 s, and all 32 committed tokens
+> byte-identical (`248046 198 248045 74455 ... 18890 33358`).  U now moves 12.8 TFLOP in 1.04 s =
+> **12.3 TFLOP/s, 17 % of this card's int8 peak** - the highest rate in the engine, and 8.7x the row
+> kernel's 1.42 TFLOP/s.
+>
+> Why the earlier weight-reuse kernel (0.5) lost while this one wins, in one line: the run kernel cut
+> traffic 4x but kept the per-4-value unaligned operand loads and turned the block into a serial
+> row chain, so its cost floor was ~30 ms; the tile cuts traffic ~60x (20 GB -> 0.32 GB a layer, i.e.
+> 23.5 ms of IC time -> 0.4 ms) *and* the instructions per MAC, and gives each weight byte 64 rows of
+> reuse and each activation byte 256 columns.  Note the old kernel's 23.7 ms matches its 20 GB / 850 GB/s
+> = 23.5 ms, so traffic WAS a real ceiling - the reuse kernel just never reached it.
+>
+> **The prompt now, 20,397 ms (`final2.log`):**
+>
+> | phase | ms | share |
+> |---|---|---|
+> | gemm gate/up = the A stage (gu + SwiGLU + down) | 5,619 | 27.6 % |
+> | gather = the D projection (`iq_mmvq`) | 3,601 | 17.7 % |
+> | wait copy | 3,388 | 16.6 % |
+> | gdn | 2,989 | 14.7 % |
+> | gemm down = U (was 8,954) | **1,046** | 5.1 % |
+> | qsa 621, hc reads 1,111, router+shared 475, host grouping 196, rest ~150 | 2,553 | 12.5 % |
+>
+> The A stage is the next item, and its 64-row tile is only 39 % full: `STRATA_LATENT_NPROF` reports
+> `nb=16 ent=396` - ~25 routed entries a group at a 512-token chunk - so most of each tile's rows are
+> padding.  That is a tile-shape question for that kernel (the same reason a 32-row tile lost there is
+> that it halves the compute without halving the weight staging), not another launch knob.
 
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).

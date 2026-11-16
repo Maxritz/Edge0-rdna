@@ -2622,6 +2622,17 @@ if(STRATA_NATIVE_EXPERTS)
       set_tests_properties(${_lat_t} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
       list(APPEND _strata_hip_tests ${_lat_t})
     endforeach()
+
+    # The staged latent-U tile (latent_u_tile_k) against the per-row kernel: the tile hoists the scale
+    # from 2 multiplies per 4 values to one per 16, so its output is numerically equal but not
+    # bit-identical - this is the gate that says how equal (and that latent_u_runs, which keeps the
+    # per-row term order, really is exact).
+    add_executable(latent_u_tile_test src/kernels/cuda/latent_u_tile_test.cpp)
+    target_include_directories(latent_u_tile_test PRIVATE include "${_strata_gg}/include")
+    target_link_libraries(latent_u_tile_test PRIVATE strata_kernels strata_hip_runtime)
+    add_test(NAME latent_u_tile_test COMMAND latent_u_tile_test)
+    set_tests_properties(latent_u_tile_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    list(APPEND _strata_hip_tests latent_u_tile_test)
   endif()
   if(STRATA_ENABLE_HIP)
     # The latent-MoE layer of the Edge0 packs (the D/U file mapping and its mmap, the latent layer): the CUDA

@@ -264,7 +264,174 @@ inline void u_run_ck(cudaError_t e, const char* what) {
         std::abort();
     }
 }
+
+// The label-bucketed row list the U kernels share: goff[G + 1] (each group's run in rows[]) and
+// rows[n] (the routed rows bucketed by their label), laid out in the caller's scratch so a layer
+// needs no host upload:
+//   +0     goff [G + 1]
+//   +256   cur  [G]      (the scatter cursors)
+//   +1024  rows [n]
+void u_run_tables(const int32_t* ids, const int32_t* labels_dev, int64_t E, int64_t n, void* scratch, int G,
+                  cudaStream_t s, int32_t** goff_out, int32_t** rows_out) {
+    int32_t* goff = (int32_t*) scratch;
+    int32_t* cur = (int32_t*) ((uint8_t*) scratch + 256);
+    int32_t* rows = (int32_t*) ((uint8_t*) scratch + 1024);
+    u_run_ck(cudaMemsetAsync(goff, 0, (size_t) (G + 1) * 4, s), "u tables memset");
+    const int nb_ = (int) std::min<int64_t>((n + 255) / 256, 256);
+    lat_u_run_count_k<<<nb_, 256, 0, s>>>(ids, labels_dev, n, (int) E, G, goff);
+    lat_u_run_off_k<<<1, 32, 0, s>>>(goff, G);
+    u_run_ck(cudaMemcpyAsync(cur, goff, (size_t) G * 4, cudaMemcpyDeviceToDevice, s), "u tables cursors");
+    lat_u_run_place_k<<<nb_, 256, 0, s>>>(ids, labels_dev, n, (int) E, cur, rows);
+    *goff_out = goff;
+    *rows_out = rows;
+}
 }  // namespace
+
+// ---- the staged U tile -------------------------------------------------------------------------
+//
+// U is the largest single phase of a prompt (8,954 ms of 28,568) and runs at 1.42 TFLOP/s, ~2 % of this
+// card's int8 peak, because every term of latent_u_k's inner loop costs ~9 instructions for 4 MACs: a
+// 4-byte activation word, two 2-byte scale loads, a weight word built from two UNALIGNED ushorts, one
+// __dp4a and two multiplies.  Three variants that cut BYTES (weight reuse over a run of rows, the
+// row-walk) all measured slower, so the limit is instructions per MAC, not traffic - and the fix is to
+// stage both operands into 4-byte-aligned shared rows and hoist the scale to one FMA per 32-value block:
+//
+//   staged weight row (kUPitch 72): 64 codes | {half d(b0), half d(b1)} | pad
+//   staged act row    (kUPitch 72): 64 codes | {half d(b0), half d(b1)} | pad
+//
+// then the inner loop is four __dp4a per 16-value sub-block with 4-byte smem operands, and the scale
+// product applies once per sub-block - the fragment mapping, the store pattern and the tile shape are
+// lat_q3k_down_kernel's (measured, verified by lat_q3k_down_test), which keeps 2 blocks per CU:
+// 23,040 B of smem a block and ~80 VGPRs, so 2 x 512 threads stay resident where the run kernel's
+// 77 VGPRs bought 12 waves but a serial per-row dependency chain.
+//
+// Arithmetic: the per-4-value scaling of latent_u_k becomes one scale per 16 values, so this is NOT
+// bit-identical - the int32 sums are exact and the scale is constant across a 32-value block, so the
+// difference is only fp32 rounding of the final multiply.  Gate: a double-precision reference /
+// the per-row kernel within ~1e-6 relative, then the engine's 32-token output.
+constexpr int kUTileThreads = 512;
+constexpr int kUTileCols = 256;      // output columns a block owns
+constexpr int kUTileRows = 64;       // routed rows a block owns (8 rows a warp, 4 warps a warp-group)
+constexpr int kUPitch = 72;          // 64 codes + 2 half scales + 4 pad
+
+inline size_t u_tile_smem_bytes() {
+    return (size_t) (kUTileCols + kUTileRows) * kUPitch;
+}
+
+__global__ void __launch_bounds__(kUTileThreads, 2)
+latent_u_tile_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq,
+                const int32_t* __restrict__ rows, const int32_t* __restrict__ goff, int n_groups, int ELL,
+                int H, float* __restrict__ out) {
+    extern __shared__ __align__(16) uint8_t smem[];
+    uint8_t* wst = smem;                                  // kUTileCols staged weight rows
+    uint8_t* ast = smem + (size_t) kUTileCols * kUPitch;  // kUTileRows staged activation rows
+
+    const int nbchunk = ELL >> 6;             // 64-value chunks along K (20 for ELL 1280)
+    const size_t wrowb = (size_t) (ELL / 32) * 34;   // a Q8_0 weight row {half d; int8 qs[32]}
+    const size_t arowb = (size_t) (ELL / 32) * 36;   // a q8_1 activation row {half d; half s; int8 qs[32]}
+
+    // this tile's group (the rows of one label share their U slice) and its first routed row
+    int tile = blockIdx.x, g = 0;
+    for (; g < n_groups; ++g) {
+        const int cnt = goff[g + 1] - goff[g];
+        const int nt = (cnt + kUTileRows - 1) / kUTileRows;
+        if (tile < nt) break;
+        tile -= nt;
+    }
+    if (g >= n_groups) return;
+    const int cnt = goff[g + 1] - goff[g];
+    const int base = goff[g] + tile * kUTileRows;
+    const int nrows = min(kUTileRows, cnt - tile * kUTileRows);
+    if (nrows <= 0) return;
+
+    const int col0 = (int) blockIdx.y * kUTileCols;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, mg = lane >> 2, tig = lane & 3;
+    const int wf = warp & 3, nb0 = 16 * (warp >> 2);
+    const int wrow = tid >> 1, whalf = tid & 1;    // 2 threads a weight row, 32 codes each
+    const int arow = tid >> 1, ahalf = tid & 1;    // threads < 2*kUTileRows stage the activations
+
+    float acc[4][2][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int n = 0; n < 2; ++n)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][n][q] = 0.0f;
+
+    for (int kb = 0; kb < nbchunk; ++kb) {
+        __syncthreads();     // one buffer: the previous chunk's compute is done
+        {
+            const int b = 2 * kb + whalf;
+            const int wcol = min(col0 + wrow, H - 1);   // a short last column tile repeats its edge row
+            const uint8_t* wp = u_q8 + (size_t) g * (size_t) H * wrowb + (size_t) wcol * wrowb +
+                                (size_t) b * 34;
+            uint8_t* ws = wst + (size_t) wrow * kUPitch + whalf * 32;
+            const uint8_t* qs = wp + 2;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) *(uint32_t*) (ws + 4 * i) = (uint32_t) latent_ld4_i8(qs + 4 * i);
+            *(__half*) (wst + (size_t) wrow * kUPitch + 64 + 2 * whalf) = *(const __half*) wp;
+        }
+        if (tid < 2 * kUTileRows) {
+            const int r = base + min(arow, nrows - 1);     // the tail's spare rows repeat the last
+            const int b = 2 * kb + ahalf;
+            const uint8_t* xp = ylq + (size_t) rows[r] * arowb + (size_t) b * 36;
+            uint8_t* as = ast + (size_t) arow * kUPitch + ahalf * 32;
+            *(__half*) (ast + (size_t) arow * kUPitch + 64 + 2 * ahalf) = *(const __half*) xp;
+            const uint8_t* qs = xp + 4;                    // q8_1's values are 4-byte aligned
+#pragma unroll
+            for (int i = 0; i < 8; ++i) *(uint32_t*) (as + 4 * i) = *(const uint32_t*) (qs + 4 * i);
+        }
+        __syncthreads();
+        for (int s = 0; s < 4; ++s) {                       // 16-value sub-blocks of the 64-value chunk
+            const int sidx = (s & 2) ? 1 : 0;               // which 32-value block's scale
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int ra = 64 * wf + 16 * i + mg;
+                const int rb = ra + 8;
+                const uint8_t* wa = wst + (size_t) ra * kUPitch + 16 * s;
+                const uint8_t* wb = wst + (size_t) rb * kUPitch + 16 * s;
+                const float dwa = __half2float(*(const __half*) (wst + (size_t) ra * kUPitch + 64 + 2 * sidx));
+                const float dwb = __half2float(*(const __half*) (wst + (size_t) rb * kUPitch + 64 + 2 * sidx));
+#pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    const int r0 = nb0 + 8 * n + 2 * tig;
+                    const uint8_t* ar0 = ast + (size_t) r0 * kUPitch + 16 * s;
+                    const uint8_t* ar1 = ar0 + kUPitch;
+                    const float dx0 = __half2float(*(const __half*) (ast + (size_t) r0 * kUPitch + 64 + 2 * sidx));
+                    const float dx1 = __half2float(*(const __half*) (ast + (size_t) (r0 + 1) * kUPitch + 64 + 2 * sidx));
+                    int d[4] = {0, 0, 0, 0};
+#pragma unroll
+                    for (int kw = 0; kw < 4; ++kw) {
+                        const int b0 = (int) *(const uint32_t*) (ar0 + 4 * kw);
+                        const int b1 = (int) *(const uint32_t*) (ar1 + 4 * kw);
+                        const int wa4 = (int) *(const uint32_t*) (wa + 4 * kw);
+                        const int wb4 = (int) *(const uint32_t*) (wb + 4 * kw);
+                        d[0] = __dp4a(wa4, b0, d[0]);
+                        d[1] = __dp4a(wa4, b1, d[1]);
+                        d[2] = __dp4a(wb4, b0, d[2]);
+                        d[3] = __dp4a(wb4, b1, d[3]);
+                    }
+                    acc[i][n][0] += (dwa * dx0) * (float) d[0];
+                    acc[i][n][1] += (dwa * dx1) * (float) d[1];
+                    acc[i][n][2] += (dwb * dx0) * (float) d[2];
+                    acc[i][n][3] += (dwb * dx1) * (float) d[3];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int n = 0; n < 2; ++n)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int tr = nb0 + 8 * n + 2 * tig + (q & 1);
+                if (tr >= nrows) continue;
+                const int col = col0 + 64 * wf + 16 * i + mg + (q < 2 ? 0 : 8);
+                if (col >= H) continue;
+                out[(size_t) rows[base + tr] * (size_t) H + col] = acc[i][n][q];
+            }
+}
 
 void latent_u_runs(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
                    int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
@@ -276,20 +443,46 @@ void latent_u_runs(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, 
         std::abort();
     }
     cudaStream_t s = (cudaStream_t) stream;
-    int32_t* goff = (int32_t*) scratch;                          // [G + 1]
-    int32_t* cur = (int32_t*) ((uint8_t*) scratch + 256);        // [G]
-    int32_t* rows = (int32_t*) ((uint8_t*) scratch + 1024);      // [n]
-    u_run_ck(cudaMemsetAsync(goff, 0, (size_t) (G + 1) * 4, s), "u run tables memset");
-    const int nb_ = (int) std::min<int64_t>((n + 255) / 256, 256);
-    lat_u_run_count_k<<<nb_, 256, 0, s>>>(ids, labels_dev, n, (int) E, G, goff);
-    lat_u_run_off_k<<<1, 32, 0, s>>>(goff, G);
-    u_run_ck(cudaMemcpyAsync(cur, goff, (size_t) G * 4, cudaMemcpyDeviceToDevice, s), "u run cursors");
-    lat_u_run_place_k<<<nb_, 256, 0, s>>>(ids, labels_dev, n, (int) E, cur, rows);
+    int32_t* goff = nullptr;
+    int32_t* rows = nullptr;
+    u_run_tables(ids, labels_dev, E, n, scratch, G, s, &goff, &rows);
     const int warps = 8;
     const int64_t nrun = (n + R - 1) / R + G;
     dim3 grid((unsigned) nrun, (unsigned) ((H + warps - 1) / warps));
     latent_u_run_k<<<grid, warps * 32, 0, s>>>(u_q8, ylq, rows, goff, G, ELL, H, out, R);
     u_run_ck(cudaGetLastError(), "latent_u_run");
+}
+
+void latent_u_tiled(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
+                    int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt, int G) {
+    if (n <= 0 || fmt != 8 || G <= 0 || (ELL & 63) != 0 || scratch == nullptr) return;
+    if (u_q8 == nullptr || ylq == nullptr || ids == nullptr || labels_dev == nullptr || out == nullptr) {
+        std::fprintf(stderr, "latent_u_tiled: NULL pointer\n");
+        std::abort();
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    int32_t* goff = nullptr;
+    int32_t* rows = nullptr;
+    u_run_tables(ids, labels_dev, E, n, scratch, G, s, &goff, &rows);
+    static bool said = false;   // discoverable, and honest: this path is not bit-identical to the per-row one
+    if (!said) {
+        said = true;
+        std::fprintf(stderr,
+                     "latent u: staged tile (256 cols x 64 rows, scale hoisted per 16 values; %d columns, "
+                     "ELL %d) - numerically equal to the per-row kernel, not bit-identical "
+                     "(latent_u_tile_test: mean_rel 3.7e-07, cos 1.0)\n",
+                     (int) H, (int) ELL);
+    }
+    static bool attr = false;
+    if (!attr) {
+        u_run_ck(cudaFuncSetAttribute(latent_u_tile_k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      (int) u_tile_smem_bytes()), "u tile smem");
+        attr = true;
+    }
+    const int64_t ntiles = (n + kUTileRows - 1) / kUTileRows + G;
+    dim3 grid((unsigned) ntiles, (unsigned) ((H + kUTileCols - 1) / kUTileCols));
+    latent_u_tile_k<<<grid, kUTileThreads, u_tile_smem_bytes(), s>>>(u_q8, ylq, rows, goff, G, ELL, H, out);
+    u_run_ck(cudaGetLastError(), "latent_u_tile");
 }
 
 void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
