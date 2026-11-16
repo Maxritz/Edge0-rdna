@@ -423,6 +423,36 @@
 > Knobs added, all defaulting to the shipped behaviour: `STRATA_LATENT_U_WARPS` (8 = shipped),
 > `STRATA_POOL_NO_PIN` (unset = pinned), `STRATA_VERIFY_U_TILE` (0 = shipped, 1/2 = the tiles).
 
+> ### 0.11 Decode's round, re-split with the copy isolated: router+plan is now the largest single item
+>
+> A slot keeps only its LAST write, so a first attempt at isolating the hq copy (reusing a slot twice)
+> silently inflated `u: gemv` from 13.2 to 24.3 - the table still summed to 90 ms, which is exactly why
+> the total is checked on every change.  Done correctly, one arm, `v5.log`, total **89.90 ms**:
+>
+> | part | GDN | QSA | total | note |
+> |---|---|---|---|---|
+> | `router+plan` | 16.439 | 6.325 | **22.77** | never instrumented - the largest item now |
+> | `u: hqcp+matvec+hits` | 11.085 | 3.619 | **14.70** | the hq copy alone is 0.19-0.25 ms; the rest is `latent_u_matvec` |
+> | `u: gemv` (q8_1 of H + the GPU-rows U) | 10.013 | 3.342 | **13.35** | |
+> | `u: pool wait` | 9.270 | 1.455 | **10.72** | the pool at its measured 30-32 GB/s ceiling |
+> | dense GEMVs (qkv 3.33, z 2.09, out-proj 1.98, q+q-idx 1.54) | | | 8.94 | |
+> | gdn (rec 0.97, ab 0.31, conv 0.25) + qsa attention 1.08 + head 2.30 + hc-read0 3.05 | | | 7.96 | |
+> | `waitB` 3.82, `VRAM hits` 3.90, `shared+quant` 1.74, rest | | | 11.5 | |
+>
+> Two U-shaped pieces total **28.05 ms** and both move ~1.7 GB a round (10 and ~7 routed rows a layer, one
+> per label, each needing its label's whole 3.5 MB slice) at ~126 GB/s effective - well under the
+> Infinity Cache's 1.38 TB/s and DRAM's 384 GB/s, so there is real headroom in them, but four shapes and
+> two placements (0.10) all lose to the shipped per-row kernel.
+>
+> **The transposed-U estimate, done before writing it.**  A column-major table would let a lane own a
+> whole output column: no warp shuffle (5 steps of the ~37 instructions an output costs now), and the
+> same 4-byte coalesced loads.  At one row per label there is no row reuse for the transpose to expose,
+> so its instruction-count ceiling is ~4-14 % of the 13.35 ms half (0.5-1.8 ms, +0.6-2 % decode) - unless
+> the 126 GB/s is a layout-latency artifact, in which case the ceiling is the byte floor itself (13.35 ->
+> 4.4 ms at DRAM, +11 % decode).  Cost: 167 MB of VRAM for a persistent table (which 512K+MTP does not
+> have) or 3.5 MB of per-layer scratch plus a ~1 ms/round transpose kernel.  It is the one untested axis
+> and it is worth one experiment, with the scratch variant so no VRAM decision is needed.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

@@ -2513,13 +2513,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // bytes with no host CUDA call (the engine's own remedy for this path, generate.cpp:10329-10333).
                 strata::kernels::copy_bytes_from_mapped(hq_dev_, m_ymiss_ + (size_t) tb * K * N,
                                                         (size_t) cap * ((size_t) lat_ELL_ / 32 * 36), cs);
-                if (v_up) stamp(l, 35, grp);        // slot 35 = the U matvec + the hit rows
+                if (v_up) stamp(l, 35, grp);        // slot 35 = the U matvec (+ the hit rows, closed by 23)
                 strata::kernels::latent_u_matvec(lat_u_ + (size_t) l * lat_dense_.u_bytes(),
                                                  (const uint8_t*) hq_dev_,
                                                  ids_ + (size_t) tb * K, lat_labels_dev_ + (size_t) l * (size_t) lat_E_,
                                                  p_dst, p_counts + 1, (int64_t) lat_E_, cap,
                                                  (int) lat_ELL_, (int) N, (int) lat_G_, parts_out, cs, lat_fmt_);
-                if (v_up) stamp(l, 35, grp);        // slot 35 = the hit rows
+                if (v_up) stamp(l, 35, grp);        // slot 35 = the hit rows (the copy alone measured 0.19-0.25 ms)
                 moe_hit_set(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);   // knife-0: assign, as u0 does
                 stamp(l, 23, grp);   // the hq copy + the U matvec + the hit rows are done; `copy+combine` is the combine
                 if (trace_m_ != nullptr) gpu_stamp(trace_m_, (l * kProfPer + 38) * 2, cs);   // T-TRI breadcrumb
@@ -3305,20 +3305,22 @@ void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
         {   // STRATA_VERIFY_U_PROF: the latent U path split inside the two buckets that shared it.  The window
             // stamps 21 -> 33 -> 34 -> 22 -> 35 -> 23 (quantize, the GPU-rows U, the pool's row wait, the hq copy
             // + the U matvec, the hit rows), so 22 and 23 are divided out of it - the table's total is unchanged,
-            // which is the rule every slot on this page follows.
+            // which is the rule every slot on this page follows.  A slot keeps only its LAST write, so 35 is
+            // written twice on purpose: gap(35, 22) is the copy + the matvec and gap(23, 35) the hits.
             const double uq = gap(at(l, 33), at(l, 21));
             const double uu = gap(at(l, 34), at(l, 33));
             const double uw = gap(at(l, 22), at(l, 34));
             const double uc = gap(at(l, 35), at(l, 22));
             const double uh = gap(at(l, 23), at(l, 35));
             if (uu > 0 || uc > 0) {
-                prof_sum_[kind][33] += uq + uu;    // "u: gemv"     (the q8_1 of H + the GPU-rows U)
-                prof_sum_[kind][34] += uw;         // "u: pool wait" (the pool's rows for this group)
-                prof_sum_[kind][35] += uc + uh;    // "u: hqcp+matvec+hits"
+                prof_sum_[kind][33] += uq + uu;    // "u: gemv"        (the q8_1 of H + the GPU-rows U)
+                prof_sum_[kind][34] += uw;         // "u: pool wait"   (the pool's rows for this group)
+                prof_sum_[kind][35] += uc + uh;    // "u: hqcp+matvec+hits"  (copy 0.25 ms, the rest is the matvec)
                 prof_sum_[kind][22] -= uq + uu + uw;
                 prof_sum_[kind][23] -= uc + uh;
             }
-        }        const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
+        }
+        const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
         if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
             prof_sum_[kind][27] += dn;      // hc-read0: norm
             prof_sum_[kind][28] += dd;      //           down
