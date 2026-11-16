@@ -836,6 +836,32 @@
 > 249.00 / 248.54 tok/s) and the two arms' blob/resident numbers above are the honest anchors for the
 > cost model whenever it is written.
 
+> ### 0.27 Where the auto chunk is actually decided: `host_plan_chunk`, not `plan_lend`
+>
+> Attempt 3 (halving inside `plan_lend`, first above the `small >= c` early return and then in the
+> `chunk = c` path) changed nothing again - 512 / 256 / 1024 at 783 / 672 / 557 cache slots.  A diagnostic
+> inside both paths settled why: **neither path prints**, i.e. `plan_lend`'s automatic result is then thrown
+> away.  The chunk printed by "prompt chunk auto" comes from the #2824 host plan:
+>
+>   generate.cpp:17973-17998   if (k > 0 && o.prefill_auto && n_batched > 1024)
+>                                chunk = host_plan_chunk(...)   // generate.cpp:8937, prefill_plan.hpp
+>
+> `host_plan_chunk` is a HOST-TIER model: it prices the chunk against the page cache (`available - 1.2 GiB`),
+> the pack's file tier, the measured H2D rate (`g_last_h2d_gbps`), the SSD read rate and a compute rate, and
+> returns the chunk that minimises total time across those tiers.  On this box every prompt > 1024 tokens
+> takes that path (`n_batched` is 4,062), so *all* of the auto-chunk behaviour measured in 0.22-0.26 came
+> from it - and none of my three patches touched it.
+>
+> That also explains the shape of the results: the model has no term for the VRAM each chunk lends, which is
+> what actually costs the streamed experts (1024 -> 81,684 blobs and 854 resident against 512's 62,554 and
+> 1,519 at the same cache), so it happily trades cache capacity for a shorter chunk count.  The fix belongs
+> in `prefill_plan`'s cost: the GPU tier's slot count has to shrink with the chunk (`lend_of` already hands
+> the model those numbers - it is called but its result only prices bytes, not the experts it evicts).
+>
+> All three attempts are reverted; the shipped behaviour is unchanged (ring 96, chunk 512 at 783-803 slots,
+> 249.00 / 248.54 tok/s, byte-identical, 512K+MTP exit 0).  The next attempt starts in `prefill_plan.hpp`,
+> not in `plan_lend`.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
