@@ -357,6 +357,42 @@ int lat_sms() {
     return sms;
 }
 
+// STRATA_LAT_Q3K_INFO=1: the launch's residency, measured on this device - the registers and scratch the kernel
+// actually got, and how many blocks of this shape the driver keeps per CU.  This is the dispatch trap's other half:
+// the per-launch time probe (fprintf in prefill.cpp's arm_launch) says how long a launch takes, this says how much
+// of the card that launch can possibly be using.  Printed for the first three shapes only (a prompt has thousands).
+void lat_info(const void* fn, unsigned gx, unsigned gy, unsigned gz, int threads, size_t smem) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_LAT_Q3K_INFO");
+        return v != nullptr && v[0] == '1';
+    }();
+    static int printed = 0;
+    if (!on || printed >= 3) return;
+    ++printed;
+    int blocks = 0;
+#if defined(__HIPCC__)
+    hipFuncAttributes fa{};
+    if (hipFuncGetAttributes(&fa, fn) != hipSuccess) { (void) hipGetLastError(); return; }
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, threads, smem) != hipSuccess) {
+        (void) hipGetLastError();
+        blocks = 0;
+    }
+#else
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, fn) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, threads, smem) != cudaSuccess) {
+        (void) cudaGetLastError();
+        blocks = 0;
+    }
+#endif
+    const int sms = lat_sms();
+    std::fprintf(stderr,
+                 "latq3kinfo gu: grid=(%u,%u,%u) block=%d smem=%zu regs=%d scratch=%zu dynmax=%d blocks/cu=%d "
+                 "waves/cu=%d of 64 threads/cu=%d of 2048 cus=%d\n",
+                 gx, gy, gz, threads, smem, (int) fa.numRegs, (size_t) fa.localSizeBytes,
+                 (int) fa.maxDynamicSharedSizeBytes, blocks, blocks * threads / 32, blocks * threads, sms);
+}
+
 }  // namespace
 
 void lat_q3k_fused(const uint8_t* const* blob, const int32_t* starts, int n_groups, const void* xq, void* hbuf,
@@ -374,6 +410,7 @@ void lat_q3k_fused(const uint8_t* const* blob, const int32_t* starts, int n_grou
     const int sms = lat_sms();
     const unsigned gy = (unsigned) std::min(n_groups, 512);
     const unsigned gz = (sms > 0 && (int) (gy * kItems) < sms) ? 8u : 1u;
+    lat_info((const void*) lat_q3k_fused_gu_kernel, (unsigned) kItems, gy, gz, LTHREADS, lat_smem_bytes());
     lat_q3k_fused_gu_kernel<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
         blob, starts, n_groups, (const uint8_t*) xq, (uint8_t*) hbuf, counts, ent_tok);
     dck(cudaGetLastError(), "launch gu+swiglu+q8_1");

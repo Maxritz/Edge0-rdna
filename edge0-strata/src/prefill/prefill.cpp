@@ -1503,15 +1503,31 @@ bool fused_layout(size_t T, bool src) {
     if (lat_mmq) return false;
     return src && fused_ring() && mmq_plan().any && ring_slots(T) > STAGE && (int64_t) T >= stream_all_min();
 }
-// M4: STRATA_LAT_FUSED_Q3K=1 - the latent A stage on the q3k pack's own fused kernels (lat_q3k_fused: gate/up +
-// SwiGLU + the q8_1 of H + down in two launches, each expert read where it already is, so no gather_native and no
-// per-expert launch).  Read once: moe_set_bytes, the carve and the layer loop must agree on it.  Off by default.
+// M4: the latent A stage on the q3k pack's own fused kernels (lat_q3k_fused: gate/up + SwiGLU + the q8_1 of H + down
+// in two launches, each expert read where it already is, so no gather_native and no per-expert gather).  Read once:
+// moe_set_bytes, the carve and the layer loop must agree on it.  ON by default for the one pack it is built for (the
+// guard below pins it to gu_type 11 / d_type 20 / lat_I 640), because reading the expert in place removes the whole
+// `gather` phase - measured 11.3 s of a 4K prompt's 49.1 s of device time.  STRATA_LAT_FUSED_Q3K=0 is the way back to
+// the native grouped kernel.
 bool lat_fused_q3k_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_LAT_FUSED_Q3K");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return on;
+}
+
+// STRATA_LAT_STAGED_BATCH=N: experts per A-stage launch in the *staged* walk (a chunk below stream_all_min()).
+// Only the fused q3k call takes per-group row counts, so only it may mix experts whose entry ranges are not
+// adjacent; every other latent A stage keeps one expert per launch.  The caller caps N at STAGE / 2 so the ring
+// always keeps half its slots as prefetch - see the lookahead arithmetic in the walk.
+int lat_staged_batch() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_LAT_STAGED_BATCH");
+        const int k = v != nullptr ? std::atoi(v) : 4;
+        return k > 0 ? k : 1;
+    }();
+    return n;
 }
 
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
@@ -5975,9 +5991,12 @@ if (lat_du) {
                                         if (ncall % 24 == 0)
                                             std::fprintf(stderr,
                                                          "latfq3kprof: calls=%lld ms=%.0f entries=%lld us/entry=%.2f "
-                                                         "last: nb=%zu ent=%lld cap=%lld T=%lld K=%lld\n",
+                                                         "us/call=%.1f last: nb=%zu ent=%lld hbuf=%lldB cap=%lld "
+                                                         "T=%lld K=%lld (the launch grid is the latq3kinfo line)\n",
                                                          ncall, acc, nent,
-                                                         nent > 0 ? acc * 1000.0 / (double) nent : 0.0, nb, ent,
+                                                         nent > 0 ? acc * 1000.0 / (double) nent : 0.0,
+                                                         ncall > 0 ? acc * 1000.0 / (double) ncall : 0.0, nb, ent,
+                                                         (long long) (T * K * 800),
                                                          (long long) (T * K), (long long) T, (long long) K);
                                         cudaEventDestroy(ev0); cudaEventDestroy(ev1);
                                     }
@@ -6040,8 +6059,22 @@ if (lat_du) {
                             // A: per-expert grouped launches (the kernel's grp_start ranges tile contiguous entries, so a
                             // layout-mixed batch cannot share a launch): resident slots take the nib layout on nib
                             // layers, staged blobs (plain GGUF bytes) the plain one.
+                            //
+                            // The one exception is the fused q3k A stage: its launch takes per-group row counts, so a
+                            // batch may hold experts whose entry ranges are not adjacent, and it reads every blob where
+                            // it is.  Batched launches are what the card needs (one expert is 5 blocks of 16 warps on a
+                            // 20-CU part, ~10 % of it), and the ring's lookahead is reduced by exactly the batch so that
+                            // stage_one can never reach a slot a pending batch still reads: the newest staged entry is
+                            // j + lookahead and the oldest un-launched batch entry is >= j - (batch - 1), so the furthest
+                            // slot distance is lookahead + batch - 1 = stage_n - 1 < stage_n.  Capped at stage_n / 2 so
+                            // half the ring is always prefetch.  STRATA_LAT_STAGED_BATCH=N (1: launch per expert).
+                            const size_t stage_batch =
+                                lat_fused_q3k
+                                    ? std::max<size_t>(1, std::min<size_t>((size_t) lat_staged_batch(),
+                                                                           (size_t) stage_n / 2))
+                                    : (size_t) 1;
                             size_t staged = 0;
-                            const size_t lookahead = (size_t) stage_n - 1;
+                            const size_t lookahead = (size_t) stage_n - stage_batch;
                             if (lat_fused) {
                                 // A on the fused batch kernels, #136's walk: the experts in id order, one WideBatch
                                 // launch per kMaxBatch of them - at most a third of the ring streamed, so the next
@@ -6353,48 +6386,65 @@ if (lat_du) {
                                 // STRATA_EXPERT_NIBBLE: the cache slots' nib layout on nib layers; a staged
                                 // blob is always the plain GGUF bytes.
                                 //
-                                // BATCHING THIS WALK IS BLOCKED BY THE RING GEOMETRY, measured: with
-                                // STRATA_LAT_STAGED_BATCH=8 every slot was held and stage_one() reused one whose
-                                // blob a queued launch still read - 64,126 -> 8,279 launches, 78.2 vs 65.1 tok/s,
-                                // and WRONG tokens. `lookahead = STAGE - 1` with `STAGE = 8` leaves zero free
-                                // slots by construction, so the prerequisite is STAGE enlarged with
-                                // lookahead = STAGE - batch (docs/perf-log-2026-11-16.md).
+                                // The fused q3k A stage takes stage_batch experts a launch (see the lookahead
+                                // arithmetic above): resident and staged experts together, because its launch
+                                // carries each group's row count and reads every blob where it is, so the entry
+                                // ranges need not be adjacent.  One wait per batch, on its last copy (the copy
+                                // stream is in order), then one release event per staged slot the launch read -
+                                // the same shape the stream_all walk already uses.
                                 size_t nb = 0;
+                                int fb_slot[MMQ_GROUP];   // the batch's staged ring slots, for the release events
+                                size_t nst = 0;
+                                auto lat_fire = [&]() -> bool {
+                                    if (nb == 0) return true;
+                                    if (nst > 0) {
+                                        pt.mark(kPfWaitCopy, m.cs);
+                                        cudaStreamWaitEvent(m.cs, m.copied[fb_slot[nst - 1]], 0);
+                                    }
+                                    if (!arm_launch(lat_fused_q3k ? la_for(false) : la_for(nst > 0 ? false : nib_l), nb))
+                                        return false;
+                                    for (size_t i = 0; i < nst; ++i) {   // a slot frees once the launch is done
+                                        cudaEventRecord(m.used[fb_slot[i]], m.cs);
+                                        m.used_of[fb_slot[i]] = fb_slot[i];
+                                    }
+                                    nb = 0;
+                                    nst = 0;
+                                    return true;
+                                };
                                 for (size_t j = 0; j < n_order; ++j) {
                                     const int32_t e = order[j];
                                     while (staged < n_order && staged <= j + lookahead) {
                                         if (!stage_one(staged)) return false;
                                         ++staged;
                                     }
-                                    if (stage_of[j] < 0) {   // resident: accumulate into the shared launch
-                                        gp[nb] = (unsigned long long) m.cache->device_slot(
-                                            m.host_res[(size_t) l * m.g->n_expert + e]);
-                                        gs[nb] = (int32_t) m.off[(size_t) e];
-                                        gs[nb + 1] = (int32_t) (m.off[(size_t) e] + m.cnt[(size_t) e]);
-                                        ++nb;
-                                        ++stats_.experts_resident;
-                                        if (nb == (size_t) MMQ_GROUP) {
-                                            if (!arm_launch(la_for(nib_l), nb)) return false;
-                                            nb = 0;
+                                    const int sl = stage_of[j];
+                                    if (sl < 0) {   // resident (or on the peer): no ring slot to hold
+                                        const bool r0 = m.host_res && m.cache &&
+                                                        m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                                        const uint8_t* bp = prune_plan_hit(l, e)
+                                            ? g_zero_blob
+                                            : (r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
+                                                  : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr));
+                                        if (bp == nullptr) {
+                                            err = "prefill latent: an expert is neither resident, streamed nor on the peer";
+                                            return false;
                                         }
-                                        continue;
+                                        gp[nb] = (unsigned long long) bp;
+                                        ++stats_.experts_resident;
+                                    } else {
+                                        gp[nb] = (unsigned long long) m.stage_dev[sl];
+                                        fb_slot[nst++] = sl;
                                     }
-                                    if (nb > 0) {   // launch the residents collected so far before the staged one
-                                        if (!arm_launch(la_for(nib_l), nb)) return false;
-                                        nb = 0;
-                                    }
-                                    pt.mark(kPfWaitCopy, m.cs);
-                                    cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
-                                    gp[0] = (unsigned long long) m.stage_dev[stage_of[j]];
-                                    gs[0] = (int32_t) m.off[(size_t) e];
-                                    gs[1] = (int32_t) (m.off[(size_t) e] + m.cnt[(size_t) e]);
-                                    if (!arm_launch(la_for(false), 1)) return false;
-                                    cudaEventRecord(m.used[stage_of[j]], m.cs);   // the slot frees once this launch is done
-                                    m.used_of[stage_of[j]] = stage_of[j];
+                                    gs[nb] = (int32_t) m.off[(size_t) e];
+                                    gs[nb + 1] = (int32_t) (m.off[(size_t) e] + m.cnt[(size_t) e]);
+                                    // the group's row count, when the fused q3k call is the one reading the table:
+                                    // taken from the plan, never left to gs's difference (lat_gc is reset at layer
+                                    // scope, so a walk that does not set it would leave an earlier batch's counts)
+                                    if (lat_fused_q3k) lat_gc[nb] = (int32_t) m.cnt[(size_t) e];
+                                    ++nb;
+                                    if (nb == stage_batch && !lat_fire()) return false;
                                 }
-                                if (nb > 0) {
-                                    if (!arm_launch(la_for(nib_l), nb)) return false;
-                                }
+                                if (!lat_fire()) return false;
                             }
                             if (!arm_flush()) return false;   // STRATA_LATENT_MMQ: the layer's pending group
                             // U: each down latent hits U[labels[expert]]; the H-wide rows are this layer's Dm

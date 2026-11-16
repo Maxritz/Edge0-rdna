@@ -62,6 +62,44 @@ inline size_t lat_smem_bytes() {
     return (size_t) 2 * WROWS * LWPITCH + (size_t) 2 * kTileRows * LAPITCH + (size_t) kTileRows * 4;
 }
 
+// STRATA_LAT_Q3K_INFO=1: the launch's residency, measured on this device - the registers and scratch the kernel
+// actually got, and how many blocks of this shape the driver keeps per CU.  The per-launch time probe (in
+// prefill.cpp's arm_launch) says how long a launch takes; this says how much of the card it can be using.  Printed
+// for the first three shapes only (a prompt has thousands of launches).
+void lat_info(const void* fn, unsigned gx, unsigned gy, unsigned gz, int threads, size_t smem) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_LAT_Q3K_INFO");
+        return v != nullptr && v[0] == '1';
+    }();
+    static int printed = 0;
+    if (!on || printed >= 3) return;
+    ++printed;
+    int dev = 0, sms = 0;
+    int blocks = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+#if defined(__HIPCC__)
+    hipFuncAttributes fa{};
+    if (hipFuncGetAttributes(&fa, fn) != hipSuccess) { (void) hipGetLastError(); return; }
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, threads, smem) != hipSuccess) {
+        (void) hipGetLastError();
+        blocks = 0;
+    }
+#else
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, fn) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, threads, smem) != cudaSuccess) {
+        (void) cudaGetLastError();
+        blocks = 0;
+    }
+#endif
+    std::fprintf(stderr,
+                 "latq3kinfo down: grid=(%u,%u,%u) block=%d smem=%zu regs=%d scratch=%zu dynmax=%d blocks/cu=%d "
+                 "waves/cu=%d of 64 threads/cu=%d of 2048 cus=%d\n",
+                 gx, gy, gz, threads, smem, (int) fa.numRegs, (size_t) fa.localSizeBytes,
+                 (int) fa.maxDynamicSharedSizeBytes, blocks, blocks * threads / 32, blocks * threads, sms);
+}
+
 // One 16-value sub-block's 4 code words of 4 qs words (q[m] = values 4m .. 4m + 3, the natural order) permuted into
 // the staged order: out[k]'s byte c is the sub-block's value 4c + k.
 __device__ __forceinline__ void lat_stage_codes(const uint32_t* A, uint32_t (&out)[4]) {
@@ -306,6 +344,7 @@ void lat_q3k_down(const uint8_t* const* blob, const int32_t* starts, int n_group
     // A launch of a few experts (a verify window's, or one big group) has too few (group, 256-row) items to fill
     // the device: the group's tiles go over blockIdx.z as well.  With many groups the extra z blocks would only exit.
     const unsigned gz = (sms > 0 && (int) (gy * kItems) < sms) ? 8u : 1u;
+    lat_info((const void*) lat_q3k_down_kernel, (unsigned) kItems, gy, gz, LTHREADS, lat_smem_bytes());
     lat_q3k_down_kernel<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
         blob, starts, n_groups, (const uint8_t*) hq, out, ld, counts, ent_dst);
     dck(cudaGetLastError(), "launch");
