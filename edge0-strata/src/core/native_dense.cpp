@@ -534,6 +534,21 @@ bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>
 }
 
 const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int slot, int cls) {
+    // Which storage the hyper-connection read actually gets, printed once per (class, slot).  This is not decoration:
+    // an `up` that is dequantized per call costs a Q8 read PLUS a bf16 write of the whole matrix on EVERY layer of
+    // EVERY round, while a `down` served from `data` is a plain read.  The two stages read the same 6.55 MB a layer,
+    // so the only way they can differ is this choice, and the profile cannot see it: measured on gfx1031, `hc1 up`
+    // 18.33 ms a round against `hc1 down` 2.16 ms and an isolated 2.7 ms for the same read.
+    static bool told[2][2] = {};
+    if (cls >= 0 && cls <= 1 && slot >= 0 && slot <= 1 && !told[cls][slot]) {
+        told[cls][slot] = true;
+        const char* what = w.data != nullptr ? "direct bf16 in device memory"
+                         : w.hc_q8 != nullptr ? "Q8, dequantized into scratch on EVERY call"
+                         : "MISSING (both data and hc_q8 are null)";
+        std::fprintf(stderr, "strata hc: %s %s weight -> %s (%lld elements, %.1f MB bf16)\n",
+                     cls == 0 ? "attention-side" : "FFN-side", slot == 0 ? "down" : "up", what,
+                     (long long) w.elements, (double) w.elements * 2.0 / (1024.0 * 1024.0));
+    }
     if (w.data != nullptr) return (const uint16_t*) w.data;
     if (w.hc_q8 == nullptr) return nullptr;
     // the device's scratch (allocated at load, one pair per device): the prompt path and the single-token read run one

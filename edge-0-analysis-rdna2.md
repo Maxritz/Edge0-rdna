@@ -971,6 +971,73 @@
 > 24.61 ms**, down 2.89, **norm 0.30**.  So the 22.9 % decode item is the FFN-side hyper-connection *up
 > projection*, at ~0.51 ms a layer for 4 tokens: a latency-bound small-batch GEMV, not a norm.
 
+> ### 0.32 RDNA2 feature audit by measurement: cache policy and non-temporal loads are dead, and `hc1 up` is a live anomaly
+>
+> The RDNA2 ISA summary lists four unused features. Two of them are now measured, and the answer is no.
+>
+> **Non-temporal (streaming) loads on the expert stream - measured, and they HURT.** `tools/hip/q3k_nt_bench`
+> on this card, real Q3_K blob geometry (0.671 MB an expert), 96 experts = 64.5 MB (~21x the 3 MB L2):
+>
+> | case | cached | non-temporal | delta |
+> |---|---|---|---|
+> | stream, no reuse | 480.2 GB/s | 486.9 GB/s | **+1.4 %** |
+> | reuse 4x an expert | 1756.2 GB/s | 1628.5 GB/s | **-7.3 %** |
+> | reuse 16x an expert | 3589.3 GB/s | 2410.3 GB/s | **-32.8 %** |
+>
+> Byte-identical results in every arm. A prompt chunk routes many rows to the same expert, so the real workload
+> is the reuse case, not the pure stream - non-temporal loads would cost 7-33 %. (The 480 GB/s on a 384 GB/s
+> part is the 96 MB Infinity Cache doing its job; the card's real DRAM rate is ~170 GB/s, see below.)
+>
+> **Cache policy (glc/slc, "cache-less") - measured flat.** `tools/hip/cache_policy_bench`, a 678.6 MB region
+> (> Infinity Cache, so DRAM-led): plain 169.8 GB/s, `__ldg` 169.8 GB/s, glc+slc 170.2 GB/s, 20.95 / 20.96 /
+> 20.90 ms. Nothing to win. 170 GB/s is the honest DRAM figure this card reaches.
+>
+> **`hc1 up` is an anomaly, and it is NOT the kernel.** The isolated read bench (`fused_gr_bench`, hipified),
+> cold over 48 weight sets = 48 layers (624 MB, no L2 residency), 4 tokens, per-stage GPU stamps:
+> `norm 11.2 / down 68.6 / up 56.8 us` a layer - i.e. 0.54 / 3.33 / 2.73 ms a round. The engine measures
+> `hc1 norm 0.298 / hc1 down 2.894 / hc1 up 24.608`. **down and norm match the bench; up is 9x it.**
+>
+> Two facts pin it down:
+>
+> 1. **It is not the up kernel.** Every up branch gives the same figure in alternating runs with the persistent
+>    read off: default (`gr_up_q32_kernel`) 18.351 / 18.331 ms, and `STRATA_QFUSE_HC_LOCAL=0`
+>    (`gr_up_multi_kernel` + `gr_q8_tail`) 18.328 ms. Output byte-identical throughout.
+> 2. **It does not scale with tokens.** `hc1 up` is 17.064 ms at T=1 and 18.283 ms at T=4, while `down` goes
+>    1.822 -> 2.157. So the cost is one weight read a layer (~0.49 ms), not arithmetic.
+>
+> That gives the page the two stages contradicting each other on identical byte counts, same layer, back to back:
+>
+> | stage | bytes a layer | ms a layer | implied bandwidth |
+> |---|---|---|---|
+> | `hc1 down` | 6.55 MB | 0.061 | 107 GB/s (VRAM-class) |
+> | `hc1 up` | 6.55 MB | 0.522 | **12.6 GB/s (PCIe-class)** |
+>
+> Both arrive as `(const uint16_t*) wu/hd[half]->data` (verify.cpp:1620), so the pointer *provenance* is the same;
+> what differs is which memory the two tensors actually landed in. `NativeDense::hc_bf16_view` has exactly such a
+> fork - `w.data` (direct) vs `w.hc_q8` (dequantized into scratch *on every call*) - and the decode path never
+> goes near it, so the decode-side residency is still unconfirmed. A one-time diagnostic now prints each HC
+> weight's storage ("direct bf16 in device memory" / "Q8, dequantized into scratch on EVERY call" / MISSING).
+>
+> **Next experiment, precisely:** print the storage class and pointer for `wu[half]`/`hd[half]` on the verify
+> path, then probe the achieved bandwidth of that exact pointer with the same kernel that gets 107 GB/s on
+> `w_down`. If `w_up` is mapped host memory, the fix is to place those 314 MB in VRAM, and the prize is 21.9 ms of
+> the 113 ms round - decode 20.3 -> ~25 tok/s profiled, ~26 -> ~32 unprofiled.
+>
+> **The expert cache, by contrast, is already at the literature's optimum and is not a lever.** Two results:
+> Lin et al. (arXiv 2511.05814) find LRU suboptimal for MoE offloading and LFU the improvement, plus speculative
+> prefetch - this engine already ranks its cache by activation frequency from `profile.bin`, which is LFU by
+> construction. Liang et al. (arXiv 2505.16056) measure 20 MoE models and find the effective cache is ~2x the
+> active experts; `--expert-cache auto` here gives 735 slots for a 512-expert layer, in that band. The trace
+> agrees: `VRAM hits` is 4.71 ms of the round.
+>
+> **MAPLE (AmSach/maple) is not an engine change.** It is *pruning*: profile the activation manifold, keep the top
+> K experts a layer, mask the excised router logits to -inf, and re-emit a smaller pack (DeepSeek-Coder-V2-Lite
+> 64 -> 54 experts, 8.57 GB -> 4.50 GB). Its score is `s = C * sqrt(sigma)`, whose `C` is exactly what
+> `--expert-profile` already records, so the profile we keep is the calibration it wants. Two consequences for
+> this repo: it changes the pack, not the engine, and it has no quality gate here - the reason Q4_0 for the latent
+> D table is still blocked applies unchanged. It would shrink the 73 GB expert stream, which is the prefill lever,
+> so it is worth doing *with* a KL/NLL gate, not before.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
