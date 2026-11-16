@@ -18679,6 +18679,12 @@ int main(int argc, char** argv) {
         std::vector<float> hash_rows;
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
+        // Sherlock: a speculative round is ONE number today (round_ms) and it covers four unrelated things - choosing and
+        // drafting the window, the verify window itself (the only phase PROF-T sees), the verdict and the emit, and
+        // draft_next (the MTP draft layer plus the 106,299-row head for the next round).  On the healthy device a round is
+        // ~100 ms while the verify window is ~51 ms, so half the decode had no attribution at all.  Host timing only.
+        double sp_choose = 0, sp_win = 0, sp_mid = 0, sp_draft_next = 0, sp_tail = 0, sp_round = 0;
+        int64_t sp_n = 0;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
@@ -18788,6 +18794,7 @@ int main(int argc, char** argv) {
         int win_cap = o.spec;   // the widest window the VRAM allows (lowered on an out-of-memory capture, see below)
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
+            const bool sp_timed = !first_window;   // the first window is the prompt's last token: excluded from round_ms
         retry_round:
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
             int T = S_mtp;
@@ -18834,6 +18841,8 @@ int main(int argc, char** argv) {
                 }
             }
             }
+            const Clock::time_point tp_choose = Clock::now();
+            if (sp_timed) sp_choose += std::chrono::duration<double, std::milli>(tp_choose - t0).count();
             // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
             // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
             // full window can overrun)
@@ -18894,6 +18903,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+            const Clock::time_point tp_win = Clock::now();
+            if (sp_timed) sp_win += std::chrono::duration<double, std::milli>(tp_win - tp_choose).count();
             if (drive.d.failed) {
                 std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",
                              (long long) drive.d.fail_layer, (long long) drive.d.fail_expert,
@@ -18966,19 +18977,25 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
+            const Clock::time_point tp_mid = Clock::now();
+            if (sp_timed) sp_mid += std::chrono::duration<double, std::milli>(tp_mid - tp_win).count();
             generation = {};
             const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
             const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new || draft_next(T, a);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
+            const Clock::time_point tp_dn = Clock::now();
+            if (sp_timed) sp_draft_next += std::chrono::duration<double, std::milli>(tp_dn - tp_mid).count();
             if (!drafted) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
             x = outv[(size_t) a];
             p += a + 1;
+            if (sp_timed) sp_tail += std::chrono::duration<double, std::milli>(Clock::now() - tp_dn).count();
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
+            if (sp_timed) { sp_round += round_ms; ++sp_n; }
             if (gated_proposal && !initial_round) source_policy.observe_committed(from_sfx, from_sfx ? T : std::min(S_mtp, room), a, sfx_match);
             if (gated_proposal && !initial_round && timed_round)   // p has advanced: the window was p - a - 1 ..
                 source_policy.defer_cost(std::max<int64_t>(p - a - 2 + T, p + S_mtp), T, round_ms);
@@ -19009,6 +19026,13 @@ int main(int argc, char** argv) {
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
+        if (sp_n > 0) {   // Sherlock: where a speculative round's ~100 ms actually goes, phase by phase (host timing only)
+            const double r = (double) sp_n;
+            std::printf("%-24s choose+draft %.3f  window %.3f  verdict+emit %.3f  draft_next %.3f  tail %.3f  "
+                        "(sum %.3f of %.3f ms/round over %lld rounds)\n",
+                        "  round phases", sp_choose / r, sp_win / r, sp_mid / r, sp_draft_next / r, sp_tail / r,
+                        (sp_choose + sp_win + sp_mid + sp_draft_next + sp_tail) / r, sp_round / r, (long long) sp_n);
+        }
         if (!follow.empty())
             std::printf("%-24s %lld of %lld emitted tokens differ from the argmax\n", "follow",
                         (long long) follow_differ, (long long) follow_emitted);

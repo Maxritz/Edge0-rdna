@@ -1,5 +1,45 @@
 # Edge0 / Strata on RDNA2 (gfx1031) — full audit and optimisation plan
 
+> ## §0 CORRECTION (added 2026-11-16, after the measurements below were taken)
+>
+> **Every number in §2–§10 of this document was measured with the GPU in a fault state.** The adapter
+> was reading its own VRAM at **22.6 GB/s instead of 361.5 GB/s**; its caches (587–841 GB/s) and its
+> compute (15.1 TFLOP/s fp32) stayed completely healthy, so nothing inside the process looked wrong.
+> A reboot — with no code change at all — produced:
+>
+> | | this document's numbers (fault) | after the reboot |
+> |---|---|---|
+> | decode | 4.99 tok/s | **23.56–24.67 tok/s** (4.7×) |
+> | prefill | 87.66 tok/s | **126.65–126.85 tok/s** (1.44×) |
+> | TTFT | 47.1 s | **32.4 s** |
+> | decode window T1 | 377.55 ms | **58.73–59.72 ms** (6.4×) |
+> | `wait for rings` | 355.66 ms | **51.28–52.58 ms** (6.8×) |
+> | engine Q8_0 GEMV, standalone | 20–21 GB/s | **354–357 GB/s** = 93 % of the card's 384 GB/s spec |
+>
+> So the two headlines of this audit — "the A stage is 61 % of prefill device time because it runs one
+> expert per launch" and "decode is 12.5× off because of the handshake" — are **artefacts of the fault**:
+> a 17× slower memory path inflates every bandwidth-bound stage and every wait that depends on one.
+> The kernel-level findings that are *not* bandwidth-bound still stand (the A-stage VGPR ceiling and its
+> spills, the per-expert launch geometry at small chunk sizes, `--kv turbo3` costing decode time, the
+> `STRATA_EMBED_VRAM=0` width change), but their ranking must be re-derived from the healthy baseline.
+>
+> The ranking after the correction, from `PROF-T` on the healthy device (`re2.log`, per window):
+>
+> | stage | T1 ms | T4 ms | share of the T4 window |
+> |---|---|---|---|
+> | `copy+combine` | 16.7 | **39.0** | 42 % |
+> | FFN-side hyper-connection read (`hc1 up`) | 19.0 | 20.3 | 22 % |
+> | dense GEMVs (`qkv` 3.0, `z` 1.9, `out-proj` 1.9, `q` 1.5) | | 8.3 | 9 % |
+> | LM head (289 MB) | 2.0 | 2.3 | 2.5 % |
+>
+> and, outside the window entirely, **half of a decode round**: `Verifier::run` is 97 ms/round while the
+> ring loop is 51 ms/round, so ~46 ms is staging/head/commit that `PROF-T` never sees. That, plus
+> `copy+combine`, is where the remaining 2.5× to the reference row lives — not in the projection kernels.
+>
+> A guard now exists so this cannot be repeated: `mem_path_probe` (`src/kernels/cuda/mem_path.cu`,
+> commit `77042f7`) measures DRAM against cache bandwidth at every startup and prints
+> `strata: memory path: DRAM … GB/s, cache … GB/s (ratio …) - healthy|DEGRADED`. `STRATA_MEM_PATH=0` off.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
