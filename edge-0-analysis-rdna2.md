@@ -794,6 +794,30 @@
 > ~249 tok/s and byte-identical output at all three cache sizes, plus the 512K + MTP configuration still
 > starting (177 slots, exit 0) - the last one is why this is not a one-line cap.
 
+> ### 0.25 The auto-chunk defect is real and now measured at a FIXED cache size
+>
+> 0.24 compared chunk 512 (796-803 slots) against 1024 (~570 slots), which confounds the chunk with the
+> cache.  Same prompt, same cache (~557-570 slots, `--vram-reserve-mib 1024`), alternating pairs:
+>
+> | arm | chunk | prefill |
+> |---|---|---|
+> | `--prefill auto` (picks 1024) | 1024 | 203.31 / 201.66 tok/s |
+> | `--prefill 512` (pinned) | 512 | **244.16 / 244.14** |
+>
+> So **-21 % from the auto pick alone**, at identical cache size and byte-identical output.  The defect is
+> proven; my first cost-model attempt was not the fix (it did not fire as intended and its premise was
+> drawn from the confounded pair), and it is reverted.
+>
+> What the model must reproduce, and the one thing that is still unclear: the ring-full test CANNOT
+> separate 512 from 1024 here (`room_of(t)` grows as t falls and is capped at ring_max, so both fill it),
+> which means `scan` is really "the biggest chunk whose lend cap fits" - and at ~560 slots 1024 fits.  Why
+> 1024 then loses 21 % needs one more measurement before a formula can be written: at the same cache,
+> what do the blobs and `resident` look like for the two arms (0.22's proxy: 63.6k blobs at 512 against
+> 80.1k at 1024 came from *different* cache sizes and may not hold).
+>
+> Until the formula is derived from that pair, the shipped behaviour is unchanged (0.23's ring 96 gives
+> chunk 512 at 796-803 slots, 249.00 / 248.54 tok/s) and every harness pins the chunk explicitly.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
