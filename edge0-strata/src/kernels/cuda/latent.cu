@@ -495,9 +495,146 @@ void latent_u_tiled(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids,
     u_run_ck(cudaGetLastError(), "latent_u_tile");
 }
 
+// ---- the decode-shaped U tile -------------------------------------------------------------------
+//
+// `latent_u_tile_k` above owns a 64-row tile because prefill's groups carry ~25-50 entries.  Decode's
+// do not: `cap` is ten rows a layer, usually one per label, so that tile pads 64 rows for 1 and stages
+// MORE than the per-row kernel (52 MB against 35 MB a layer) - measured: u: gemv stayed 13.23 ms with
+// it.  At that size the per-row kernel is bound by BLOCK COUNT (320 blocks a row x 10 rows x 48 layers
+// = ~154k blocks a round at ~86 ns), not by bytes, so the fix is fewer, fatter blocks:
+//
+//   one block = (a label's <= 16 routed rows) x (256 output columns), 256 threads, lane = column.
+//
+// A weight byte then serves 16 rows instead of 1, a layer issues ~150 blocks instead of 3,200, and the
+// block's inner loop needs no cross-lane reduction at all: each lane owns its column and keeps 16
+// accumulators, reading its own four staged words and the row's four, one __dp4a each, with the scale
+// product applied once per 16 values.  19,584 B of smem (3 blocks a CU) and ~40 VGPRs.
+//
+// Arithmetic: numerically equal to the per-row kernel, not bit-identical (the scale moves from every
+// 4 values to every 16) - same class as the prefill tile, gated by latent_u_tile_test.
+constexpr int kUSmallThreads = 256;
+constexpr int kUSmallCols = 256;     // output columns a block owns (one lane each)
+constexpr int kUSmallRows = 16;      // routed rows a block owns (16 accumulators a lane)
+
+inline size_t u_small_smem_bytes() {
+    return (size_t) (kUSmallCols + kUSmallRows) * kUPitch;
+}
+
+__global__ void __launch_bounds__(kUSmallThreads, 2)
+latent_u_tile_s_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq,
+                  const int32_t* __restrict__ rows, const int32_t* __restrict__ goff, int n_groups, int ELL,
+                  int H, float* __restrict__ out, int64_t n_ident) {
+    extern __shared__ __align__(16) uint8_t smem[];
+    uint8_t* wst = smem;                                    // kUSmallCols staged weight rows
+    uint8_t* ast = smem + (size_t) kUSmallCols * kUPitch;   // kUSmallRows staged activation rows
+
+    const int nbchunk = ELL >> 6;                    // 64-value chunks along K (20 for ELL 1280)
+    const size_t wrowb = (size_t) (ELL / 32) * 34;   // a Q8_0 weight row
+    const size_t arowb = (size_t) (ELL / 32) * 36;   // a q8_1 activation row
+
+    int tile = blockIdx.x, g = 0, base = 0, nrows = 0;
+    if (rows == nullptr || goff == nullptr) {        // one matrix, identity rows (the D projection)
+        if ((int64_t) tile * kUSmallRows >= n_ident) return;
+        base = tile * kUSmallRows;
+        nrows = min(kUSmallRows, (int) n_ident - base);
+    } else {
+        for (; g < n_groups; ++g) {
+            const int c = goff[g + 1] - goff[g];
+            const int nt = (c + kUSmallRows - 1) / kUSmallRows;
+            if (tile < nt) break;
+            tile -= nt;
+        }
+        if (g >= n_groups) return;
+        const int c = goff[g + 1] - goff[g];
+        base = goff[g] + tile * kUSmallRows;
+        nrows = min(kUSmallRows, c - tile * kUSmallRows);
+        if (nrows <= 0) return;
+    }
+
+    const int col0 = (int) blockIdx.y * kUSmallCols;
+    const int tid = threadIdx.x;                     // one thread a column
+    float acc[kUSmallRows];
+#pragma unroll
+    for (int r = 0; r < kUSmallRows; ++r) acc[r] = 0.0f;
+
+    for (int kb = 0; kb < nbchunk; ++kb) {
+        __syncthreads();
+        {   // this thread's column: 64 codes + the two 32-value scales.  The blocks are 34 bytes
+            // ({half d; int8 qs[32]}) and 36 ({half d; half s; int8 qs[32]}), so the second block's codes
+            // do NOT follow the first block's contiguously - they start after its scale.
+            const int wcol = min(col0 + tid, H - 1);
+            const uint8_t* wp = u_q8 + (size_t) g * (size_t) H * wrowb + (size_t) wcol * wrowb + (size_t) kb * 68;
+            uint8_t* ws = wst + (size_t) tid * kUPitch;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) *(uint32_t*) (ws + 4 * i) = (uint32_t) latent_ld4_i8(wp + 2 + 4 * i);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) *(uint32_t*) (ws + 32 + 4 * i) = (uint32_t) latent_ld4_i8(wp + 36 + 4 * i);
+            *(__half*) (ws + 64) = *(const __half*) wp;
+            *(__half*) (ws + 66) = *(const __half*) (wp + 34);
+        }
+        if (tid < kUSmallRows) {   // one thread a row: its 64 codes + the two scales
+            const int rr = rows != nullptr ? rows[base + tid] : base + tid;
+            const uint8_t* xp = ylq + (size_t) rr * arowb + (size_t) kb * 72;
+            uint8_t* as = ast + (size_t) tid * kUPitch;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) *(uint32_t*) (as + 4 * i) = *(const uint32_t*) (xp + 4 + 4 * i);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) *(uint32_t*) (as + 32 + 4 * i) = *(const uint32_t*) (xp + 40 + 4 * i);
+            *(__half*) (as + 64) = *(const __half*) xp;
+            *(__half*) (as + 66) = *(const __half*) (xp + 36);
+        }
+        __syncthreads();
+        const uint8_t* ws = wst + (size_t) tid * kUPitch;
+        for (int s = 0; s < 4; ++s) {                // 16-value sub-blocks of the 64-value chunk
+            const int si = (s & 2) ? 2 : 0;          // which 32-value block's scale
+            const float dw = __half2float(*(const __half*) (ws + 64 + si));
+            int d[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) d[j] = (int) *(const uint32_t*) (ws + 16 * s + 4 * j);
+            for (int r = 0; r < nrows; ++r) {
+                const uint8_t* as = ast + (size_t) r * kUPitch;
+                const float dx = __half2float(*(const __half*) (as + 64 + si));
+                int a = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    a = __dp4a(d[j], (int) *(const uint32_t*) (as + 16 * s + 4 * j), a);
+                acc[r] += (dw * dx) * (float) a;
+            }
+        }
+    }
+    for (int r = 0; r < nrows; ++r) {
+        const int col = col0 + tid;
+        if (col >= H) continue;
+        out[(size_t) (rows != nullptr ? rows[base + r] : base + r) * (size_t) H + col] = acc[r];
+    }
+}
+
+void latent_u_tiles(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
+                    int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
+                    int G) {
+    if (n <= 0 || fmt != 8 || G <= 0 || (ELL & 63) != 0 || scratch == nullptr) return;
+    if (u_q8 == nullptr || ylq == nullptr || ids == nullptr || labels_dev == nullptr || out == nullptr) {
+        std::fprintf(stderr, "latent_u_tiles: NULL pointer\n");
+        std::abort();
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    int32_t* goff = nullptr;
+    int32_t* rows = nullptr;
+    u_run_tables(ids, labels_dev, E, n, scratch, G, s, &goff, &rows);
+    static bool attr = false;
+    if (!attr) {
+        u_run_ck(cudaFuncSetAttribute(latent_u_tile_s_k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      (int) u_small_smem_bytes()), "u small tile smem");
+        attr = true;
+    }
+    const int64_t ntiles = (n + kUSmallRows - 1) / kUSmallRows + G;
+    dim3 grid((unsigned) ntiles, (unsigned) ((H + kUSmallCols - 1) / kUSmallCols));
+    latent_u_tile_s_k<<<grid, kUSmallThreads, u_small_smem_bytes(), s>>>(u_q8, ylq, rows, goff, G, ELL, H, out, n);
+    u_run_ck(cudaGetLastError(), "latent_u_tile_s");
+}
+
 void latent_d_tiled(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, int64_t n_out, float* out,
-                    void* stream, int fmt) {
-    // The D projection: every token against the whole [G*ELL, N] dense matrix, no groups (each token
+                    void* stream, int fmt) {    // The D projection: every token against the whole [G*ELL, N] dense matrix, no groups (each token
     // uses G*ELL outputs whatever its route), so the same staged tile serves it with rows == nullptr -
     // identity row order.  T=512 gives 8 full 64-row tiles, i.e. no padding at all, where the U side
     // runs at 39 % fill.

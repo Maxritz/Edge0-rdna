@@ -2472,15 +2472,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // Slots are stream stamps, never a host synchronise - a host CUDA call inside the capture window is
             // the issue #31 driver-lock hazard this very block warns about two lines down.
             static const bool v_up = std::getenv("STRATA_VERIFY_U_PROF") != nullptr;
-            // STRATA_VERIFY_U_TILE=1: decode's GPU-rows U on the staged tile (the kernel that took prefill's U
-            // from 23.7 to 2.7 ms a layer).  The per-row kernel re-reads a label's whole U slice once per
-            // routed row - ~40 rows x 3.5 MB x 48 layers a round - which is the same defect the tile fixed.
-            static const bool v_ut = [] {
+            // STRATA_VERIFY_U_TILE: 1 = the prefill tile, 2 = the decode-shaped tile (16 rows, one lane a
+            // column).  The 64-row tile measured neutral here (cap is 10 rows a layer, ~1 per label); the
+            // small tile issues ~150 blocks a layer instead of ~3,200.
+            static const int v_ut = [] {
                 const char* v = std::getenv("STRATA_VERIFY_U_TILE");
-                return v != nullptr && v[0] == '1';
+                return v != nullptr ? std::atoi(v) : 0;
             }();
             if (v_up) stamp(l, 33, grp);        // slot 33 = this layer's U
-            if (v_ut)
+            if (v_ut == 2)
+                strata::kernels::latent_u_tiles(lat_u_ + (size_t) l * lat_dense_.u_bytes(), (const uint8_t*) lat_uq_,
+                                                ids_ + (size_t) tb * K, lat_labels_dev_ + (size_t) l * (size_t) lat_E_,
+                                                lat_E_, cap, (int) lat_ELL_, (int) N, hit_out, hit_scratch_, cs,
+                                                lat_fmt_, lat_G_);
+            else if (v_ut == 1)
                 strata::kernels::latent_u_tiled(lat_u_ + (size_t) l * lat_dense_.u_bytes(), (const uint8_t*) lat_uq_,
                                                 ids_ + (size_t) tb * K, lat_labels_dev_ + (size_t) l * (size_t) lat_E_,
                                                 lat_E_, cap, (int) lat_ELL_, (int) N, hit_out, hit_scratch_, cs,

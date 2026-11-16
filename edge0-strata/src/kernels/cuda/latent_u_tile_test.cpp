@@ -156,6 +156,32 @@ int main() {
         std::printf("FAIL: the D tile (identity rows) is not numerically equal\n");
         ok = false;
     }
+
+    // The decode-shaped tile (16 rows a block, one lane a column) against the same per-row reference.
+    // n = 20 rows over 3 groups exercises both a full 16-row tile and the 4-row tail.  The per-row
+    // reference has to be re-taken here: `ref` above now holds the D (single-group) result.
+    strata::kernels::latent_u_grouped(dw, da, dids, dlab, kE, kRows, kELL, kH, dref, nullptr, 8, kG);
+    strata::kernels::latent_u_tiles(dw, da, dids, dlab, kE, kRows, kELL, kH, dtile, scratch, nullptr, 8, kG);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(ref.data(), dref, ref.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(tile.data(), dtile, tile.size() * 4, cudaMemcpyDeviceToHost));
+    double s_max_rel = 0.0, s_sum_rel = 0.0, s_dot = 0.0, s_nr = 0.0, s_nt = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double dv = std::fabs((double) tile[i] - (double) ref[i]);
+        const double rel = dv / (std::fabs((double) ref[i]) + 1e-6);
+        if (rel > s_max_rel) s_max_rel = rel;
+        s_sum_rel += rel;
+        s_dot += (double) ref[i] * (double) tile[i];
+        s_nr += (double) ref[i] * (double) ref[i];
+        s_nt += (double) tile[i] * (double) tile[i];
+    }
+    const double s_mean_rel = s_sum_rel / (double) ref.size();
+    const double s_cos = s_dot / (std::sqrt(s_nr) * std::sqrt(s_nt) + 1e-30);
+    std::printf("small tile  : mean_rel %.3e  max_rel %.3e  cos %.9f\n", s_mean_rel, s_max_rel, s_cos);
+    if (!(s_mean_rel < 1e-5) || !(s_cos > 0.9999999)) {
+        std::printf("FAIL: the decode-shaped tile is not numerically equal\n");
+        ok = false;
+    }
     std::printf("%s\n", ok ? "PASS latent_u_tile_test" : "FAIL latent_u_tile_test");
     return ok ? 0 : 1;
 }

@@ -363,6 +363,37 @@
 > 3000 -> 3200 MT/s is +6.7 % on paper and would move decode by ~1.4 %; the pool kernel has at most
 > ~15 % of headroom.  Neither is the lever the round's own split points at.
 
+> ### 0.9 The decode-shaped U tile: built, parity-clean, and 7x slower - both tiles lose, for a reason
+>
+> At decode's shape `cap` is **10 routed rows a layer, one per label**, so there is no row reuse for any
+> tile to exploit while a tile still pays a full slice stage.  Measured, alternating pairs, same 32-token
+> prompt, `u: gemv` from the round table:
+>
+> | U kernel | u: gemv | decode | note |
+> |---|---|---|---|
+> | per-row (`latent_u_grouped`, shipped) | **9.92 / 9.94 ms** | **25.19 / 25.10 tok/s** | 3,200 blocks a layer, no smem, no syncs |
+> | prefill tile (64 rows, `U_TILE=1`) | 13.23 | 24.79-25.38 | stages 52 MB a layer for 35 MB of work |
+> | decode tile (16 rows, lane-per-column, `U_TILE=2`) | **68.7 / 69.0 ms** | 14.09 / 15.10 | 100 blocks a layer, but 20 syncs each for one row |
+>
+> The decode tile is new here (256 columns x <=16 rows, one lane a column, 16 accumulators, no cross-lane
+> reduction, 19,584 B of smem) and it is numerically clean - `latent_u_tile_test` now covers it and prints
+> **mean_rel 3.733e-07, cos 1.000000000** against the per-row kernel, the same figures as the prefill
+> tile.  It is still 7x slower in the engine, and the reason is the shape, not a bug: with one row a
+> label, its 256-thread block stages 17 KB into shared for four `__dp4a` per thread per chunk, twenty
+> times, and only ~5 blocks an SM can hide that.  The per-row kernel is better precisely because its
+> blocks stage 10.9 KB and compute immediately, with 3,200 of them in flight instead of 100.
+>
+> So decode's `u: gemv` is **irreducible in this direction**: a label's U slice is needed once per routed
+> entry, ~35 MB a layer (~1.7 GB a round), and the shipped kernel already runs it at ~127 GB/s effective.
+> The byte floor at the Infinity Cache's 1.38 TB/s is ~1.2 ms a round (4.4 ms at DRAM), so there is room,
+> but only a layout change can take it: a **transposed U table** (column-major, so one lane can read a
+> column coalesced and a block covers 256 columns with no staging and no syncs) - which needs ~167 MB of
+> VRAM, available at 4K context but not at 512K.  That is the next step, and it is a weight-layout change,
+> not another tile size.
+>
+> Both tile variants stay behind `STRATA_VERIFY_U_TILE` (0 = shipped per-row, 1 = prefill tile, 2 = decode
+> tile), default 0, because a measured negative is worth more than a deleted one.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

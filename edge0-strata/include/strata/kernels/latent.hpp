@@ -45,6 +45,14 @@ void latent_u_tiled(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* id
                     int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
                     int G);
 
+/// The DECODE-shaped tile: one block = (a label's <= 16 routed rows) x 256 columns, one lane a column, no
+/// cross-lane reduction.  Decode's groups carry ~10 rows, where the 64-row tile pads 64 rows for 1 and
+/// stages more than the per-row kernel; this one issues ~150 blocks a layer instead of ~3,200.  Same
+/// outputs as latent_u_grouped up to fp32 rounding (scale per 16 values instead of per 4).
+void latent_u_tiles(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* ids, const int32_t* labels_dev,
+                    int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
+                    int G);
+
 /// The same staged tile for the D projection (no groups: every token against the whole [n_out, K]
 /// matrix).  `out` is [M, n_out] fp32, the layout the caller then quantizes to the xl rows' q8_1.
 void latent_d_tiled(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, int64_t n_out, float* out,
