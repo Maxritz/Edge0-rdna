@@ -126,6 +126,12 @@
 > **-13.2 % on the prompt, byte-identical tokens.**  The deeper prefetch alone (lookahead 28 instead of
 > 4) already cut `wait copy` by two thirds; the wider launch then took the dot product's rate up 2.5x.
 >
+> The ring change touches the one configuration that must never break - 512K context + MTP on a 12 GiB
+> card, which runs at zero free VRAM by design - so it was re-run after the change: exit 0, 179 expert
+> slots, `strata: memory path: DRAM 696.2 GB/s, cache 1447.1 GB/s - healthy`, and the same four tokens
+> as before (`715 1822 1822 1822`, decode 7.85 tok/s).  The extra slots cost no VRAM: `stage_slots()`
+> was already 32 and `stage_dev`/`copied` were already sized for it; only the modulus changed.
+>
 > | attempt | result |
 > |---|---|
 > | MMQ A stage (`LAT_FUSED_Q3K=0 LATENT_MMQ=1`) | 39,240 ms - gate/up product 2.5x faster but `dequant` 4,871 + `wait copy` 10,385 |
