@@ -67,55 +67,83 @@
 > `STRATA_EMBED_VRAM=0`, which changes the U width (H 2560→10240) and costs decode 9%; the cache win
 > alone is not reachable without freeing ~644 MiB of VRAM elsewhere.
 >
-> The baseline to beat, then, on the healthy device: **decode ≈ 25.4 tok/s, prefill ≈ 127 tok/s,
-> TTFT ≈ 32.4 s** (reference row: 62.4 / 430 / —, i.e. 2.5× and 3.4× away).
+> The baseline to beat, then, on the healthy device: **decode ≈ 25.4 tok/s, TTFT ≈ 29.0 s**, and
+> prefill **142.1 tok/s** as of `fb1a943` (it was 127 before the launch-width fix in §0.3; reference
+> row: 62.4 / 430 / —, i.e. 2.5× and 3.0× away).
 >
-> ### §0.2 The prefill ledger, re-taken on the healthy device (`pf_why.log`, `STRATA_PREFILL_TIMING=1`)
+> ### §0.2 The prefill ledger, re-taken after the launch-width fix (`final1.log`, `STRATA_PREFILL_TIMING=1`)
 >
-> 4063 tokens, GPU timeline **32,280 ms**, wall 32,285 ms, host staging 100 ms.  Supersedes §4.2.
+> 4063 tokens, GPU timeline **28,568 ms**, wall 28,573 ms, host staging 83 ms — **142.08 tok/s**
+> (confirmation run `final2.log`: 28,544 ms, 142.22 tok/s).  Supersedes §4.2 and the 32,280 ms ledger
+> that stood here before `fb1a943`.
 >
 > | phase | ms | share |
 > |---|---|---|
-> | gemm down (latent expert) | 9,192 | 28.5 % |
-> | gemm gate/up (latent expert) | 8,424 | 26.1 % |
-> | wait copy | 4,403 | 13.6 % |
-> | gather | 3,592 | 11.1 % |
-> | gdn (conv+gates+recurrence+out) | 3,593 | 11.1 % |
-> | qsa attention | 623 | 1.9 % |
-> | hc read: down+silu 658, up 294, inject 103, mix 67 | 1,122 | 3.5 % |
-> | router+shared 455, qsa proj 356, host grouping 194 | 1,005 | 3.1 % |
-> | combine 28, ple 61, embed+steps 70, hc read 4 | 163 | 0.5 % |
+> | gemm down (latent expert) | 8,954 | 31.3 % |
+> | gemm gate/up (latent expert) | 5,817 | 20.4 % |
+> | gather | 3,609 | 12.6 % |
+> | wait copy | 3,442 | 12.0 % |
+> | gdn (conv+gates+recurrence+out) | 3,606 | 12.6 % |
+> | qsa attention | 622 | 2.2 % |
+> | hc read: down+silu 655, up 280, inject 115, mix 63 | 1,113 | 3.9 % |
+> | router+shared 480, qsa proj 353, host grouping 196 | 1,029 | 3.6 % |
+> | combine 26, ple 61, embed+steps 72, hc read 4 | 163 | 0.6 % |
 >
-> So the two latent expert GEMMs are **54.6 %** of prefill and the data movement feeding them
-> (`gather` + `wait copy`) another **24.7 %**: 79 % of the prompt is the expert path.  63,357 expert
-> blobs are streamed per prompt — 73.5 GB — but `wait copy` is only 4.4 s, so the PCIe link is not the
-> wall; the GEMMs are.  They move ~13.7 TFLOP in 17.6 s, i.e. **≈780 GFLOP/s, about 3 % of the
-> gfx1031's int8 throughput**.  That, and not another launch-count tweak, is what the 3.4× on prefill
-> needs: a tiled int8 GEMM for the latent expert path (the material for it already exists in the tree:
-> `lat_mmq_bench`, `mmq_expert_bench`, and llama.cpp's `mul_mat_q` under `third_party/ggml`).
+> The expert path is still **76 %** of the prompt (gate/up + down + gather + wait copy), but it is
+> 21.8 s now instead of 25.4 s, and the shape of the remaining cost is different: with the launches
+> four times wider the gate/up kernel runs at **2.5× the rate it did** (5,817 ms for work that used to
+> take 8,424), which is the same product the MMQ tiled path achieved — so at a usable launch width the
+> fused kernel is already near the tiled one and the 3.4× is not in the dot product.
+> **gemm down (8,954 ms) is now the single largest phase** and the least efficient per MAC: it computes
+> 640 MACs per output row against gate/up's 1,280, yet takes 1.5× as long.  Its tiling redesign was
+> measured and lost (§0.4), because the engine's groups are ~50 entries and its 64-row tile already
+> covers a group in one tile.
 >
-> ### §0.3 The A stage, closed out (every alternative measured, none of them wins)
+> ### §0.3 The launch width was clamped to 4 groups — the whole "batch has no effect" story
 >
 > `STRATA_PREFILL_TIMING` + `STRATA_LATENT_NPROF` + `STRATA_LAT_Q3K_INFO` give the A stage's own shape
-> and cost.  One launch carries **4 expert groups / 64 entries and costs 238 µs** (3.08 µs/entry,
-> 30,700 launches per 4K prompt), on a grid of `(5,4,1)` = 20 blocks = **one block per CU**.
+> and cost.  One launch carried **4 expert groups / 64 entries and cost 238 us** (3.08 us/entry,
+> 16,176 launches per 4K prompt), on a grid of `(5,4,1)` = 20 blocks = **one block per CU**.
+>
+> The reason it was 4 and could not be anything else:
+>
+> ```cpp
+> const int stage_n = group_resident ? STAGE_GRP : STAGE;           // = 8 for a streamed walk
+> const size_t stage_batch = min(lat_staged_batch(), stage_n / 2);  // = 4
+> ```
+>
+> The staging buffers were never the limit - `stage_slots(T) = max(ring_slots(T), STAGE_GRP = 32)` and
+> the walk cycles `stage_next % stage_n`, so all 32 slots were already allocated.  Only the ceiling was
+> hard-coded to 8.  With `stage_n = stage_slots(T)` and the batch default 4 -> 16 (`fb1a943`):
+>
+> | run | GPU timeline | prefill | gemm gate/up | gemm down | wait copy |
+> |---|---|---|---|---|---|
+> | baseline (stage_n 8, batch 4) | 32,828 ms | 123.66 tok/s | 8,420 ms | 9,718 ms | 4,387 ms |
+> | stage_n 32, batch 4 | 30,550 ms | 132.87 tok/s | 9,657 ms | 9,051 ms | 1,531 ms |
+> | **stage_n 32, batch 16** | **28,492 ms** | **142.46 tok/s** | 6,170 ms | 8,987 ms | 2,981 ms |
+> | confirmation x2 | 28,573 / 28,544 | 142.08 / 142.22 | 5,817 / 5,823 | 8,954 / 8,965 | 3,442 / 3,434 |
+>
+> **-13.2 % on the prompt, byte-identical tokens.**  The deeper prefetch alone (lookahead 28 instead of
+> 4) already cut `wait copy` by two thirds; the wider launch then took the dot product's rate up 2.5x.
 >
 > | attempt | result |
 > |---|---|
-> | MMQ A stage (`LAT_FUSED_Q3K=0 LATENT_MMQ=1`) | 39,240 ms — gate/up product 2.5× faster but `dequant` 4,871 + `wait copy` 10,385 |
+> | MMQ A stage (`LAT_FUSED_Q3K=0 LATENT_MMQ=1`) | 39,240 ms - gate/up product 2.5x faster but `dequant` 4,871 + `wait copy` 10,385 |
 > | native grouped (`LAT_FUSED_Q3K=0`) | 42,849 ms |
-> | chunk 1024 (`--prefill 1024`) | 31,773 ms (−1.6 %, noise) and it streams *more* blobs (80,670) |
+> | chunk 1024 (`--prefill 1024`) | 31,773 ms (-1.6 %, noise) and it streams *more* blobs (80,670) |
 > | chunk 2048 | **fails**: `verify: layer 3 never rang (graph finished)` |
-> | batch 8 / 16 / 64 (capped at 16) | 32,097 / 32,114 / 32,111 — the total is conserved: fewer launches just move ~1.2 s from `wait copy` into the kernels |
-> | `amdgpu_num_vgpr(128)` | gate/up 8,424 → 19,926 ms (234 spilled registers) |
+> | batch 8 / 16 / 64, **before the clamp fix** | 32,097 / 32,114 / 32,111 - all three actually ran as 4 (`b2.log`: `last: nb=4`), so these measured the clamp, not the batch |
+> | batch 16, **with the clamp fixed** | 28,492 ms, 142.46 tok/s (`n2.log`: `last: nb=16`) |
+> | `amdgpu_num_vgpr(128)` | gate/up 8,424 -> 19,926 ms (234 spilled registers) |
 >
-> So the A stage is **not** launch-bound, not chunk-bound, not batch-bound and not helpable by the
-> compiler: it is compute-bound at ~3 µs/entry with both kernels at 256 VGPRs, 28/53 spilled, one block
-> per CU.  The remaining fix is the tiling redesign that halves the per-thread live state so 128 VGPRs
-> is reachable without spilling — and the gate for it now exists on this platform, because
-> `lat_q3k_down_test` (built for HIP in `387ce0a`) compares against a double-precision host reference and
-> **PASSES**, while reporting the shape sensitivity that motivates the work: the fused down kernel is
-> 3.59× slower than the native one at 4 entries per group and slightly faster at 200+.
+> So the A stage **was** launch-bound: the earlier "not batch-bound, the total is conserved" conclusion
+> was drawn from three runs that were silently clamped to the same batch.  Both kernels are still at
+> 256 VGPRs with 28/53 spilled and one block per CU, but at a proper launch width that costs far less
+> than it appeared to - the register cap is still a loss (`amdgpu_num_vgpr(128)`) and the tiling
+> redesign below is still a loss, so widening the launch was the cheap win hiding behind them.  The
+> gate that made it safe is `lat_q3k_down_test` (built for HIP in `387ce0a`), which compares against a
+> double-precision host reference and passes; the second gate was the 32-token output, byte-identical
+> across every arm above.
 >
 > ### §0.4 The tiling redesign, done and measured — and it is a loss
 >
