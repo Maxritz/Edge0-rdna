@@ -39,6 +39,62 @@
 > A guard now exists so this cannot be repeated: `mem_path_probe` (`src/kernels/cuda/mem_path.cu`,
 > commit `77042f7`) measures DRAM against cache bandwidth at every startup and prints
 > `strata: memory path: DRAM … GB/s, cache … GB/s (ratio …) - healthy|DEGRADED`. `STRATA_MEM_PATH=0` off.
+>
+> ### §0.1 What was fixed on the healthy device, and how it was validated
+>
+> Decode's window splits three ways at T4 (two stamps added in commit `55f048f`, `re5b.log`):
+> `pcie/uWait` **24.7 ms** (the GPU spinning for the CPU pool — 731 MB of expert weights per round from
+> DDR4 at 30.5 GB/s), `cpu/uCopy` 14.6 ms (hq copy + U matvec + hit rows), `copy+combine` **0.11 ms**
+> (the combine itself).  The 39 ms "copy+combine" the earlier ranking blamed was the profiler carrying
+> slot 23 forward, not the combine.
+>
+> `STRATA_HC_PERSIST` (one persistent hyper-connection read instead of ~12 launches per layer) is now
+> **default on for gfx10** and validated with two alternating pairs, because a single decode figure on
+> this box varies by ±9%:
+>
+> | | T4 window (ms) | decode (tok/s) |
+> |---|---|---|
+> | default read | 91.78 / 92.29 → **92.04** | 24.37 / 24.49 → **24.43** |
+> | persistent read | 88.73 / 89.34 → **89.04** | 25.46 / 25.39 → **25.43** |
+> | | **−3.3 %** | **+4.1 %** |
+>
+> with all 32 committed tokens identical to the default read (`re2.log` vs `h1.log`).
+>
+> **Rejected by measurement, so nobody re-tries it:** a bigger expert cache.  822 → 1062 slots
+> (`--vram-reserve-mib 256`) gave 25.02/25.55 (off) against 26.84/24.56 (on) — the second pair reverses
+> the first, so the effect is inside the run-to-run noise and it was not shipped.  1642 slots really
+> does cut the pool (26.1 → 21.5 ms/round) and prefill to 137.9 tok/s (+8.5%), but that arm needs
+> `STRATA_EMBED_VRAM=0`, which changes the U width (H 2560→10240) and costs decode 9%; the cache win
+> alone is not reachable without freeing ~644 MiB of VRAM elsewhere.
+>
+> The baseline to beat, then, on the healthy device: **decode ≈ 25.4 tok/s, prefill ≈ 127 tok/s,
+> TTFT ≈ 32.4 s** (reference row: 62.4 / 430 / —, i.e. 2.5× and 3.4× away).
+>
+> ### §0.2 The prefill ledger, re-taken on the healthy device (`pf_why.log`, `STRATA_PREFILL_TIMING=1`)
+>
+> 4063 tokens, GPU timeline **32,280 ms**, wall 32,285 ms, host staging 100 ms.  Supersedes §4.2.
+>
+> | phase | ms | share |
+> |---|---|---|
+> | gemm down (latent expert) | 9,192 | 28.5 % |
+> | gemm gate/up (latent expert) | 8,424 | 26.1 % |
+> | wait copy | 4,403 | 13.6 % |
+> | gather | 3,592 | 11.1 % |
+> | gdn (conv+gates+recurrence+out) | 3,593 | 11.1 % |
+> | qsa attention | 623 | 1.9 % |
+> | hc read: down+silu 658, up 294, inject 103, mix 67 | 1,122 | 3.5 % |
+> | router+shared 455, qsa proj 356, host grouping 194 | 1,005 | 3.1 % |
+> | combine 28, ple 61, embed+steps 70, hc read 4 | 163 | 0.5 % |
+>
+> So the two latent expert GEMMs are **54.6 %** of prefill and the data movement feeding them
+> (`gather` + `wait copy`) another **24.7 %**: 79 % of the prompt is the expert path.  63,357 expert
+> blobs are streamed per prompt — 73.5 GB — but `wait copy` is only 4.4 s, so the PCIe link is not the
+> wall; the GEMMs are.  They move ~13.7 TFLOP in 17.6 s, i.e. **≈780 GFLOP/s, about 3 % of the
+> gfx1031's int8 throughput**.  That, and not another launch-count tweak, is what the 3.4× on prefill
+> needs: a tiled int8 GEMM for the latent expert path (the material for it already exists in the tree:
+> `lat_mmq_bench`, `mmq_expert_bench`, and llama.cpp's `mul_mat_q` under `third_party/ggml`).
+
+
 
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
