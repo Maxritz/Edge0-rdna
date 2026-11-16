@@ -93,6 +93,30 @@
 > gfx1031's int8 throughput**.  That, and not another launch-count tweak, is what the 3.4× on prefill
 > needs: a tiled int8 GEMM for the latent expert path (the material for it already exists in the tree:
 > `lat_mmq_bench`, `mmq_expert_bench`, and llama.cpp's `mul_mat_q` under `third_party/ggml`).
+>
+> ### §0.3 The A stage, closed out (every alternative measured, none of them wins)
+>
+> `STRATA_PREFILL_TIMING` + `STRATA_LATENT_NPROF` + `STRATA_LAT_Q3K_INFO` give the A stage's own shape
+> and cost.  One launch carries **4 expert groups / 64 entries and costs 238 µs** (3.08 µs/entry,
+> 30,700 launches per 4K prompt), on a grid of `(5,4,1)` = 20 blocks = **one block per CU**.
+>
+> | attempt | result |
+> |---|---|
+> | MMQ A stage (`LAT_FUSED_Q3K=0 LATENT_MMQ=1`) | 39,240 ms — gate/up product 2.5× faster but `dequant` 4,871 + `wait copy` 10,385 |
+> | native grouped (`LAT_FUSED_Q3K=0`) | 42,849 ms |
+> | chunk 1024 (`--prefill 1024`) | 31,773 ms (−1.6 %, noise) and it streams *more* blobs (80,670) |
+> | chunk 2048 | **fails**: `verify: layer 3 never rang (graph finished)` |
+> | batch 8 / 16 / 64 (capped at 16) | 32,097 / 32,114 / 32,111 — the total is conserved: fewer launches just move ~1.2 s from `wait copy` into the kernels |
+> | `amdgpu_num_vgpr(128)` | gate/up 8,424 → 19,926 ms (234 spilled registers) |
+>
+> So the A stage is **not** launch-bound, not chunk-bound, not batch-bound and not helpable by the
+> compiler: it is compute-bound at ~3 µs/entry with both kernels at 256 VGPRs, 28/53 spilled, one block
+> per CU.  The remaining fix is the tiling redesign that halves the per-thread live state so 128 VGPRs
+> is reachable without spilling — and the gate for it now exists on this platform, because
+> `lat_q3k_down_test` (built for HIP in `387ce0a`) compares against a double-precision host reference and
+> **PASSES**, while reporting the shape sensitivity that motivates the work: the fused down kernel is
+> 3.59× slower than the native one at 4 entries per group and slightly faster at 200+.
+
 
 
 
