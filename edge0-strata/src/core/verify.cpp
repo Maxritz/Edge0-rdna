@@ -2199,6 +2199,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // the ring this pre publishes) waits on the xl doorbell: the D stage now has the whole router+plan+bell
             // stretch (~0.6 ms) of head start instead of starting when the pool is already waiting.
             quantize_q8_1_rows(mixed_, T, (int) N, lat_xq_, cs);
+            // STRATA_VERIFY_D_TILE=1: the same staged tile prefill's D uses (21.5 TFLOP/s there, and it made
+            // prefill's D 4.2x faster than iq_mmvq), here at M = T = 4.  It pads the row tile to 64 so the
+            // COMPUTE is 16x wasted, but it reads exactly the same 52 MB a layer that iq_mmvq does - and that
+            // read is what the 21.5 ms is spent on (2.5 GB a round at ~120 GB/s, against DRAM's ~384).
+            static const bool d_tile = [] {
+                const char* v = std::getenv("STRATA_VERIFY_D_TILE");
+                return v != nullptr && v[0] == '1';
+            }();
+            if (d_tile)
+                strata::kernels::latent_d_tiled((const uint8_t*) lat_d_ + (size_t) l * lat_dense_.d_bytes(),
+                                                (const uint8_t*) lat_xq_, T, (int) N,
+                                                (int64_t) lat_G_ * lat_ELL_, lat_xl_, cs, lat_fmt_);
+            else
             iq_mmvq(strata::kernels::lat_dense_fmt_to_type(lat_fmt_),
                     lat_d_ + (size_t) l * lat_dense_.d_bytes(), lat_xq_, lat_xl_, (int) N,
                     (int) (lat_G_ * lat_ELL_), T, cs);   // Q4DU: fmt->ggml type (8 Q8_0 / 2 Q4_0)
@@ -2815,7 +2828,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
 std::string Verifier::profile_by_t_report() {
     if (!prof_on_) return std::string();
-    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "u: gemv", "u: pool wait", "u: hqcp+matvec+hits"};
+    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "Dstg|hc0n", "rtpl|hc0d", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "u: gemv", "u: pool wait", "u: hqcp+matvec+hits"};
     std::string out;
     char b[96];
     for (int T = 1; T <= 8; ++T) {
@@ -3302,6 +3315,21 @@ void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
             }
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
+        {   // What the 16 -> 17 bucket actually is.  verify.cpp:2197-2224 runs the DECODE-side D stage inside
+            // it - iq_mmvq over the whole [G*ELL, N] matrix, a colscale, two quantizes, two mapped D2H copies
+            // and a doorbell - and stamps 32 where it ends, so 16..32 is the D stage and 32..17 the router, the
+            // plan and the shared expert.  Slots 30/31 carry this and the hc-read split's names: the two are
+            // mutually exclusive (that split only exists when its own stamps are written), so a run shows one.
+            const double dD = gap(at(l, 32), at(l, 16));
+            const double dR = gap(at(l, 17), at(l, 32));
+            const bool hc_split = gap(at(l, 27), at(l, 0)) > 0 && gap(at(l, 28), at(l, 27)) > 0 &&
+                                   gap(at(l, 1), at(l, 28)) > 0;
+            if (!hc_split && dD > 0 && dR > 0) {
+                prof_sum_[kind][30] += dD;         // "Dstg|hc0n"
+                prof_sum_[kind][31] += dR;         // "rtpl|hc0d"
+                prof_sum_[kind][17] -= dD + dR;    // 17 was 16 -> 17; nothing is counted twice
+            }
+        }
         {   // STRATA_VERIFY_U_PROF: the latent U path split inside the two buckets that shared it.  The window
             // stamps 21 -> 33 -> 34 -> 22 -> 35 -> 23 (quantize, the GPU-rows U, the pool's row wait, the hq copy
             // + the U matvec, the hit rows), so 22 and 23 are divided out of it - the table's total is unchanged,

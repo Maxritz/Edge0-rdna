@@ -453,6 +453,34 @@
 > have) or 3.5 MB of per-layer scratch plus a ~1 ms/round transpose kernel.  It is the one untested axis
 > and it is worth one experiment, with the scratch variant so no VRAM decision is needed.
 
+> ### 0.12 router+plan attributed: it is the decode D stage (21.46 ms), and it is a bytes problem
+>
+> Slot 17 is now split at the D stage's own stamp (`gap(32,16)` vs `gap(17,32)`), total still summing to
+> 90.02 ms.  One arm:
+>
+> | part of the 22.77 ms bucket | GDN | QSA | total |
+> |---|---|---|---|
+> | **D stage** (`iq_mmvq` + colscale + 2 quantizes + 2 mapped D2H copies + doorbell) | 15.488 | 5.968 | **21.46** |
+> | router + plan + shared expert | 1.234 | 0.410 | **1.64** |
+>
+> So the router is 1.6 ms and "plan" is nothing: the bucket is the decode-side D projection.  D reads its
+> whole matrix every layer - G*ELL x N = 19,200 x 2,560 Q8_0 = **52 MB a layer, 2.5 GB a round** - which at
+> the measured 15.3-17.4 ms is ~150 GB/s against DRAM's ~384, and the two mapped D2H copies are only 388 KB
+> a layer (0.7 % of those bytes), so the copies are not the cost either.
+>
+> **The staged D tile loses at M = 4**, measured: 21.27 / 21.48 ms against `iq_mmvq`'s 17.37 / 15.31, decode
+> 22.92 / 23.21 against 23.55 / 25.45 (tokens identical).  The tile moves the same bytes far better but pads
+> its row tile to 64 for 4 rows, and 16x the compute costs more than the streaming saves - the same reason
+> the decode U tile lost, for the same arithmetic reason.
+>
+> What is left for decode's D, in order of size:
+> 1. **fewer bytes**: the pack's D is Q8_0 (1.06 B a value).  Q4_0 would halve it to 26 MB a layer, i.e.
+>    ~2x on this 21.46 ms *and* free ~1.2 GB of VRAM for the expert cache - but it changes the model's
+>    arithmetic and there is still no KL/NLL gate to accept that, so it is the user's call, not a kernel's.
+> 2. **a decode-shaped D kernel**: M = 4 rows, no padding, 16-byte aligned staging, deep MLP - the tile's
+>    structure without its 64-row tile.  Realistic target the DRAM floor, 6.5-8.3 ms (+13-16 % decode).
+> 3. at T = 4 all 15 labels are needed (40 routed entries), so there is no routed-subset saving to take.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
