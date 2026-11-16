@@ -2529,13 +2529,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // bytes with no host CUDA call (the engine's own remedy for this path, generate.cpp:10329-10333).
                 strata::kernels::copy_bytes_from_mapped(hq_dev_, m_ymiss_ + (size_t) tb * K * N,
                                                         (size_t) cap * ((size_t) lat_ELL_ / 32 * 36), cs);
-                if (v_up) stamp(l, 35, grp);        // slot 35 = the U matvec (+ the hit rows, closed by 23)
+                if (v_up) stamp(l, 29, grp);        // slot 29 closes the copy (0.19-0.25 ms) and opens the matvec
+                // STRATA_VERIFY_U_CPU_GROUPED=1: the CPU rows' U on latent_u_grouped instead of latent_u_matvec.
+                // Both compute U[labels[ids[r]]] . hq[r] for the rows the pool owns; the matvec runs (G, H/8)
+                // blocks and walks every entry per block (81 GB/s effective), the grouped kernel is the one the
+                // GPU rows already use (126 GB/s).  Rows the GPU owns are computed from hq here - wrong values -
+                // but moe_hit_set ASSIGNS them from hit_out immediately after, so they never escape.
+                static const bool u_cpu_grouped = [] {
+                    const char* v = std::getenv("STRATA_VERIFY_U_CPU_GROUPED");
+                    return v != nullptr && v[0] == '1';
+                }();
+                if (u_cpu_grouped)
+                    latent_u_grouped(lat_u_ + (size_t) l * lat_dense_.u_bytes(), (const uint8_t*) hq_dev_,
+                                     ids_ + (size_t) tb * K, lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_,
+                                     cap, (int) lat_ELL_, (int) N, parts_out, cs, lat_fmt_);
+                else
                 strata::kernels::latent_u_matvec(lat_u_ + (size_t) l * lat_dense_.u_bytes(),
                                                  (const uint8_t*) hq_dev_,
                                                  ids_ + (size_t) tb * K, lat_labels_dev_ + (size_t) l * (size_t) lat_E_,
                                                  p_dst, p_counts + 1, (int64_t) lat_E_, cap,
                                                  (int) lat_ELL_, (int) N, (int) lat_G_, parts_out, cs, lat_fmt_);
-                if (v_up) stamp(l, 35, grp);        // slot 35 = the hit rows (the copy alone measured 0.19-0.25 ms)
+                if (v_up) stamp(l, 35, grp);        // slot 35 closes the matvec; 23 closes the hit rows
                 moe_hit_set(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);   // knife-0: assign, as u0 does
                 stamp(l, 23, grp);   // the hq copy + the U matvec + the hit rows are done; `copy+combine` is the combine
                 if (trace_m_ != nullptr) gpu_stamp(trace_m_, (l * kProfPer + 38) * 2, cs);   // T-TRI breadcrumb
@@ -2831,7 +2845,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
 std::string Verifier::profile_by_t_report() {
     if (!prof_on_) return std::string();
-    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "Dstg|hc0n", "rtpl|hc0d", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "u: gemv", "u: pool wait", "u: hqcp+matvec+hits"};
+    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx", "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve", "attention", "gate", "", "out-proj", "router+plan", "shared+quant", "waitA", "VRAM hits", "waitB", "pcie/uWait", "cpu/uCopy", "copy+combine", "(gap)", "head", "Dstg|hc0n", "rtpl|hc0d", "u: copy", "hc1 norm", "hc1 down", "hc1 up", "u: gemv", "u: pool wait", "u: matvec"};
     std::string out;
     char b[96];
     for (int T = 1; T <= 8; ++T) {
@@ -3341,14 +3355,16 @@ void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
             const double uq = gap(at(l, 33), at(l, 21));
             const double uu = gap(at(l, 34), at(l, 33));
             const double uw = gap(at(l, 22), at(l, 34));
-            const double uc = gap(at(l, 35), at(l, 22));
+            const double uc = gap(at(l, 29), at(l, 22));
+            const double um = gap(at(l, 35), at(l, 29));
             const double uh = gap(at(l, 23), at(l, 35));
-            if (uu > 0 || uc > 0) {
-                prof_sum_[kind][33] += uq + uu;    // "u: gemv"        (the q8_1 of H + the GPU-rows U)
-                prof_sum_[kind][34] += uw;         // "u: pool wait"   (the pool's rows for this group)
-                prof_sum_[kind][35] += uc + uh;    // "u: hqcp+matvec+hits"  (copy 0.25 ms, the rest is the matvec)
+            if (uu > 0 || um > 0) {
+                prof_sum_[kind][33] += uq + uu;    // "u: gemv"      (the q8_1 of H + the GPU-rows U)
+                prof_sum_[kind][34] += uw;         // "u: pool wait" (the pool's rows for this group)
+                prof_sum_[kind][29] += uc;         // "u: copy"      (hq rows into VRAM)
+                prof_sum_[kind][35] += um;         // "u: matvec"    (the CPU rows' U)
                 prof_sum_[kind][22] -= uq + uu + uw;
-                prof_sum_[kind][23] -= uc + uh;
+                prof_sum_[kind][23] -= uc + um;    // 23 keeps the hit rows only
             }
         }
         const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));

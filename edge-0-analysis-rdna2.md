@@ -532,6 +532,34 @@
 > only levers left are the bytes themselves (Q4_0 for the latent D table: ~2x on 15-21 ms and ~1.2 GB of
 > VRAM back) or moving expert bytes off PCIe (the CPU share, blocked by the Windows commit limit).
 
+> ### 0.15 The CPU-rows U fixed: latent_u_matvec -> latent_u_grouped, -32 % and the first decode gain
+>
+> The 14.4 ms "matvec+hits" bucket now has its parts on their own slots - copy 0.18 ms, matvec ~10.7,
+> hits 0.15-0.20 - and the matvec was the one decode kernel never compared against anything.  It is
+> strictly worse than the kernel the GPU rows already use: `latent_u_matvec` runs (G, H/8) blocks and
+> walks every entry inside each block, `latent_u_grouped` is the per-row kernel with the same arithmetic
+> at 126 GB/s.  Swapping is safe because `moe_hit_set` ASSIGNS the GPU rows from `hit_out` immediately
+> after, so the wrong values a full-range call computes for them never escape.
+>
+> | CPU-rows U | slot 35 | copy | hits | decode |
+> |---|---|---|---|---|
+> | `latent_u_matvec` (shipped until now) | 10.648 / 10.773 ms | 0.18 | 0.15-0.20 | 24.92 / 25.48 tok/s |
+> | **`latent_u_grouped`** | **7.224 / 7.328** | 0.18 | 0.09 | **26.36 / 26.31** |
+>
+> Two clean runs with it as the default: decode **25.70 / 26.27 tok/s**, prefill 228.56 / 229.96 (noise),
+> output byte-identical.  -32 % on that kernel, ~+3-4 % decode - the first decode movement of the session,
+> and it came from noticing that two kernels do the same job and only one had ever been timed.
+> `STRATA_VERIFY_U_CPU_GROUPED=0` restores the matvec.
+>
+> **On the A stage's DMA coalescing (the other half of this pass), measured indirectly but decisively:**
+> the A region is COUNT-sensitive, not just byte-sensitive.  At chunk 1024 the blob count rose 28 %
+> (63,361 -> 80,897) and `gemm gate/up` rose **70 %** (5,982 -> 10,196 ms); if the copies were pure
+> bandwidth, +28 % bytes could not cost +70 % time.  The host-side issue cost is negligible (84 ms for
+> 63,361 copies = 1.3 us each), so the penalty is per-transfer in the DMA engine - which is exactly what
+> coalescing consecutive experts (the walk visits them in sorted id order, and their arena blobs are
+> contiguous) into one `cudaMemcpyAsync` per run would remove.  That is the next prefill step and it does
+> not need the commit-limit change.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
