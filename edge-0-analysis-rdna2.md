@@ -708,6 +708,28 @@
 > user-gated levers (Q4_0 latent D; the Windows commit limit) nothing else on this engine has an
 > unmeasured avenue left.
 
+> ### 0.22 A 35 % cliff in `--prefill auto`: the chunk hinges on 50 MB of ambient VRAM
+>
+> Two clean runs of the SAME binary, minutes apart, returned 254.93 tok/s and 164.19 tok/s.  The difference
+> is not code and not the ring: everything up to "VRAM after the arena load" is byte-identical (4.42 GiB),
+> and then the cache sizer reads 1.89 GiB in the good runs and 1.83 GiB in the bad, and the chunk heuristic
+> picks accordingly:
+>
+> | free VRAM at the sizer | cache slots | `--prefill auto` chunk | chunks | blobs | prefill |
+> |---|---|---|---|---|---|
+> | 1.88-1.89 GiB | 790-793 | **512** | 8 | 63.6k | **250.7-254.9 tok/s** |
+> | 1.83-1.84 GiB | 741-753 | **256** | 16 | 105.2k | **164.2-171.7** |
+>
+> and 1.84 GiB has been observed on BOTH sides, so the threshold sits inside the run-to-run drift of ambient
+> VRAM (another process holding ~50 MB is enough).  The ring depth is not implicated - 32 / 96 / 128 slots
+> all gave chunk 512 at 1.84-1.88 GiB in one batch - so this predates 257e803 and would have bitten any
+> measurement taken on a busy machine.
+>
+> Practical consequence: `--prefill auto` is not a safe default for measurement on this box (a 3 % VRAM
+> difference is a 35 % throughput difference), so every A/B here pins the chunk explicitly, and the harnesses
+> should too.  The engine-side fix - hysteresis, or a floor that does not sit on the cliff - is a
+> configuration-logic change, not a kernel one, and it is the cheapest remaining robustness win in the tree.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
