@@ -560,6 +560,32 @@
 > contiguous) into one `cudaMemcpyAsync` per run would remove.  That is the next prefill step and it does
 > not need the commit-limit change.
 
+> ### 0.16 The staging ring was starving the copies: 32 -> 128 slots, prefill 229.4 -> 250.7 tok/s
+>
+> The PCIe probe settles the A stage's question and refutes my own coalescing plan: **28.0 GB/s host->device**
+> (best of 27.9 / 28.0 / 28.0 / 27.3), so the prompt's 73.5 GB of expert blobs is only **2.6 s** of
+> transfer.  Yet `wait copy` was 3.4 s and each copy occupied 41 us of DMA per 280 us of wall - the engine
+> sits **~85 % idle**, so the copies were ring-starved, and coalescing (fewer, bigger transfers) cannot
+> help an engine that is not busy.  The lever is ring depth, and `STRATA_STAGE_SLOTS` measures it:
+>
+> | ring slots | wait copy | prefill |
+> |---|---|---|
+> | 32 (shipped until now, 37 MB) | 3,397 / 3,385 ms | 229.44 / 229.68 tok/s |
+> | 64 | 2,440 / 2,437 | 242.47 / 242.51 |
+> | 96 | 2,124 | 246.34 |
+> | **128 (new default, 148 MB)** | **1,878 / 1,875** | **250.64 / 250.70 / 251.14** |
+> | 192 | 3,431 | 186.98 |
+> | 256 | 3,216 | 188.88 **and the output changes at token 27** |
+>
+> So 128 is the measured optimum and 192/256 are actively harmful (the VRAM the ring takes starts to bite
+> the expert cache and, at 256, something degrades numerically).  128 is what ships: two clean runs at
+> 250.70 / 251.14 tok/s with TTFT 18.1 -> 16.6 s and the output byte-identical, and 512K + MTP still
+> starts with it (177 cache slots against 179, exit 0, the same four tokens).
+>
+> The cost is 74 MB of VRAM out of the expert cache, which prefill barely uses - 428 of 63,545 blobs were
+> resident.  `gemm gate/up` is unchanged across every arm (5,610-5,632 ms), so this is purely the copy
+> wait: 19.3 % of the prompt at 32 slots, 11.6 % at 128.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

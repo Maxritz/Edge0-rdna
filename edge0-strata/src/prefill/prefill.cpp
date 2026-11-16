@@ -401,7 +401,27 @@ inline int ring_slots(size_t T) {
 }
 // The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
 // and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
-inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
+//
+// STRATA_STAGE_SLOTS=N overrides the depth (bounded by ring_cap()).  The measured reason it matters: the
+// PCIe probe says 28.0 GB/s host->device, so the prompt's 73.5 GB of expert blobs is only 2.6 s of
+// transfer, yet `wait copy` is 3.4 s a prompt and each copy occupies 41 us of DMA per 280 us of wall -
+// the engine is idle ~85 % of the time, i.e. the copies are ring-starved, not link-bound.  A deeper ring
+// (more slots, more prefetch ahead of the compute) is the lever; coalescing per-expert copies is not,
+// because an idle engine cannot be helped by fewer, bigger transfers.
+inline int stage_slots(size_t T) {
+    // 128 slots (148 MB) by default: measured 229.4 -> 250.6 tok/s with wait copy 3,397 -> 1,878 ms,
+    // two runs each identically, tokens unchanged.  64 gives 242.5 and 96 gives 246.3; 192 and 256 REGRESS
+    // (187 / 189 tok/s, and 256 alters the output at token 27), so 128 is the measured safe optimum.
+    // 512K + MTP still starts with it (178 cache slots against 179, exit 0, same four tokens).
+    // The ring is 74 MB more VRAM, taken out of the expert cache - which prefill barely uses (428 of 63k
+    // blobs were resident).  STRATA_STAGE_SLOTS=N overrides it (bounded by ring_cap()).
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_STAGE_SLOTS");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    const int base = env > 0 ? env : 128;
+    return std::min(std::max(base, std::max(ring_slots(T), STAGE_GRP)), ring_cap());
+}
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
