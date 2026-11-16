@@ -1085,6 +1085,42 @@
 > half skips when `apply` is false. That is the one asymmetry left to measure: stamp inside the FFN up's prologue
 > versus its stores.
 
+> ### 0.34 hc1 up: the state is VRAM too, the stores are ruled out, and the anomaly is now isolated but unexplained
+>
+> Extending 0.33's diagnostic to the activation state closes the last memory hypothesis:
+>
+> ```
+> strata hc: attention-side HC state: R DEVICE (VRAM) | R_out DEVICE (VRAM) | bo_prev DEVICE (VRAM) | lo DEVICE (VRAM)
+> strata hc: FFN-side HC state: R DEVICE (VRAM) | R_out DEVICE (VRAM) | bo_prev DEVICE (VRAM) | lo DEVICE (VRAM)
+> ```
+>
+> And the per-row store is ruled out by data already taken. The FFN read runs with `apply` forced true, so it
+> stores `R_out[i]` on all 10,240 rows - 40,960 scattered 4-byte stores a token. If those dominated, T=1 (one
+> store a row) would be about four times faster than T=4 (four stores a row); it is **17.064 vs 18.283 ms, 7 %**.
+>
+> So the standing ledger for this item, all with a byte-identical 32-token output:
+>
+> | hypothesis | result |
+> |---|---|
+> | up kernel choice | flat: 18.351 / 18.331 / 18.328 ms |
+> | arithmetic / token count | flat: 17.064 (T=1) / 18.283 (T=4) |
+> | q8_1 image write | flat: 18.418 vs 18.433 |
+> | weights in host memory | no - all DEVICE (VRAM), plain bf16, `hc_q8` null |
+> | read variant | flat: 18.452 / 18.402 / 18.345 |
+> | activation state in host memory | no - all DEVICE (VRAM) |
+> | per-row `R_out` stores | no - 7 % from T=1 to T=4 |
+>
+> **What remains, stated as the fact it is rather than a theory:** the attention-side up is **2.000 ms** a round
+> (42 us a layer, matching the isolated kernel's 57 us and a 148 GB/s read) and the FFN-side up is **18.433 ms**
+> (383 us a layer, 16 GB/s) - same 6.2 MB, same kernel family, same everything measurable. Nothing global to the
+> kernel, the data or the memory explains a 9x split between two calls of the same code, so the difference is in
+> how the FFN call is *made*: it is the only one inside the group loop with `apply` forced true, and it is the
+> call whose output feeds the MoE router. The instrument that settles it does not exist yet - a stamp pair
+> immediately around the up launch itself, which needs one spare profile slot; slot 15 is free and `at(l,15)` is
+> never written, so that is the change to make next, and it costs one build and one run.
+>
+> This item is **not** fixed, and no speedup has been claimed for it.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

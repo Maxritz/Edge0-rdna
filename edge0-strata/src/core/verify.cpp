@@ -1645,6 +1645,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              half == 0 ? "attention-side" : "FFN-side", mem_class(wi[half]->data),
                              mem_class(half == 0 ? (const void*) xq_ : (const void*) nat_xq_), nat ? 1 : 0,
                              wd[half]->hc_q8 != nullptr ? "set" : "null", wu[half]->hc_q8 != nullptr ? "set" : "null");
+                // The one asymmetry left between the halves: the FFN read runs with apply forced true, so its up
+                // stores R_out[i] for all 10,240 rows, one lane each - 40,960 scattered 4-byte stores per token.  If
+                // that state is host-mapped, every one of them is a PCIe transaction.
+                std::fprintf(stderr, "strata hc: %s HC state: R %s | R_out %s | bo_prev %s | lo %s | mixed %s\n",
+                             half == 0 ? "attention-side" : "FFN-side", mem_class(Rt(tb)),
+                             mem_class(half == 0 ? (const void*) Rt(tb) : (const void*) Rt(tb)),
+                             mem_class(bo_ + tb * N), mem_class(lo_ + tb * g.hc_lr), mem_class(mixed_ + tb * N));
             }
             FusedGrArgs fa[kFusedGrWideT];
             for (int t = tb; t < te; ++t) {
