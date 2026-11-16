@@ -635,6 +635,33 @@
 > decode inside the kernel, the same class of work the U and D tiles needed - and unlike those, its
 > weights arrive per group so its staging cannot be amortised further at 25 entries a group.
 
+> ### 0.19 Why the A stage is 4.86 ms: not the decode, not the inner loop - the spills
+>
+> The prescribed rewrite ("hoist the scale per 16-value sub-block, 4-byte-aligned staged loads") is
+> already in `lat_q3k_fused.cu`, twice over:
+>
+> * `store_chunk` stages each row as `16*s + 4*k` code words with a FLOAT scale at `64 + 4*s`, i.e. one
+>   scale per 16-value sub-block, 4-byte aligned;
+> * the HIP inner loop is four `__dp4a` per sub-block with `acc += (da * dx) * d` - the same shape that
+>   took prefill's U from 23.7 to 2.7 ms a layer;
+> * `lat_gu_decode` reads the Q3_K super-block with five `lat_ld4` dword groups (codes, hmask, scales)
+>   and unpacks with `__vsub4`/byte_perm - ~18 instructions per 32 staged values = **0.56 a value**,
+>   against the inner loop's 0.25 `dp4a` per value per tile row.  With ~25 real rows a group the decode
+>   is under 10 % of the instruction stream, so rewriting it cannot move the 4.86 ms.
+>
+> Where the time actually is, by the same arithmetic: useful work 9.6 TFLOP in 4.865 s = 1.97 TFLOP/s,
+> but the 64-row tile executes 2.56x that (39 % fill) = 5.1 TFLOP/s of executed int8 - about 7 % of the
+> card's ~73 TFLOP/s dp4a peak.  The inner loop's own issue efficiency is ~73 % (22 instructions per 64
+> MAC a lane, i.e. 93 of the 128 MAC a warp `dp4a` can issue), so the loop is NOT the limit either.  The
+> gap is occupancy: 256 VGPRs with 28 spilled registers and scratch 196 B/lane pin the kernel to ONE
+> block a CU, and the measured remedy for that - `amdgpu_num_vgpr(128)` to fit two - costs 234 spilled
+> registers and 2.4x the time (8,424 -> 19,926 ms).  Both directions measured, both worse.
+>
+> So the A stage's remaining gain needs a kernel with a smaller per-thread accumulator and no shared
+> staging to spill through - i.e. 2 blocks a CU at <=128 VGPRs by construction rather than by a cap.  The
+> two shape toggles that were available (batch 32 vs 16/48, tile 32 vs 64) are now measured and neither
+> moves it.  That rewrite is the next step and it is a new kernel, not a knob.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
