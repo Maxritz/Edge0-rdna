@@ -319,6 +319,9 @@ int g_ring_override = 0;   // #340: set by a layer split (Prefill::set_ring_over
 // on one chunk the smaller ring only slowed it (RTX 5070, 4K prompts: Coder -15%, IQ3_S -5%, IQ3_XXS -2%).
 int g_ring_budget = 0;
 int64_t g_ring_small_max = 0;
+// The expert cache's slot count (Prefill::set_cache_slots).  0 = unknown: the staging depth keeps its floor.
+// The ring and the chunk are one budget, and the depth is fixed at allocation time, before any chunk is planned.
+int g_cache_slots = 0;
 // #136: the fused experts (STRATA_PF_FUSED=1) launch on a batch of a layer's streamed experts at once, so the ring
 // should hold a whole layer's (~460 of 512 on Q2_0): with 384 slots a layer's last batch waits for slots its own
 // first batch frees.  Measured on the 5070, Q2_0, the 4K / 32K code-agent prompts (one run each): fused at 384 slots
@@ -430,8 +433,23 @@ inline int stage_slots(size_t T) {
     // Ring depth itself is measured FLAT at a fixed chunk on this card - 96 / 80 / 112 slots give 235.34 /
     // 235.46 / 237.12 tok/s (0.8 % apart) - so the 16 slots cost nothing and buy the chunk.  A deeper ring is
     // still reachable with STRATA_STAGE_SLOTS, and a box with more free VRAM keeps picking 512 either way.
+    // 80.  MEASURED, TWICE, WITH OPPOSITE ANSWERS: a pinned A/B (`STRATA_STAGE_SLOTS` 80 vs 128, alternating pairs,
+    // tokens identical) gave wait copy 3,306/3,162 -> 2,410/2,522 ms and prefill 243.59/251.01 -> 264.96/263.19
+    // (+6.8 %); the SAME 80-vs-128 change driven in-engine from the cache's slot count gave 272.5/271.5 at 80 and
+    // 271.8/271.8 at 128, i.e. nothing.  So the depth is NOT a reproducible lever on this card and the default stays
+    // 80; `g_cache_slots` and the print below exist so it is never inferred from `wait copy` again.
     const int base = env > 0 ? env : 80;
-    return std::min(std::max(base, std::max(ring_slots(T), STAGE_GRP)), ring_cap());
+    const int out = std::min(std::max(base, std::max(ring_slots(T), (int) STAGE_GRP)), ring_cap());
+    {   // the depth the prompt path actually stages at, and where it came from, printed whenever it CHANGES.  This was
+        // inferred from `wait copy` three times and read wrong twice - a depth is cheap to print and expensive to guess.
+        static int said = -1;
+        if (said != out) {
+            said = out;
+            std::fprintf(stderr, "prefill ring: %d slots (base %d, ring_slots %d, budget %d, cap %d, cache slots %d, T=%lld)\n",
+                         out, base, (int) ring_slots(T), g_ring_budget, ring_cap(), g_cache_slots, (long long) T);
+        }
+    }
+    return out;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
@@ -2692,6 +2710,7 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
     g_ring_budget = slots > 0 ? slots : 0;
     g_ring_small_max = small_max > 0 ? small_max : 0;
 }
+void Prefill::set_cache_slots(int64_t slots) { g_cache_slots = slots > 0 ? (int) std::min<int64_t>(slots, 1 << 20) : 0; }
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 

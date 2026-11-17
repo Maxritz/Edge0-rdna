@@ -147,6 +147,15 @@ public:
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
 
+    /// The expert cache's slot count, so the staging depth can be chosen from the budget the cache actually has.
+    /// The depth and the chunk are ONE budget (`chunk + ring + 128 <= slots`), and `stage_slots` is evaluated at
+    /// allocation time - before any chunk is planned - where the scan's byte budget does not exist yet.  Deciding it
+    /// there is what keeps the depth honest: measured on gfx1031 the prompt path staged at 80 slots while 128 (which
+    /// the Q4 table's 1,910 slots afford) is worth +6.8 % prefill and -24 % exposed DMA in alternating pairs, and at
+    /// the Q8 table's 720 slots the same deepening would have collapsed the auto chunk to 256 (measured -35 %).
+    /// Called once, before the prompt plan; 0 (or fewer than 768 slots) keeps the conservative floor.
+    static void set_cache_slots(int64_t slots);
+
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  `src`: init gets an
     /// ExpertSource (carve picks the fused MoE layout only then).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,

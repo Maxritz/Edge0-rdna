@@ -9342,6 +9342,9 @@ int main(int argc, char** argv) {
                                  "streamed ring %d slots\n", 100.0 * res_share, ring);
         }
     };
+    // The staging depth follows the cache's slot count, and it must be set before the FIRST plan_lend below: the
+    // ring and the chunk are one budget (`chunk + ring + 128 <= slots`) and stage_slots() is fixed at allocation time.
+    strata::prefill::Prefill::set_cache_slots(xcache.slots());
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
@@ -17976,6 +17979,9 @@ int main(int argc, char** argv) {
     int64_t spec_pos = strata::spec::kSpecNotStarted;   // plan v0.3 P6: where the speculative loop starts (0 is a real position: a 1-token prompt on a native pack)
     strata::prefill::Prefill prefill;
     // #1595: not by default when the cache holds every expert (nothing to take)
+    // The staging depth is decided from the cache's slot count BEFORE any chunk is planned: the two are one
+    // budget (`chunk + ring + 128 <= slots`) and stage_slots() is fixed at allocation time.  See set_cache_slots.
+    strata::prefill::Prefill::set_cache_slots(xcache.slots());
     strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,
         !multi_gpu && !o.no_pool && o.batch <= 0 &&
         strata::prefill::share_rules::default_share_has_work((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert)) &&
