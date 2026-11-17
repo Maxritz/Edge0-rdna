@@ -193,6 +193,29 @@ is already the cheaper of two schedules.  Nothing there moves without fewer byte
 
 ---
 
+### 6a. The KL/NLL gate for a table change, and the engine's own noise floor
+
+`tools/rdna2/kl_gate.py` compares the model's own next-token distribution under two latent tables on the same
+tokens, via the engine's `STRATA_LOGITS_DUMP` tap.  It aligns by **position, not by record** (a verify window's T
+depends on how many draft tokens were accepted: the first version died on "record 2: shape (3, V) vs (4, V)").
+
+Validated with the *same* table twice:
+
+```
+bit-identical logits:  no
+KL(a||b) mean / max:   1.193e-03 / 1.121e-02
+top-1 agreement:       100.000 %  (16/16)
+```
+
+**The engine is not bit-reproducible run to run at the logits** - 1.2e-3 mean KL between two identical runs,
+top-1 agreeing everywhere.  So the gate's floor is ~1.2e-3, not 0; a table change has to clear that, and top-1
+agreement is the more robust statistic at this level.  Likely sources are the scheduling-dependent ones (the CPU
+pool's partial contributions to the combine, float atomics) - and it is worth noting that it also means every
+"byte-identical output" gate this stretch used was testing the **tokens**, not the arithmetic.
+
+The dump captures the decode windows (positions past the prompt), which is exactly where a decode table lever
+lives.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a

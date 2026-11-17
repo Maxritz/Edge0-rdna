@@ -67,36 +67,47 @@ def main():
     args = ap.parse_args()
 
     a, b = read_records(args.a), read_records(args.b)
-    if len(a) != len(b):
-        print(f"records differ: {len(a)} vs {len(b)} (the two runs took different windows)")
-    n = min(len(a), len(b))
-    if n == 0:
-        raise SystemExit("no comparable records")
+
+    # ALIGN BY POSITION, NOT BY RECORD.  A verify window's T depends on how many draft tokens were accepted, so
+    # two runs split the same token stream into different records (observed: (3, V) vs (4, V)).  Each record
+    # supplies T consecutive positions starting at `position`, so flatten to position -> row and compare the
+    # intersection.  That is also what makes the gate usable after a table change, where the generated tokens may
+    # themselves diverge once the distributions differ.
+    def by_pos(recs):
+        m = {}
+        for pos, rows in recs:
+            for t in range(rows.shape[0]):
+                m[pos + t] = rows[t]
+        return m
+
+    ma, mb = by_pos(a), by_pos(b)
+    common = sorted(set(ma) & set(mb))
+    print(f"records {len(a)} vs {len(b)}; positions {len(ma)} vs {len(mb)}; common {len(common)}")
+    if not common:
+        raise SystemExit("no positions in common")
+    nv = a[0][1].shape[1]
+    if any(ma[p].shape[0] != nv for p in common) or any(mb[p].shape[0] != nv for p in common):
+        raise SystemExit("inconsistent vocab size across records")
 
     kl_rows, top1_rows, worst = [], [], []
     bit_identical = True
-    for i in range(n):
-        pa, ra = a[i]
-        pb, rb = b[i]
+    for p in common:
+        ra, rb = ma[p], mb[p]
         if ra.shape != rb.shape:
-            raise SystemExit(f"record {i}: shape {ra.shape} vs {rb.shape}")
-        if pa != pb:
-            print(f"  record {i}: position {pa} vs {pb}")
+            raise SystemExit(f"position {p}: shape {ra.shape} vs {rb.shape}")
         if not np.array_equal(ra, rb):
             bit_identical = False
         la, lb = log_softmax(ra), log_softmax(rb)
-        kl = (np.exp(la) * (la - lb)).sum(axis=-1)          # KL(a || b) per position
-        agree = (ra.argmax(axis=-1) == rb.argmax(axis=-1)).astype(np.float64)
+        kl = float((np.exp(la) * (la - lb)).sum())
         kl_rows.append(kl)
-        top1_rows.append(agree)
-        for t in range(ra.shape[0]):
-            worst.append((float(kl[t]), pa + t, int(ra[t].argmax()), int(rb[t].argmax())))
+        top1_rows.append(1.0 if ra.argmax() == rb.argmax() else 0.0)
+        worst.append((kl, p, int(ra.argmax()), int(rb.argmax())))
 
-    kl = np.concatenate(kl_rows)
-    t1 = np.concatenate(top1_rows)
+    kl = np.asarray(kl_rows)
+    t1 = np.asarray(top1_rows)
     worst.sort(reverse=True)
 
-    print(f"records {n}, positions {kl.size}, vocab {a[0][1].shape[1]}")
+    print(f"positions compared {kl.size}, vocab {nv}")
     print(f"bit-identical logits:      {'yes' if bit_identical else 'no'}")
     print(f"KL(a||b) mean / max:       {kl.mean():.6e} / {kl.max():.6e}")
     print(f"top-1 agreement:           {t1.mean() * 100:.3f} %  ({int(t1.sum())}/{t1.size})")
