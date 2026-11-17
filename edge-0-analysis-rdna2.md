@@ -1521,6 +1521,30 @@
 >
 > `STRATA_PREFILL_HOSTPROF=1` ships as the instrument (off by default, no cost).
 
+> ### 0.45 `STRATA_IO_THREADS` is flat, so the copy bucket is not short of issuing threads
+>
+> The 8.1 s copy-issue bucket is `Stager::wait`, i.e. the host waiting for blobs to be pinned.  The AMD reference
+> configuration uses `STRATA_IO_THREADS=32`, so it was the obvious lever.  Alternating pairs:
+>
+> | arm | prefill | share+diag | copies |
+> |---|---|---|---|
+> | 8 (default) | 229.47 / 229.66 tok/s | 9,365 / 9,349 ms | 8,108 / 8,117 ms |
+> | 32 | 230.40 / 229.62 tok/s | 9,313 / 9,362 ms | 8,097 / 8,107 ms |
+>
+> Flat to 0.4 % on throughput and to 1 % on both buckets.  Issuing threads are not what the copy path is short of,
+> which is consistent with 0.44: the cost is that the host is not issuing L+1's work while the GPU runs L, not
+> that it cannot issue fast enough when it does.
+>
+> Together with 0.44 this closes the cheap levers around prefill's 17.7 s: ring depth is flat (240.35 / 240.46 /
+> 237.12 at chunk 512), the grouping loop is 15 ms, and IO threads are flat.  **What is left is the alternation
+> itself** - host stalled 9.4 s on the GPU, GPU idle 8.1 s on the host - and that is a restructuring of the layer
+> loop into a producer/consumer over two layers, not a tuning knob.
+>
+> Reliability note, third instance: the third arm (`STRATA_IO_THREADS=8`, identical to the first) emitted wrong
+> tokens from token 20.  Three separate A/Bs this stretch have now had a late arm corrupt, so any timing arm
+> whose 32-token output is not checked is untrustworthy, and the corruption shows up as *wrong output*, not as a
+> slow run - which is exactly how it would slip through a throughput-only harness.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
