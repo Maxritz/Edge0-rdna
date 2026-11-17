@@ -1691,6 +1691,35 @@
 > separate block from the CUs, so queue priority over compute waves does not affect it.  Priority only reorders
 > compute against compute.
 
+> ### 0.50 8 waves/SIMD is not reachable from this structure - 153 VGPRs is the floor, both routes measured
+>
+> 0.48 left the A stage at `unroll 1`: 153 VGPRs, 0 spills, **6 waves/SIMD**, `gemm gate/up` 4,756 ms.  The
+> obvious next step is 8 waves, which needs <= 128 VGPRs.  Both cheap routes were tried and both are dead:
+>
+> | variant | VGPRs | spills | waves/SIMD |
+> |---|---|---|---|
+> | `unroll 1`, kTileRows 64 (shipped) | 153 | 0 | 6 |
+> | `unroll 1`, **kTileRows 32** | 153 | 0 | 6 |
+> | `unroll 1` + `i`-loop `unroll 2` | **160** | 0 | 6 |
+>
+> * **kTileRows does not touch register pressure at all** - 32 and 64 compile to the identical allocation.  It
+>   also could not have helped if it had: the row mapping is `nb0 = 16 * (warp >> 2)`, i.e. four warp-groups of
+>   16 rows each covering exactly 64 rows, so at kTileRows = 32 half the warps would sit on rows outside the tile.
+>   Tile size and row mapping are one knob, not two.
+> * **Partial unrolling of the `i` loop costs registers** (153 -> 160), so the `i` nest wants to stay fully
+>   unrolled; the register win of 0.48 came from the `s` loop only.
+>
+> The only remaining route to <= 128 is to halve the rows a warp holds - `acc[4][2][4]` (32 VGPRs) becoming
+> `acc[4][1][4]` (16) with `nb0 = 8 * (warp >> 2)` and kTileRows 32 to match.  That is *a trade, not a win*: half
+> the rows per warp means twice the row-tiles and half the work per warp, and the saving is ~16-20 of the 25
+> VGPRs needed - it may still land above 128.  Not attempted here: it rewrites the MMA row mapping in a
+> byte-exact kernel for an occupancy gain that 0.48 already showed is worth nothing on its own (unroll 1 and
+> unroll 2 tie on throughput at 153 vs 201 VGPRs - this kernel is not occupancy-limited).
+>
+> **That last point is the finding**: the A stage's throughput does not respond to occupancy.  Its 4,756 ms come
+> from the dp4a sequence and the staged-tile traffic, not from having too few waves, which is why 6 waves and 4
+> waves measure the same and why the spills (real waste) mattered and the wave count did not.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
