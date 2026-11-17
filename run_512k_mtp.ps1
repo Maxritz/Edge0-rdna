@@ -10,8 +10,8 @@ param(
     [int]$MaxContext = 524288,
     [string]$Prefill = 'auto',
     [string]$Tokens = 'prompt64.txt',
-    [string]$Dense = 'E:/Edge0-120B-q3k/latent_dense_q8.bin',
-    [string]$DenseFmt = '8',
+    [string]$Dense = '',   # '' -> the Q4_0 pack when the converter has been run, else the Q8_0 one
+    [string]$DenseFmt = '',
     [string]$Extra = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -20,8 +20,16 @@ $build = Join-Path $root 'edge0-strata\build'
 
 $env:STRATA_LATENT_A = 'E:/Edge0-120B-q3k/experts.bin'
 $env:STRATA_LATENT_LABELS = 'E:/Edge0-120B-q3k/labels.bin'
+# The latent table: the Q4_0 pack is 1.07 GB smaller than Q8_0, which is worth +4.5 % prefill and +4.5 % decode
+# directly and, at long context, another cache-size's worth on top (512K expert slots 105 -> 955).  The engine
+# derives the format from the file's own size, so no format variable is needed - but keep the Q4 path optional so
+# a deployment that never ran tools/rdna2/q4_latent.py still works.
+$q4 = 'E:/Edge0-120B-q3k/latent_dense_q4.bin'
+if ($Dense -eq '') {
+    $Dense = if (Test-Path $q4) { $q4 } else { 'E:/Edge0-120B-q3k/latent_dense_q8.bin' }
+}
 $env:STRATA_LATENT_DENSE = $Dense
-$env:STRATA_LATENT_DENSE_FMT = $DenseFmt
+if ($DenseFmt -ne '') { $env:STRATA_LATENT_DENSE_FMT = $DenseFmt } else { Remove-Item Env:\STRATA_LATENT_DENSE_FMT -ErrorAction SilentlyContinue }
 $env:STRATA_EMBED_VRAM = $Embed
 $env:STRATA_LATENT_FUSED = '1'
 $env:STRATA_LATENT_FUSED_DU = '1'

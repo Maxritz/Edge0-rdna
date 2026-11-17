@@ -43,30 +43,49 @@ bool LatentDense::open(const std::string& path, int64_t n_layers, int64_t n_grou
                        int64_t latent_dim, std::string& err) {
     close();
     n_layers_ = n_layers; n_groups_ = n_groups; n_embd_ = n_embd; latent_dim_ = latent_dim;
-    // Q4DU: STRATA_LATENT_DENSE_FMT=4 selects the Q4_0 pack (18 B/block), 8 or unset the
-    // historical Q8_0 one (34 B/block).  The file's size must then match the derived layout -
-    // a mismatched file/env pair fails the open with both candidate sizes spelled out.
+    // Q4DU: the table's FORMAT IS A PROPERTY OF THE FILE.  STRATA_LATENT_DENSE_FMT=4 or =8 still forces it (and a
+    // forced format whose size disagrees stays a hard error - a misread layout would produce garbage answers), but
+    // when the variable is unset the file's OWN SIZE decides: 18 B a 32-weight block is Q4_0, 34 B is Q8_0, both
+    // from the same geometry.  A switch this cheap to get wrong must not depend on an env var someone remembers to
+    // set - the Q4 pack is otherwise indistinguishable from "the fast tiled kernels silently did not run".
+    const bool fmt_forced = ::getenv("STRATA_LATENT_DENSE_FMT") != nullptr;
     fmt_ = 8;
     if (const char* f = ::getenv("STRATA_LATENT_DENSE_FMT")) {
         if (f[0] == '4' && f[1] == 0) fmt_ = 4;
         else if (f[0] == '8' && f[1] == 0) fmt_ = 8;
         else { err = path + ": STRATA_LATENT_DENSE_FMT must be 4 or 8 (got '" + std::string(f) + "')"; return false; }
     }
-    const size_t db = d_bytes(), ub = u_bytes();
-    const uint64_t want = (uint64_t) n_layers * (db + ub);
+    const int env_fmt = fmt_;          // the env's choice, captured BEFORE want_for() moves fmt_ around
+    auto want_for = [&](int f) -> uint64_t {
+        fmt_ = f;
+        return (uint64_t) n_layers * (uint64_t) (d_bytes() + u_bytes());
+    };
+    const uint64_t want8 = want_for(8), want4 = want_for(4);
+    fmt_ = env_fmt;
+    uint64_t want = (fmt_ == 4) ? want4 : want8;
+    auto resolve_fmt = [&](uint64_t size) -> bool {
+        want = (fmt_ == 4) ? want4 : want8;
+        if (size == want) return true;
+        const int other = (fmt_ == 4) ? 8 : 4;
+        const uint64_t alt = (other == 4) ? want4 : want8;
+        if (!fmt_forced && size == alt) {
+            fmt_ = other; want = alt;
+            std::fprintf(stderr, "latent dense: %s is the %s pack (%llu B); fmt %d selected from its size\n",
+                         path.c_str(), other == 4 ? "Q4_0" : "Q8_0", (unsigned long long) size, other);
+            return true;
+        }
+        err = path + ": size " + std::to_string((long long) size) + " != " + std::to_string(want) +
+              " (fmt " + std::to_string(fmt_) + " wants " + std::to_string(want) +
+              "; fmt " + std::to_string(other) + " wants " + std::to_string((long long) alt) + ")";
+        return false;
+    };
 #if defined(_WIN32)
     HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
     if (fh == INVALID_HANDLE_VALUE) { win_err(err, path, "CreateFile"); return false; }
     LARGE_INTEGER fsz;
     if (!GetFileSizeEx(fh, &fsz)) { win_err(err, path, "GetFileSizeEx"); CloseHandle(fh); return false; }
-    if ((uint64_t) fsz.QuadPart != want) {
-        const uint64_t alt = (uint64_t) n_layers *
-            ((size_t) n_groups_ * (size_t) latent_dim_ * (size_t) (n_embd_ / 32) * (fmt_ == 4 ? 34 : 18) +
-             (size_t) n_groups_ * (size_t) n_embd_ * (size_t) (latent_dim_ / 32) * (fmt_ == 4 ? 34 : 18));
-        err = path + ": size " + std::to_string((long long) fsz.QuadPart) + " != " + std::to_string(want) +
-              " (fmt " + std::to_string(fmt_) + " wants " + std::to_string(want) +
-              "; the other fmt wants " + std::to_string((long long) alt) + ")";
+    if (!resolve_fmt((uint64_t) fsz.QuadPart)) {
         CloseHandle(fh); return false;
     }
     HANDLE mh = CreateFileMappingA(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
@@ -80,15 +99,7 @@ bool LatentDense::open(const std::string& path, int64_t n_layers, int64_t n_grou
     if (fd < 0) { err = path + ": " + std::strerror(errno); return false; }
     struct stat st;
     if (fstat(fd, &st) != 0) { err = path + ": fstat: " + std::strerror(errno); ::close(fd); return false; }
-    if ((uint64_t) st.st_size != want) {   // strict: the env's format and the file's size disagree.
-        // NO silent fallback - a misread layout would produce garbage answers.  Name both
-        // candidate sizes so the operator sees exactly which format the file actually is.
-        const uint64_t alt = (uint64_t) n_layers *
-            ((size_t) n_groups_ * (size_t) latent_dim_ * (size_t) (n_embd_ / 32) * (fmt_ == 4 ? 34 : 18) +
-             (size_t) n_groups_ * (size_t) n_embd_ * (size_t) (latent_dim_ / 32) * (fmt_ == 4 ? 34 : 18));
-        err = path + ": size " + std::to_string((long long) st.st_size) + " != " + std::to_string(want) +
-              " (fmt " + std::to_string(fmt_) + " wants " + std::to_string(want) +
-              "; the other fmt wants " + std::to_string((long long) alt) + ")";
+    if (!resolve_fmt((uint64_t) st.st_size)) {   // strict: a forced format and the file's size must agree.
         ::close(fd); return false;
     }
     void* p = mmap(nullptr, (size_t) want, PROT_READ, MAP_PRIVATE, fd, 0);
