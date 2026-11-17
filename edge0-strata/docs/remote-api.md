@@ -32,6 +32,10 @@ Press Ctrl+C or close the window to stop the server and free the GPU.
 | Port | `8080` | `STRATA_API_PORT` |
 | API key | `edge0-rdna2-2026` | `STRATA_API_KEY` |
 
+The key is passed to the server as the `STRATA_API_KEY` environment variable, not
+as a `--api-key` command-line argument, so it is not visible in the process list.
+`serve.server` reads that variable as the default for `--api-key`.
+
 Examples:
 
 ```bat

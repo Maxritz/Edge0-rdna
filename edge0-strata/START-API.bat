@@ -35,10 +35,12 @@ if exist ".venv\Scripts\python.exe" (
 echo Starting Edge0 Strata API ...
 echo   config : %STRATA_CONFIG%
 echo   listen : %STRATA_API_HOST%:%STRATA_API_PORT%
-echo   key    : %STRATA_API_KEY%
+echo   key    : set (read from STRATA_API_KEY; not put on the command line)
 echo.
 
-"%PY%" -m serve.server --engine strata --config "%STRATA_CONFIG%" --host "%STRATA_API_HOST%" --port "%STRATA_API_PORT%" --api-key "%STRATA_API_KEY%"
+rem serve.server defaults --api-key from STRATA_API_KEY, so passing it here would only
+rem expose the secret in the process command line (visible to other local users).
+"%PY%" -m serve.server --engine strata --config "%STRATA_CONFIG%" --host "%STRATA_API_HOST%" --port "%STRATA_API_PORT%"
 
 echo.
 echo Server stopped.
