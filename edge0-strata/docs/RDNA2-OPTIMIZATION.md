@@ -240,6 +240,49 @@ Two requirements for the harness, both learned the hard way:
 engine's own noise and cannot distinguish a table change.  A Q4 latent-D table has to clear that, measured on the
 same truncated-prefix basis.
 
+### 6c. Q4_0 latent D/U: built, gated, and a measured net loss - with the cause attributed
+
+`tools/rdna2/q4_latent.py` converts the tables (2.49 GB -> 1.42 GB, exact 18/34).  Gate on the Q8 baseline vs the
+Q4 table, same prompt, `--max-context 8192 --max-new 128`:
+
+```
+first argmax divergence at position 4079   (the Q8-vs-Q8 calibration pair: 4150)
+KL mean 9.475e-03  p50 9.18e-04  p95 3.91e-02  max 1.02e-01
+top-1 agreement 100.000 % (16/16 on the coherent prefix)      VERDICT PASS
+```
+
+**7.6x the calibrated 1.25e-3 floor** - measurable and bounded; the shorter coherent prefix is the honest signal
+that behaviour changed.
+
+A/B, alternating pairs, chunk pinned 512:
+
+| arm | decode | prefill |
+|---|---|---|
+| **Q4** | **21.67 / 21.92 tok/s (+6.3 %)** | 170.08 / 170.10 (-35.4 %) |
+| Q8 | 20.62 / 20.40 | 262.76 / 261.82 |
+
+**Decode moves for the first time in the whole stretch** - the diagnosis (decode is bound by latent D/U bytes) is
+confirmed.  But prefill loses 35 %, so it stays opt-in.
+
+Prefill ledger, same binary, only the table changed:
+
+| component | fmt=4 | fmt=8 | delta |
+|---|---|---|---|
+| **gemm down** | 7,465 | 1,144 | **+6,321** |
+| **gather** | 4,159 | 973 | **+3,186** |
+| gemm gate/up | 4,767 | 4,630 | +137 |
+| wait copy | 1,858 | 3,055 | **-1,197** |
+| **total** | **23,970** | **15,533** | **+8,437** |
+
+The regression lands in the **expert-stream phases**, not in a latent row, and `wait copy` *falls* - the shape of
+a stall charged to whichever phase is open, not of extra expert work.  Mechanism to verify: the fast latent
+kernels are **fmt==8-only** (`latent_u_runs` and the dense entries early-return on `fmt != 8`; fmt==4 block
+readers exist only in the slower per-column/matvec paths), so `STRATA_LATENT_DENSE_FMT=4` routes the D/U products
+onto the generic path per chunk.  Fix = extend the fast kernels to fmt 4, not add a fourth product.
+
+It also corrected the geometry a third time: **ELL = 1280**, not 1792 (48 x 55,705,600 B = the file exactly, and
+the kernel logs `ELL=1280`), so D/U traffic is **2.67 GB a round**, not 4.7.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
