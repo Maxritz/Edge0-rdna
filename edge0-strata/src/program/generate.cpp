@@ -4389,7 +4389,23 @@ int main(int argc, char** argv) {
         const bool pf_old = pfd != nullptr && std::strcmp(pfd, "old") == 0;
         // 0.2.7: gfx12 native packs start at 0.15 (see pcie_share_gfx12_default above); other cards and
         // STRATA_PCIE_FRAC_DEFAULT=old keep the x16 share measured for them.
-        const double base = strata::pcie_start_frac(nvfp4_pack, native_pack, pcie_share_gfx12_default(), pf_old, strata::qwen_defaults_026());
+        double base = strata::pcie_start_frac(nvfp4_pack, native_pack, pcie_share_gfx12_default(), pf_old, strata::qwen_defaults_026());
+#if defined(STRATA_USE_HIP)
+        // gfx103x NATIVE PACKS START AT 0.40, NOT THE x16 SHARE 0.55.  Measured on the 12 GiB RX 6700 XT (gfx1031,
+        // x16 link probed at 28.0 GB/s), Q4 latent table, decode 64 tokens, alternating pairs on one binary:
+        //     pcie-frac 0.10  28.45 / 28.38 tok/s     0.40  29.19 / 29.28     0.55 (the default)  25.72 / 27.33
+        //     0.80            26.05                    and the engine's own PcieAuto stays at 0.55 on this part
+        // 0.40 is +10.2 % over 0.55 and +2.9 % over the 0.10 the harness had been pinning.  The x16 rule balances
+        // link time against the CPU pool's rate, and this box's pool is slower per missed expert than the x16
+        // reference, so the balance sits lower.  `STRATA_PCIE_FRAC_DEFAULT=old` (or an explicit --pcie-frac)
+        // restores 0.55; gfx12 packs keep their own 0.15 and are untouched.
+        static const bool hip_frac_old = [] {
+            const char* v = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
+            return v != nullptr && std::strcmp(v, "old") == 0;
+        }();
+        if (native_pack && !nvfp4_pack && !pcie_share_gfx12_default() && !hip_frac_old && !strata::qwen_defaults_026())
+            base = 0.40;
+#endif
         std::string bursts;
 #if !defined(STRATA_USE_HIP) && defined(_WIN32)
         // Windows: opt-in (STRATA_PCIE_AUTO_CANON=1); an RTX 5070 decoded a short Q2_0 answer 3% slower with it, code 2.5% faster
