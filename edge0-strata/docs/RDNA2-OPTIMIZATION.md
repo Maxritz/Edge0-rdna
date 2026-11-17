@@ -996,7 +996,12 @@ Gates for the shipped default: 4k `301.23/300.69 -> 302.51/302.64`; 8k chunk 832
 512K + MTP exit 0, tokens `715 1822 363 313`, cache 872 slots; 32-token output identical in every arm.
 
 
-### 8i. The D/U chain, attributed - and two of its four rows are FIXED per-layer costs, not GEMMs
+### 8i. The D/U chain, attributed - and a WITHDRAWN claim about its two "hc read" rows (see 8k)
+
+> **SUPERSEDED IN PART - see 8k.**  This section's label mapping and the D/U pricing stand.  Its conclusion that the
+> two hyper-connection rows are "a FIXED per-layer cost, independent of tokens" is **wrong**: it came from reading the
+> ledger's *marks* column as milliseconds.  The rows are ordinary GEMMs that scale with M and run at ~48 % of the fp16
+> peak.
 
 The last large block with no measured hypothesis.  First the labels, because three of the four were wrong:
 
@@ -1089,6 +1094,67 @@ This is the third time the largest available win was a *cache-vs-chunk* admissio
 pattern to remember: on this box the expert cache is worth more than the bytes, and the chunk is the variable that
 trades one for the other - so it must be chosen against the cache size that will actually be granted, never as a
 constant.
+
+
+### 8k. CORRECTION to 8i - the "1,536 ms hyper-connection pair" was MARKS, not milliseconds; the target is withdrawn
+
+Section 8i claimed the two hyper-connection projections are "a FIXED 2.0 ms per layer-chunk, independent of the token
+count".  **That is wrong**, and the error is worth recording because it is a tooling trap, not a modelling one.
+
+The ledger prints two formats.  The component table is
+
+    component                 marks   dev ms    %dev   host ms   %host
+    hc read: down+silu          480      658     5.7%      93.1     0.8%
+
+and the compact one-line summary prints `hc read: down+silu 658 (5.7%)`.  A regex of the form
+`hc read: down\+silu (\d+)` matches the **marks** column in the table (480) and the **ms** in the compact line (658).
+Every "fixed 2.0 ms per layer-chunk" figure in 8i came from that regex, so the numbers were mark counts:
+
+    chunk    layer-chunks    "hcDown" read    marks/layer-chunk
+    64          3,072            6,144              2.0
+    128         1,536            3,072              2.0
+    256           768            1,536              2.0
+    512           384              768              2.0
+    1,024         192              384              2.0
+    2,048          96              192              2.0
+
+A mark count is proportional to the number of layer-chunks *by construction* - 2 marks per layer-chunk - so the
+"exactly 2.0 at every chunk size" that looked like a smoking gun was arithmetic on a count, not a measurement.
+The task built on it ("the 1,536 ms pair") is therefore also void: **1,536 was 768 layer-chunks x 2 marks.**
+
+The real times, from the dev-ms column:
+
+    chunk    M      layer-chunks   hc down   hc up   sum    per layer-chunk
+    256     256         768          775      335    1,110      1.45 ms
+    512     512         384          650      300      950      2.47 ms
+    832     832         240          657      256      913      3.80 ms
+    1,024   1024        192          679      242      921      4.80 ms
+    2,048   2048         96          946      280    1,226     12.77 ms
+
+It scales with M exactly as a GEMM should, and at the shipped chunk it is **913 ms = 8 % of prefill**, doing
+2 x 832 x 320 x 10240 = 5.45 G MAC in 913 ms = **5.97 T MAC/s**.  Against the 24.6 TFLOP/s fp16 peak (12.3 T MAC/s)
+that is **~48 % of peak**; against the best fp16 GEMM ever measured on this box (9.46 TFLOP/s = 4.73 T MAC/s) it is
+*above* it.  So the hyper-connection projections are the best-utilised kernels in the engine, and replacing them with a
+hand tiled kernel is not a win - the planned ~80-block rewrite was NOT built, deliberately.
+
+### 8l. The denominator was wrong for every bf16/fp16 GEMM in this document
+
+Everything above has been priced against one number, "21.8 T MAC/s", which is the **int8 dp4a** probe.  The dense
+projections are bf16/fp16.  Re-priced against the fp16 rate (24.6 TFLOP/s = 12.3 T MAC/s):
+
+    block                     T MAC/s   % of int8 dp4a peak   % of fp16 peak
+    D projection               6.06            27.8 %              49 %
+    U projection               6.10            28.0 %              50 %
+    HC down+up (chunk 832)     5.97            27.4 %              48 %
+    A stage gate/up            0.74             3.4 %               not bf16 (int8 dp4a)
+
+**Every dense GEMM in this engine runs at ~48-50 % of the fp16 peak, and the only block below it is the int8 dp4a A
+stage at 3.4 % of ITS peak.**  That is the whole story of the prefill gap in one line: there is exactly one anomalously
+slow block, and it is the one that uses the int8 dot product.  The dense path is not a target under any denominator.
+
+Consequence for the work list: the 4,063-token prefill at chunk 832 is 11.5 s, of which `gemm gate/up` is 3.74 s (32 %)
+and everything else is either at ~50 % of its own peak or is a fixed per-chunk cost already harvested by the chunk
+choice.  The remaining 1.22x to 430 tok/s lives in the A stage, not in the dense projections.
 
 ## 7. The method that actually worked
 
