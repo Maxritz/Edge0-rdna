@@ -1,0 +1,7 @@
+"arm","name","exit","prefill","decode","blobs","gate","tokens","log"
+"A","base1","0","347.29","19.54","43786","3818","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_mmap_base1.log"
+"B","var1","0","123.07","11.16","43846","3746","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_mmap_var1.log"
+"A","base2","0","351.55","20.30","43786","3751","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_mmap_base2.log"
+"B","var2","0","123.78","10.68","43846","3682","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_mmap_var2.log"
+"A","base3","0","341.59","20.37","43786","3837","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_mmap_base3.log"
+"B","var3","0","119.24","9.54","43846","3838","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_mmap_var3.log"

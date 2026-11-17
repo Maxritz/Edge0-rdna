@@ -1,0 +1,5 @@
+"arm","name","exit","prefill","decode","blobs","gate","tokens","log"
+"A","base1","0","332.71","20.30","43786","3811","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_ardn_base1.log"
+"B","var1","0","351.99","20.07","43786","3730","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_ardn_var1.log"
+"A","base2","0","349.62","19.50","43786","3761","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_ardn_base2.log"
+"B","var2","0","333.48","20.37","43786","3795","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_ardn_var2.log"

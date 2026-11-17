@@ -1,0 +1,7 @@
+"arm","name","exit","prefill","decode","blobs","gate","tokens","log"
+"A","base1","0","344.16","19.45","43774","3831","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_raw3k_envonly_base1.log"
+"B","var1","0","358.64","15.84","37926","3604","82 220 248046 198 248045 846 198 248046","C:\Users\rr\Desktop\Edge0-rdna\ab_raw3k_envonly_var1.log"
+"A","base2","0","344.72","19.63","43774","3821","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_raw3k_envonly_base2.log"
+"B","var2","0","359.96","15.93","37926","3603","82 220 248046 198 248045 846 198 248046","C:\Users\rr\Desktop\Edge0-rdna\ab_raw3k_envonly_var2.log"
+"A","base3","0","346.37","20.19","43774","3816","248046 198 248045 74455 198 248068 198 760","C:\Users\rr\Desktop\Edge0-rdna\ab_raw3k_envonly_base3.log"
+"B","var3","0","359.92","15.55","37926","3589","82 220 248046 198 248045 846 198 248046","C:\Users\rr\Desktop\Edge0-rdna\ab_raw3k_envonly_var3.log"

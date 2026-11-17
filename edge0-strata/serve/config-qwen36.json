@@ -1,0 +1,18 @@
+{
+  "exe": "C:/Users/rr/Desktop/Edge0-rdna/edge0-strata/build/strata.exe",
+  "args": [
+    "--model",
+    "E:/models/qwen36-35b/model.gguf",
+    "--gpu",
+    "0",
+    "--max-context",
+    "32768",
+    "--chunk",
+    "512"
+  ],
+  "cwd": "C:/Users/rr/Desktop/Edge0-rdna/edge0-strata/build",
+  "tokenizer": "E:/models/qwen36-35b/tokenizer",
+  "arch": "qwen35moe",
+  "model_name": "qwen3.6-35b-a3b",
+  "log": "C:/Users/rr/Desktop/Edge0-rdna/edge0-strata/engine-qwen36.log"
+}

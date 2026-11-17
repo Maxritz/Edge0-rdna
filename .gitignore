@@ -49,3 +49,13 @@ probe_*.exe
 dev_*.elf
 isa_*.txt
 fat*.bin
+
+# Local research clones are standalone git repos: keep them on disk, never vendor them here.
+/edge0-strata/third_party/Kraken-x/
+/edge0-strata/third_party/LMCache/
+
+# One-off root-level benchmark scratch (harness/CSVs under tools/ and docs/ are tracked).
+/lgt_*.bin
+/tr[0-9].txt
+/pdf_*.txt
+/*.bat
