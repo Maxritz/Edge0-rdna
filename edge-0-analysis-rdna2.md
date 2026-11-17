@@ -1663,6 +1663,34 @@
 > A stage, found in one line rather than a rewrite - and it confirms that the A stage has room.  The remaining
 > gap to 430 is still mostly the A stage's 4.76 s plus the 2.98 s of transfer.
 
+> ### 0.49 Hardware queue priority: the mechanism is real, it is mostly disabled here, and it is a non-lever
+>
+> "Send the work to the high-priority compute cores" is not a thing on this part - a 6700 XT has 40 identical
+> CUs with symmetric scheduling, no fast/slow or high/low tier.  What *is* real is **AMD hardware-queue (HQD)
+> priority**, exposed as `hipStreamCreateWithPriority`, which biases *dispatch between queues* when several are
+> resident.  Audited:
+>
+> * `verify.cpp` `graph_prio_on()` is `#if defined(STRATA_USE_HIP) ... return false;` - the decode graph streams
+>   get **no** priority on any HIP build.
+> * `verify.cpp:1247` the copy stream takes `hi` only behind `cp`.
+> * `mtp.cpp:478-495` the MTP draft stream's priority is `STRATA_MTP_HIP_PRIO`, **opt-in on gfx1031** (default
+>   only on gfx1200/gfx1201), and only when `force_on_`.
+> * `dflash2.cpp:200`, `generate.cpp:2925` - other opt-in high-priority streams.
+>
+> With `STRATA_MTP_SIDE_STREAM=1` the draft stream really does run concurrently with the main decode stream, so
+> that is the one place priority can bite.  A/B, alternating pairs, 32-token output identical in every arm:
+>
+> | arm | decode | prefill |
+> |---|---|---|
+> | `STRATA_MTP_HIP_PRIO=0` (default here) | 20.60 / 20.91 tok/s | 236.16 / 240.64 |
+> | `STRATA_MTP_HIP_PRIO=1` | 21.03 / 19.27 tok/s | 240.52 / 240.46 |
+>
+> Overlapping ranges, variance larger than the difference: **a non-lever on this card.**  Keep the default.
+>
+> It also cannot help prefill's exposed 2.99 s, for a hardware reason: that time is the **copy engine's DMA**, a
+> separate block from the CUs, so queue priority over compute waves does not affect it.  Priority only reorders
+> compute against compute.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
