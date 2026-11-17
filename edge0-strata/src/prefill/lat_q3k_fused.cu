@@ -65,9 +65,19 @@ constexpr int kChunks = 20;            // 1280 / 64
 constexpr int kItems = 5;              // 640 features / 128 a work item
 
 constexpr int LTHREADS = 512;
+// STRATA_A_NAT: 1 = stage weights and activations in the natural dp4a order (no CUDA mma-fragment permutation),
+// 0 = the historical permuted order.  BOTH need to live in one binary, because a compile-time A/B cannot alternate
+// and this stage's numbers straddle their own baseline across batches (4,403..4,780 against 4,620..4,630).
+__device__ int g_a_nat = 1;
 constexpr int WROWS = 256;             // 128 gate rows + their 128 up rows
+// 80, and the padding experiment is recorded as REFUTED: an 84 B pitch (21 words, coprime with the 64 LDS banks)
+// looked like the documented cure for row-stride bank conflicts, and measured 4,630 -> 6,834 ms on the A stage
+// (+48 %).  Each lane here reads a DIFFERENT row (ra = 32*wf + 8*i + mg), so the conflict algebra that applies to
+// a warp walking one row does not apply to this pattern.  LAPITCH is not just cosmetic either: it is ALSO the
+// output H row's chunk stride (kHqRow = 10 x 80) that the down half reads, so padding it corrupts the product.
 constexpr int LWPITCH = 80;            // 4 x 16 codes, 4 fp32 sub-scales
-constexpr int LAPITCH = 80;            // 64 activation codes, {d0, d1}, pad
+constexpr int LAPITCH = 80;            // 64 activation codes, {d0, d1}, pad.  NOT padding: this is ALSO the
+                                       // output H row contract with the down half (kHqRow = 10 x 80).
 constexpr int kTileRows = 64;
 constexpr int kXqRow = 1440;           // 40 q8_1 blocks of 36 B
 constexpr int kHqRow = 800;            // a staged H row: 10 chunks of 80 B (n_ff / 32 = 20 blocks)
@@ -85,13 +95,24 @@ __device__ __forceinline__ void lat_ld4(const uint8_t* p, int sh, uint32_t (&w)[
     w[3] = __funnelshift_r(q[3], q[4], sh);
 }
 
-// One 16-value sub-block's 4 code words (A[m] byte c = the sub-block's value 4m + c) into the staged order: out[k]'s
-// byte c is the sub-block's value 4c + k (the order the staged activations use, so both mma operands agree).
-__device__ __forceinline__ void lat_stage_codes(const uint32_t* A, uint32_t (&out)[4]) {
+// One 16-value sub-block's 4 code words.  `A[m]` byte c is the sub-block's value 4m + c - which IS the natural
+// dp4a order (a lane's word j holds values 4j..4j+3), so the staged row is a straight copy.
+//
+// It used to be permuted into the CUDA m16n8k16 MMA FRAGMENT order (out[k]'s byte c = value 4c + k) and every
+// reader paired word k of the weights with word k of the activations.  RDNA2 HAS NO MATRIX CORES - nothing here
+// consumes an mma fragment - so that permutation was pure cost: 8 v_perm_b32 per 16 values, 120 in the kernel.
+// Both operands are staged natural now and still pair word-for-word, and since the 16 products land in FOUR
+// separate int32 accumulators either way (word k's 4 values), each d[] is an exact integer sum: BIT-IDENTICAL.
+__device__ __forceinline__ void lat_stage_codes(const uint32_t* A, uint32_t (&out)[4], bool nat) {
+    if (nat) {
 #pragma unroll
-    for (int k = 0; k < 4; ++k)
-        out[k] = __byte_perm(__byte_perm(A[0], A[1], k | ((k + 4) << 4)),
-                             __byte_perm(A[2], A[3], k | ((k + 4) << 4)), 0x5410u);
+        for (int k = 0; k < 4; ++k) out[k] = A[k];
+    } else {
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            out[k] = __byte_perm(__byte_perm(A[0], A[1], k | ((k + 4) << 4)),
+                                 __byte_perm(A[2], A[3], k | ((k + 4) << 4)), 0x5410u);
+    }
 }
 
 // This thread's two sub-blocks of one 64-value chunk, staged.
@@ -100,7 +121,7 @@ struct GuStaged {
     float sc[2];
 };
 
-__device__ __forceinline__ GuStaged lat_gu_decode(const uint8_t* blk, int kb, int whalf) {
+__device__ __forceinline__ GuStaged lat_gu_decode(const uint8_t* blk, int kb, int whalf, bool natural) {
     const int cl = kb & 3;                        // the chunk inside the 256-value super-block
     const int half = cl >> 1;                     // the dequantizer's n = 128 * half
     const int j = 2 * (cl & 1) + whalf;           // the 2-bit field (and, with +4*half, the hmask bit)
@@ -128,7 +149,7 @@ __device__ __forceinline__ GuStaged lat_gu_decode(const uint8_t* blk, int kb, in
             // [-4, 3].  Byte-wise, not a 32-bit subtract: a byte underflow would borrow from its neighbour.
             nat[m] = __vsub4(lo2 | (4u * hi1), 0x04040404u);
         }
-        lat_stage_codes(nat, r.w[g]);
+        lat_stage_codes(nat, r.w[g], natural);
         // the sub-block's 6-bit scale: nibble (low/high per half) of byte s & 7, two high bits of byte 8 + (s & 3)
         const uint32_t nib_byte = (sw[(s & 7) >> 2] >> (8 * (s & 3))) & 0xFFu;
         const uint32_t nib = (nib_byte >> (4 * (s >> 3))) & 0xFu;
@@ -159,6 +180,7 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
         srow = (int*) (base + 2 * WROWS * LWPITCH + 2 * kTileRows * LAPITCH);
     }
 
+    const bool a_nat = g_a_nat != 0;    // STRATA_A_NAT: natural dp4a staging (1) or the historical permuted order (0)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, mg = lane >> 2, tig = lane & 3;
     const int wf = warp & 3, nb0 = 16 * (warp >> 2);
     const int wrow = tid >> 1, whalf = tid & 1;         // 2 threads a weight row, one 32-value half each
@@ -190,7 +212,7 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
             uint32_t aq[8], adw = 0;
             auto load_chunk = [&](int kb) {
                 const uint8_t* blk = wsrc + 110 * (kb >> 2);
-                wc[kb & 1] = lat_gu_decode(blk, kb, whalf);
+                wc[kb & 1] = lat_gu_decode(blk, kb, whalf, a_nat);
                 if (tid < 2 * arows) {
                     // the plain q8_1 row: 72 B a chunk (two 32-value blocks), word 0 of a block is its ds
                     const uint32_t* ap = (const uint32_t*) (xq + (size_t) srow[arow] * kXqRow + (size_t) 72 * kb);
@@ -215,11 +237,18 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                     for (int h = 0; h < 2; ++h) {
                         const int s = 2 * ahalf + h;
                         const uint32_t* wp = &aq[4 * h];
+                        if (a_nat) {
+                            // natural dp4a order, matching lat_stage_codes: 4 straight stores, no permutation
 #pragma unroll
-                        for (int k = 0; k < 4; ++k) {
-                            const uint32_t p1 = __byte_perm(wp[0], wp[1], k | ((k + 4) << 4));
-                            const uint32_t p2 = __byte_perm(wp[2], wp[3], k | ((k + 4) << 4));
-                            *(uint32_t*) (ar + 16 * s + 4 * k) = __byte_perm(p1, p2, 0x5410u);
+                            for (int k = 0; k < 4; ++k) *(uint32_t*) (ar + 16 * s + 4 * k) = wp[k];
+                        } else {
+                            // the historical CUDA mma-fragment order, kept so the two can alternate in ONE binary
+#pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                const uint32_t p1 = __byte_perm(wp[0], wp[1], k | ((k + 4) << 4));
+                                const uint32_t p2 = __byte_perm(wp[2], wp[3], k | ((k + 4) << 4));
+                                *(uint32_t*) (ar + 16 * s + 4 * k) = __byte_perm(p1, p2, 0x5410u);
+                            }
                         }
                     }
                     *(__half*) (ar + 64 + 2 * ahalf) = __ushort_as_half((unsigned short) (adw & 0xFFFFu));
@@ -230,13 +259,17 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
             store_chunk(0);
             if (kChunks > 1) load_chunk(1);
             const bool on0 = nb0 < nrows, on1 = nb0 + 8 < nrows;
-            float acc[4][2][4];
+            // float2 accumulators on purpose: RDNA2 has packed fp32 (v_pk_fma_f32), so the per-sub-block scaling
+            // runs two lanes of math a instruction.  Packed fp32 FMA is IEEE per lane, so this is bit-identical to
+            // the scalar form it replaces - it is not a numerical change.  [q] 0 = (gate even, gate odd),
+            // 1 = (up even, up odd).
+            float2 acc[4][2][2];
 #pragma unroll
             for (int i = 0; i < 4; ++i)
 #pragma unroll
                 for (int n = 0; n < 2; ++n)
 #pragma unroll
-                    for (int q = 0; q < 4; ++q) acc[i][n][q] = 0.0f;
+                    for (int q = 0; q < 2; ++q) acc[i][n][q] = make_float2(0.0f, 0.0f);
             for (int kb = 0; kb < kChunks; ++kb) {
                 __syncthreads();
                 if (on0) {
@@ -309,10 +342,12 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                                     : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
                                     : "r"(a0), "r"(a1), "r"(bq[n]));
 #endif
-                                acc[i][n][0] += (da * dx0[n]) * (float) d[0];
-                                acc[i][n][1] += (da * dx1[n]) * (float) d[1];
-                                acc[i][n][2] += (db * dx0[n]) * (float) d[2];
-                                acc[i][n][3] += (db * dx1[n]) * (float) d[3];
+                                const float2 sg = make_float2(da * dx0[n], da * dx1[n]);
+                                const float2 su = make_float2(db * dx0[n], db * dx1[n]);
+                                const float2 cg = make_float2((float) d[0], (float) d[1]);
+                                const float2 cu = make_float2((float) d[2], (float) d[3]);
+                                acc[i][n][0] = acc[i][n][0] + sg * cg;    // -> v_pk_fma_f32 (2 lanes, IEEE each)
+                                acc[i][n][1] = acc[i][n][1] + su * cu;
                             }
                         }
                     }
@@ -334,7 +369,8 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                     float h[4], am = 0.0f;
 #pragma unroll
                     for (int i = 0; i < 4; ++i) {
-                        const float gt = acc[i][n][c], uv = acc[i][n][2 + c];
+                        const float gt = c == 0 ? acc[i][n][0].x : acc[i][n][0].y;   // gate: (even, odd)
+                        const float uv = c == 0 ? acc[i][n][1].x : acc[i][n][1].y;   // up
                         h[i] = __fmul_rn(__fdiv_rn(gt, 1.0f + __expf(-gt)), uv);
                         am = fmaxf(am, fabsf(h[i]));
                     }
@@ -426,6 +462,11 @@ void lat_q3k_fused(const uint8_t* const* blob, const int32_t* starts, int n_grou
     const unsigned gy = (unsigned) std::min(n_groups, 512);
     const unsigned gz = (sms > 0 && (int) (gy * kItems) < sms) ? 8u : 1u;
     lat_info((const void*) lat_q3k_fused_gu_kernel, (unsigned) kItems, gy, gz, LTHREADS, lat_smem_bytes());
+    {   // STRATA_A_NAT=0 pins the historical permuted staging (the A/B arm); default is the natural order.
+        static const int a_nat_env = [] { const char* v = std::getenv("STRATA_A_NAT"); return v != nullptr ? std::atoi(v) : 1; }();
+        static bool a_nat_set = false;
+        if (!a_nat_set) { cudaMemcpyToSymbol(g_a_nat, &a_nat_env, sizeof(int)); a_nat_set = true; }
+    }
     lat_q3k_fused_gu_kernel<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
         blob, starts, n_groups, (const uint8_t*) xq, (uint8_t*) hbuf, counts, ent_tok);
     dck(cudaGetLastError(), "launch gu+swiglu+q8_1");
