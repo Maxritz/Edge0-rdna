@@ -468,16 +468,24 @@ constexpr int UPW_BLOCKS = N / UPW_COLS;
 /// resident, 5 interleaved pairs of fresh engines): story 197.6 -> 201.3 tok/s (+1.9%), code 243.5 -> 245.1 (+0.7%),
 /// the produced token ids identical in 6/6 runs; the isolated read (fused_gr_bench) is bitwise the old kernel's.
 bool gr_up_wide_on() {
-#if defined(__HIPCC__)
-    // A HIP build never takes it: gfx1200 / gfx1201 report compute capability 12.0 too, and sm120_default() would turn the
-    // CUDA-measured kernel on there (unmeasured on AMD).  The persistent HC read is the HIP card's own opt-in.
-    return false;
-#else
+    // The env decision is platform-independent, so the kernel can actually be MEASURED on a HIP card.  It used to
+    // be `#if defined(__HIPCC__) return false;` before the env was read, which meant STRATA_GR_UP_WIDE=1 did nothing
+    // on this GPU and the only AMD-tuned up variant in the tree could not be A/B'd at all.  The DEFAULT stays off
+    // on a HIP build: gfx1200/gfx1201 report compute capability 12.0 too, and sm120_default() would turn the
+    // CUDA-measured kernel on there (unmeasured on AMD).
     static const int env = [] {
         const char* v = std::getenv("STRATA_GR_UP_WIDE");
         return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
     if (env >= 0) return env != 0;
+#if defined(__HIPCC__)
+    // MEASURED on gfx1031 (0.38): the wide kernel is worse here AND not bitwise equal, so off is now a result
+    // rather than an "unmeasured" default.  hc1 up 10.05 -> 12.92 ms a round (+28.6 %), round 120.0 -> 125.3 ms,
+    // decode 19.15 -> 16.62 tok/s, and the produced token stream diverges from token 9 - the 32-token output is
+    // NOT the narrow kernel's, which the CUDA comment claims it is.  STRATA_GR_UP_WIDE=1 still forces it, for
+    // whoever wants to re-derive that on another card.
+    return false;
+#else
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;

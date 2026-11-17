@@ -1237,6 +1237,53 @@
 > Repro harnesses: `rs_ab.bat` (auto chunk vs ring depth), `cr_ab.bat` (ring depth at a fixed chunk),
 > `hy_ab.bat` (the hysteresis arm that did nothing).
 
+> ### 0.38 The decode latent D stage is already at the DRAM ceiling, and the wide up kernel is worse AND wrong
+>
+> **The D stage cannot be made faster by a better kernel, and packed fp16 would make it twice as slow.**  The
+> geometry is in verify.cpp: `lat_G_ = 8`, `lat_ELL_ = lay0.fmt[0].n_embd = 2560`, `N = 2560`, and the table is
+> Q8_0 (the pack ships `latent_dense_q8.bin`, `hc_q8` null, `lat_fmt` = 8).  So one layer's D matrix is
+>
+>   8 x 2560 rows = 20,480 rows, each a dot of 2560 = 80 blocks of 32, at 34 B a block
+>   -> 20,480 x 80 x 34 B = 53.1 MiB a layer, **2.38 GiB a round over 48 layers**
+>
+> Against the measured 16.5 ms that is **155 GB/s** (and 167 GB/s at the call site's own 15.3 ms note), on a card
+> whose real DRAM ceiling `cache_policy_bench` puts at **170 GB/s**.  The D stage is therefore at the memory
+> bandwidth limit, not the ALU limit, which also explains why all three of its implementations land within 4 ms
+> of each other: they are all doing the same unavoidable byte traffic.
+>
+> Consequences, both measured rather than assumed:
+>
+> * **A packed-fp16 `v_pk_`/`V_DOT2_F32_F16` D kernel is the wrong tool**: Q8_0 is 34 B per 32 weights =
+>   1.0625 B/weight, while fp16 would be 2 B/weight, so it doubles the stream this stage is bound by.  It would
+>   also have to unpack to do it.  Not written, and it should not be.
+> * **The lever is bit-width, not instruction selection.**  Q4_0 is 18 B per 32 weights = 0.5625 B/weight, so
+>   the same stage would stream 1.19 GiB a round and take ~8 ms instead of ~16.5 - about 7 % of decode.  That is
+>   the same Q4_0-for-latent-D item that has been blocked all along on there being **no KL/NLL quality gate in
+>   this repo**.  The optimisation is understood and sized; it needs a quality gate, which is a decision for the
+>   owner, not a kernel to write.
+>
+> **`gr_up_wide_kernel` on gfx1031: slower, and not bitwise equal.**  It had been unreachable - `gr_up_wide_on()`
+> returned false under `__HIPCC__` *before* reading `STRATA_GR_UP_WIDE`, so the only AMD-shaped up variant in the
+> tree could not be measured at all.  The env decision is now read first (the default stays off on HIP).  A/B,
+> alternating pairs, everything else identical (`STRATA_QFUSE_HC=0` because the wide kernel is only selectable
+> with a null `q8_mixed`, and persist off so `up` is stamped):
+>
+> | arm | `hc1 up` | round | decode |
+> |---|---|---|---|
+> | narrow (`gr_up_multi_kernel`) | 10.097 / 10.040 ms | 120.60 / 120.01 ms | 19.17 / 19.13 tok/s |
+> | **wide (`gr_up_wide_kernel`)** | **12.872 / 12.967 ms** | **125.59 / 125.07 ms** | **16.60 / 16.65 tok/s** |
+>
+> +28.6 % on the up stage and **-13 % decode** - and the two arms' 32-token outputs **diverge from token 9**,
+> so on this card the wide kernel is not the bitwise-equal retiling its CUDA comment claims.  The HIP disable is
+> now a measured decision with a reason, instead of an unmeasured one; `STRATA_GR_UP_WIDE=1` still forces it.
+>
+> **What is left in decode, in order.**  20,480-row D at 155-167 GB/s is done (bit-width only).  The U pair
+> (`u: gemv` 18.05 + `u: matvec` 14.62 = 32.7 ms) is the largest remaining item and it is **launch-bound, not
+> bandwidth-bound**: ~10 rows a layer, 320 blocks a row, 48 layers = ~154k blocks a round at ~86 ns each = 13.2 ms,
+> which is what §0.19 measured and why the prefill tile does not help it.  The fix named there - a decode-shaped
+> tile, 8-16 rows, one block per label x column tile, ~150 blocks a layer - is still the right one and is still
+> not written.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
