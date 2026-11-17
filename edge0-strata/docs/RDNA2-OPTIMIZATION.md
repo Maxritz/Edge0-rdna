@@ -1396,6 +1396,43 @@ load path.  The honest status is "strong lead, unmeasured": the right instrument
 own `isa_extract.py`/`isa_mix.py` counting the body.  That is a probe build, not an engine patch, so it carries no risk
 to the shipped binary.
 
+
+### 8r. MEASURED: the buffer-resource load is 1.7-3.0x faster than the A stage's flat load path
+
+8q's lead is now measured, standalone, with no engine change.  `build/probe_addr.cpp` reads the SAME bytes two ways from
+550-byte rows with the engine's 2-byte misalignment, at rows = 1/16/64, 20 blocks x 64 threads (the card filled):
+
+    rows   lat_ld4 (flat/generic)   buffer resource (dword)   speedup
+    1        52.71 Gvalues/s            91.37                  1.73x
+    16       33.68                      90.91                  2.70x
+    64       30.25                      91.60                  3.03x
+
+`lat_ld4` is the shipped path verbatim: five overlapping 32-bit loads + four `__funnelshift_r` per 16 values.  The
+buffer form does **exactly the same five dword loads and the same four funnel shifts** - only the addressing mode
+differs (`make_srsrc` + `llvm.amdgcn.raw.buffer.load.i32`).  The shape of the result matters as much as the ratio:
+the buffer path is **flat across working-set size (90-92 Gvalues/s)** while the flat path degrades 52.7 -> 30.3, i.e.
+the generic-address cost scales with the working set, and the descriptor removes it.
+
+**Two false starts, recorded because both would have been reported as a refutation:**
+  1. the first probe was folded away - with the row loop iteration-invariant, `ld4` measured 0.001 ms and 243,809
+     Gvalues/s, which is not a rate.  The offset now varies with the iteration in BOTH kernels.
+  2. the second run had the buffer base at `rows + r*550`, which violates the **256-byte base-alignment** rule for an
+     AMD buffer descriptor; that measured the buffer form 38-75x SLOWER.  With the base at the aligned allocation and
+     the row as a flat byte `voffset`, the same code is 3x faster.  **On this hardware an unaligned srsrc is not a
+     slow path, it is a nonsense path** - the first number was measuring undefined behaviour.
+
+**What this does and does not prove.**  It proves the addressing mode change is worth up to 3x *on this load pattern*.
+It does NOT prove the A stage gains 3x: the stage is 2,115 instructions carrying 128 `dp4a`, so the load path is only
+part of the body, and the stage is also ~48 % PCIe-duty bound, so a faster load path can be partly hidden.  Between
+those two bounds the honest expectation is a fraction of 3x on `gemm gate/up` (3,738-4,311 ms), and it is the first
+measured, structural lead on that block after fill, occupancy, registers, smem, staging and bytes all came back flat.
+
+**Port plan (not yet done, and it is a real engine edit):** the kernel receives `blob[g]` per expert; a buffer
+descriptor needs the aligned ARENA base plus a byte `voffset`, so `lat_q3k_fused` must also receive the arena base and
+its range, and the row offset becomes `blob[g] - base + row*kGuRow + ...` in 32-bit form.  Then `lat_ld4`'s five loads
+become five `buf_load_b32` calls.  The gate is the usual one: alternating pairs, the 32-token output check, and
+`run_512k_mtp.ps1 -Embed 1` expecting exit 0 with tokens `715 1822 363 313`.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
