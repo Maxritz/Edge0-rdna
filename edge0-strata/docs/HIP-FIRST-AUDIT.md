@@ -103,3 +103,24 @@ the noise — and left `wait for rings` unchanged (59.4 vs 59.0 ms). **The cache
 tokens** (`715 1822 363 313 198 262 514 1249 2796 ...` against `... 514 264 283 220 ...`), because the CPU/GPU
 expert split changes the accumulation order. So expert-cache size is a *numerical* parameter: decode A/Bs on it may
 compare throughput only, never "byte-identical output".
+
+---
+
+# "Why so many launches - can we recycle what is already launched?"
+
+Most of that recycling is **already in the engine**, which is why it is not the lever it looks like:
+
+| what would be recycled | what the engine already does | measured verdict |
+|---|---|---|
+| kernel launches (per layer, per token) | **HIP graphs**: the decode window is captured per width - `strata verify: capturing the 1/2/3/4-token window ... captured` (`src/core/graph.cpp`, `--no-capture` disables) | launches are graph NODES at ~2.4 us, not host launches at 28-31 us. So the many-launch count is not 22 ms |
+| the hyper-connection read across tokens | **a persistent kernel**: `one persistent kernel (80 blocks on 20 multiprocessors, up to 8 tokens)` | ON vs OFF: decode 22.54/22.43 vs 22.80/21.82 (noise). OFF also CHANGES the tokens (summation order, max rel diff 1.9e-07). Keep ON |
+| expert weights across layers | profile-ranked expert cache, `pre-filled 1918 of 1918 slots from the profile` | cache size is a non-lever for decode (see above) and a numerical parameter |
+| the `gr_read` launch triple | `fused_gr_read` / `fused_gr_read_multi` exist; the card check chose **"staged"** and the persistent variant on top | already the fast path |
+| wait + copy | `STRATA_FUSE_WAIT`: wait folded into the following copy | on by default |
+
+So "recycle the launches" is **done**: the window is one graph, the HC read is one persistent kernel, and the expert
+cache is a residency pool. The 22 ms attributed to `hc1 norm` therefore is NOT launch overhead, and neither the
+persistent kernel nor the head's batched read moves it (both measured neutral). It needs a per-node/event
+measurement of the captured window rather than another inference - eleven candidate explanations for decode have now
+been tested and found neutral, which is itself the finding: this path has already been tuned by someone who measured,
+and what is left is real GPU work, not dispatch waste.
