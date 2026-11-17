@@ -18131,13 +18131,32 @@ int main(int argc, char** argv) {
                 // stream term is `experts_total - gpu_cache + lend_bytes`, which can never exceed one pack), so
                 // the cap lives here, keyed on the geometry rather than on a box or a harness pin.  Packs with
                 // many experts a layer (the multi-GPU rigs the planner was fitted on) keep the old choice.
-                if (g.n_expert > 0 && g.n_expert <= 512 && o.prefill_chunk > 512 &&
-                    (o.prefill_auto_cap <= 0 || o.prefill_auto_cap > 512)) {
+                // 0.28 CAP DEPENDS ON THE CACHE IT WAS MEASURED AT, and it was measured at 552 slots.  The
+                // original reason (a 1,024-token chunk streams every 512-expert layer's set twice) still holds
+                // for a SMALL cache, but with the cache this box actually gets (1,472 slots borrowing at 4k) the
+                // optimum sits just under expert saturation instead, and 512 was costing 15 %:
+                //   4k, borrowing, cache 1,472, alternating pairs, 4063-token prompt:
+                //     chunk 512: 62,313 blobs, hc-down 768 ms -> 302.80 / 302.75 / 302.85 tok/s
+                //     chunk 640: 56,105 blobs, hc-down 672 ms -> 319.52
+                //     chunk 704: 50,461 blobs, hc-down 576 ms -> 332.12 / 332.43
+                //     chunk 768: 49,683 blobs, hc-down 576 ms -> 334.21
+                //     chunk 832: 43,774 blobs, hc-down 480 ms -> 349.95
+                //     chunk 896: 43,851 blobs, hc-down 480 ms -> 352.90
+                //     chunk 960: 43,068 blobs, hc-down 480 ms -> 346.14
+                // Bigger wins on BOTH terms: 30 % fewer blobs AND the fixed per-layer-chunk hyper-connection
+                // cost halves (768 -> 480 ms, it is 2.0 ms a layer-chunk and does not scale with tokens).  The
+                // cache is NOT hurt because the borrowing path keeps it at full size.  832 is within 0.8 % of
+                // 896 and is the same value the own-buffers path ships, so the two regimes agree.
+                const int64_t auto_cap_tokens = xcache.slots() >= 1000 ? 832 : 512;
+                if (g.n_expert > 0 && g.n_expert <= 512 && o.prefill_chunk > auto_cap_tokens &&
+                    (o.prefill_auto_cap <= 0 || o.prefill_auto_cap > auto_cap_tokens)) {
                     std::fprintf(stderr,
-                                 "strata generate: prompt chunk auto: %lld -> 512 tokens (a %lld-expert layer's "
-                                 "working set fits ~512 tokens; a larger chunk re-streams every expert twice)\n",
-                                 (long long) o.prefill_chunk, (long long) g.n_expert);
-                    o.prefill_chunk = 512;
+                                 "strata generate: prompt chunk auto: %lld -> %lld tokens (a %lld-expert layer's "
+                                 "working set fits ~%lld tokens at %lld cache slots; a larger chunk re-streams "
+                                 "every expert twice)\n",
+                                 (long long) o.prefill_chunk, (long long) auto_cap_tokens, (long long) g.n_expert,
+                                 (long long) auto_cap_tokens, (long long) xcache.slots());
+                    o.prefill_chunk = auto_cap_tokens;
                 }
                 std::fprintf(stderr, "strata generate: prompt chunk auto: %lld tokens\n", (long long) o.prefill_chunk);
             } else if (chunk != o.prefill_chunk) {

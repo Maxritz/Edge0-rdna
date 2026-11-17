@@ -995,6 +995,101 @@ and attributing the 72 `v_div_scale_f32` in an int8 body) is the untested head o
 Gates for the shipped default: 4k `301.23/300.69 -> 302.51/302.64`; 8k chunk 832 `341.43/340.00 -> 343.94/343.31`;
 512K + MTP exit 0, tokens `715 1822 363 313`, cache 872 slots; 32-token output identical in every arm.
 
+
+### 8i. The D/U chain, attributed - and two of its four rows are FIXED per-layer costs, not GEMMs
+
+The last large block with no measured hypothesis.  First the labels, because three of the four were wrong:
+
+| ledger row | real phase | what it actually brackets |
+|---|---|---|
+| `gather` | `kPfGather` | `quantize_q8_1_rows(mixed)` + the **D** projection |
+| `gemm down` | `kPfGemmD` | `quantize_q8_1(H)` + the **U** projection (the source comment says so) |
+| `hc read: down+silu` | `kPfHcDown` | the HC **down projection** D->LR + silu (not a read) |
+| `hc read: up` | `kPfHcUp` | the HC **up projection** LR->D + mix (not a read) |
+
+Geometry: `N=2560, HC=4, D=N*HC=10240, LR=320, K=10, NE=512`.  `STRATA_D_PROF` and `STRATA_DU_PROF` give the
+projections their own event pairs (both only exist on the non-fused `STRATA_LATENT_FUSED_DU=0` path, which measures the
+same as the default: `gemm down` 1,079 vs 1,080, `gather` 906 both).
+
+    block                     MAC         ms     T MAC/s   % of 21.8 T MAC/s peak
+    D projection            5.15 T       850       6.06          27.8 %
+    U projection            6.44 T     1,056       6.10          28.0 %
+    HC down                 0.64 T       768       0.84           3.8 %
+    HC up                   0.64 T       768       0.84           3.8 %
+    A stage (gemm gate/up)  3.19 T     4,311       0.74           3.4 %
+
+**D and U are the best-run blocks in the engine - 28 % of the dp4a peak, i.e. 8x the A stage's MAC rate.**  They are
+NOT the problem and should be left alone; U is also labelled `gemm down`, which is why 1,080 ms of real, efficient
+work kept being read as a candidate.
+
+**The HC pair is the real surprise: it is a FIXED cost per layer-chunk.**  Same config, three chunk sizes:
+
+    chunk    layer-chunks    hc down ms    hc up ms    per layer-chunk
+    256          768           1,536        1,536        2.0 / 2.0
+    512          384             768          768        2.0 / 2.0
+    1,024        192             384          384        2.0 / 2.0
+
+A 4x change in tokens per chunk leaves them EXACTLY unchanged.  So they cannot be GEMMs scaling with M (the down
+projects D=10240 -> LR=320, up the reverse).  They are weight-stream / grid-fill bound: 10240 x 320 = 3.28 M weights
+per layer-chunk, and a 64-row x 128-col tile gives a grid of only ~20 blocks - one per CU, 16 waves.  1,536 ms a
+prefill at chunk 512, and it HALVES for every doubling of the chunk, which is part of why chunk 832 beat 512.
+
+**Both S23 fusions are gfx11-only and refuse on gfx1031** - `STRATA_PF_HCDOWN=1` fails hard with "could not run the
+hyper-connection projections", and `STRATA_HC_UPMIX=1` changes nothing (768/768 identical).  So there is no shipped
+switch that touches this on RDNA2; it is an RDNA2 gap, not a tuning miss.
+
+**Reframing the A stage (32 % of prefill).**  It is NOT 29x from its ceiling on the terms that were being used.  It
+must pull 60,338 expert blobs x 1.16 MB = **70 GB at chunk 512, which is 2.5 s at the measured 28.0-28.1 GB/s link**,
+against 4,311 ms measured - i.e. **58 % link duty**.  At chunk 832 it is 49.3 GB = 1.76 s against ~4.3 s, 41 % duty.
+So the stage is a streaming problem within ~2x of its floor, which is exactly why fill, occupancy (32/64 waves
+measured, -0.2 %), registers, smem and instruction mix all measured flat: they are not what it is waiting on.
+
+**What this leaves, ranked by measured size and by what is now actually known:**
+
+1. **A stage non-overlap ~1.8 s** - the bytes need 2.5 s, it takes 4.31 s, and the visible `wait copy` is only 623 ms,
+   so the stream stalls *inside* the A stage (2,163 launches, each waiting on its own 32 experts).  Deeper ring/pipe
+   was measured neutral at chunk 832, so the fix is launch/consumption order, not depth.
+2. **HC down+up 1,536 ms at 2.0 ms/layer-chunk** - needs grid parallelism (K-split or a 32-column N tile to turn ~20
+   blocks into ~80), or the gfx11 fusion ported down.  It is the cleanest bounded target left: the work is fixed and
+   the current grid is 20 blocks on 20 CUs.
+3. D and U: leave them.  28 % of peak is not where the 3.9 s lives.
+
+Neither 1 nor 2 is a constant or a flag; both need a kernel edit, which is why this section stops at the attribution.
+
+
+### 8j. The 4k chunk cap was 15 % slow - the cap is only right for the cache it was measured at
+
+The 0.28 cap forced the automatic 4k chunk to 512 tokens.  Its own comment records why: at a **552-slot** cache a
+1,024-token chunk streamed every expert of the pack twice (24,024 blobs) against 512's 62,558, i.e. 203.31 / 201.66
+versus 244.16 / 244.14 tok/s.  That reasoning is sound - for a 552-slot cache.  This box now gets **1,472 slots** at
+4k on the borrowing path, and there the optimum is just under expert saturation:
+
+    4k, borrowing, cache 1,472, 4063-token prompt, alternating pairs
+    chunk   cache slots   blobs    hc-down ms   prefill tok/s
+    512       1,472      62,313      768        302.80 / 302.75 / 303.28 / 301.27
+    576       1,472      59,447      768        300.45
+    640       1,472      56,105      672        319.52
+    704       1,472      50,461      576        332.12 / 332.43
+    768       1,472      49,683      576        334.21
+    832       1,472      43,774      480        349.95 / 351.02 / 351.47
+    896       1,472      43,851      480        352.90
+    960       1,472      43,068      480        346.14
+
+Bigger wins on BOTH terms at once: **30 % fewer blobs** and the fixed per-layer-chunk hyper-connection cost **halves**
+(768 -> 480 ms, from section 8i it is 2.0 ms a layer-chunk and does not scale with tokens).  The cache is not hurt
+because the borrowing path keeps it at full size.  832 is within 0.8 % of 896 and equals the own-buffers value, so both
+regimes now agree on one number.
+
+The cap is therefore conditional on the cache it was measured against: `832` when the cache has >= 1,000 slots, `512`
+below that (which preserves the original 552-slot result).  4k default: **301.27 / 303.28 -> 351.02 / 351.47 (+16.1 %)**;
+8k unchanged at 344.02; 512K + MTP exit 0 with tokens `715 1822 363 313`.
+
+This is the third time the largest available win was a *cache-vs-chunk* admission decision rather than a kernel
+(sections 8a-8h: ring depth, the VRAM cliff, the borrow flag, the own-buffers chunk, now the borrowed chunk).  The
+pattern to remember: on this box the expert cache is worth more than the bytes, and the chunk is the variable that
+trades one for the other - so it must be chosen against the cache size that will actually be granted, never as a
+constant.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
