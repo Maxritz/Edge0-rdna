@@ -441,10 +441,18 @@ inline int stage_slots(size_t T) {
     // range (80 slots hold ~3.1 ms of a ~20 ms layer-chunk).  The binding test is the one the chunk scan uses,
     // `chunk + ring + 128 <= slots`, so the Q4 table (1,910 slots) affords 512 while the Q8 one (720) affords 80
     // and keeps the behaviour it was measured with.  Never a hardcoded box or harness pin: the cache decides.
-    const int from_cache = g_cache_slots > 0 ? g_cache_slots - (512 + 128) : 0;   // chunk 512 + headroom
+    const int room512 = g_cache_slots > 0 ? g_cache_slots - (512 + 128) : 0;
+    const int room256 = g_cache_slots > 0 ? g_cache_slots - (256 + 128) : 0;
+    // CHUNK-AWARE: the deepest ring that keeps the LARGEST affordable chunk, never spending the chunk to buy ring.
+    // At 8192 context this box has 647 cache slots: chunk 512 needs 512+ring+128 <= 647, which no useful ring
+    // satisfies (even 64 gives 704 > 647), so the auto-chunker falls to 256 anyway - and a 64-slot ring there is
+    // pure loss, because chunk 256 only needs 256+ring+128 <= 647, i.e. up to 263 slots of prefetch.  Trying 512
+    // first and falling back to the 256 budget keeps 4k at its measured 299 tok/s and gives the collapsed case its
+    // deepest ring instead of starving it.
+    //
     // Floor 64, not 80: the Q8 table leaves the cache at ~708 slots, and 512 + 80 + 128 = 720 > 708 collapses the
-    // auto chunk to 256 (measured 186 tok/s against 261).  Letting the ring SHRINK to fit keeps chunk 512, which is
-    // worth far more than 16 ring slots - 512+68+128 = 708 fits exactly.
+    // auto chunk to 256 (measured 186 tok/s against 261).  Letting the ring SHRINK to fit keeps chunk 512.
+    const int from_cache = room512 >= 64 ? room512 : room256;
     const int base = env > 0 ? env : std::min(512, std::max(64, from_cache));
     const int out = std::min(std::max(base, std::max(ring_slots(T), (int) STAGE_GRP)), ring_cap());
     {   // the depth the prompt path actually stages at, and where it came from, printed whenever it CHANGES.  This was
