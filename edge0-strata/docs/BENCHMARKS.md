@@ -28,11 +28,14 @@ decode   @ 4096                  30.82 / 30.88 tok/s       (spec 6 / min-p 0.3; 
   to ~11 tok/s (observed: 10.88, 12.49, 10.81, 11.60, 11.44). The collapsed runs still use wide T=6 windows and accept
   ~6 of ~65 drafts, so the drafts are genuinely bad for the whole run. Not the MTP side stream, not the expert lane.
   Real expected decode is therefore ~27.6, not 31.
-- **`--pcie-frac 0` is +2.8 % at 1k and +25.9 % at 512K**, but it CHANGES the arithmetic (an expert computed on the CPU
-  rounds differently from the GPU), so the 512K gate's tokens move from `715 1822 363 313` to
-  `248046 198 248045 74455`. Left as an explicit flag: it needs a KL decision and a re-baselined token contract.
+- **`--pcie-frac 0` is INERT - withdrawn.** A first pass read +2.8 % at 1k and +25.9 % at 512K; a cleaner alternating
+  design in one binary gives 29.22/29.24 vs 29.19/29.20 at 1k and 15.41/15.47 vs 15.38/15.33 at 512K, with a
+  **byte-identical** 512K output. The 1k delta was batch drift and the 512K delta was single-round noise (4 tokens =
+  one round). Default stays 0.40.
 - **The window is `wait for rings + pool`, not the max** (45.15 + 22.58 of a 73.7 ms window). The CPU pool is fully
   exposed; overlapping it is worth ~25 ms/window, i.e. ~46 tok/s.
+- **Long-context decode needs >= ~10 tokens to measure.** The 512K gate emits 4 tokens = one round, so its 11.99-15.47
+  range is noise. Always print the acceptance ratio beside a decode number.
 
 Reference targets for this engine: **~430 tok/s prefill, 62.4 tok/s decode**.  So the shipped state is ~1.4x short on
 prefill and ~2.2x short on decode.

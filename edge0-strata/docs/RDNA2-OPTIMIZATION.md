@@ -1202,14 +1202,25 @@ estimator its own zero.  It is a run-level draft-head defect (state/init), not w
 stream (5 good + 1 bad with `STRATA_MTP_SIDE_STREAM=0`) and NOT the expert lane (occurred at pcie-frac 0.40 AND 0).
 This costs more than every other decode item combined: the expected decode is ~0.83*31 + 0.17*11 = 27.6, not 31.
 
-**(4) `--pcie-frac 0` is faster but changes the ARITHMETIC, so it is documented, not defaulted.**  At 1k context, four
-alternating pairs each: 0.40 -> 28.28 / 28.37 / 28.41 / 28.47, `0` -> 29.14 / 29.17 / 29.19 / 29.23 (**+2.8 %**, and
-the ranges do not overlap).  At 512K on the never-break gate: default 12.14 tok/s, `--pcie-frac 0` **15.28 tok/s
-(+25.9 %)** - because with a small long-context cache the PCIe share is large.  BUT the gate's tokens change from
-`715 1822 363 313` to `248046 198 248045 74455`, because pcie_frac decides whether an expert is computed on the GPU
-(cache resident) or on the CPU, and those round differently - the engine says so itself.  So it is a numerics knob
-wearing a performance label, it needs a KL-gate decision and a re-baselined token contract, and it was left as an
-explicit flag: `--pcie-frac 0` for the +2.8 % / +25.9 %, default unchanged at 0.40.
+**(4) `--pcie-frac 0` is INERT - the +2.8 % / +25.9 % it first appeared to buy were measurement artefacts.  WITHDRAWN.**
+First pass said 0.40 -> 28.28 / 28.37 / 28.41 / 28.47 against `0` -> 29.14 / 29.17 / 29.19 / 29.23 at 1k (+2.8 %, ranges
+not overlapping), and 12.14 -> 15.28 tok/s at 512K (+25.9 %).  Both failed to reproduce under a cleaner design, same
+single binary, alternating, 2 runs per arm each at 1k and at 512K:
+
+    1k, 64 tokens        default(=0) 29.22 / 29.24  (accept 0.783)     --pcie-frac 0.4  29.19 / 29.20  (accept 0.735)
+    512K, 12 tokens      default(=0) 15.41 / 15.47  (9 rounds)         --pcie-frac 0.4  15.38 / 15.33  (9 rounds)
+
+Within 0.2 % at both contexts, and the 512K OUTPUT IS BYTE-IDENTICAL across all four arms
+(`715 1822 363 313 198 262 514 307 283 220 16 15`).  Two specific errors produced the first pass: the 1k difference was
+**batch drift between arms**, and the 512K "+25.9 %" compared a single decode round (the gate emits 4 tokens = one
+round) at 12.14 against one at 15.28 - noise, not a signal.  A KL measurement taken during that first pass read mean
+1.84e-3 / top-1 100 % (35 positions) with a bit-identical 0.40-vs-0.40 control; since the clean runs are byte-identical
+there is no arithmetic difference to gate either.  **So no default was changed**: pcie-frac stays 0.40, and the
+"+2.8 % / +25.9 %" figures in the first draft of this section are retracted.
+
+**What this changes about the method:** the 512K gate is not a throughput measurement - 4 tokens is one round.  Any
+decode claim at long context must run >= ~10 tokens so there are several rounds, and any claim needs the acceptance
+ratio printed beside it, because acceptance moved 0.735 <-> 0.783 between these arms while throughput did not move at all.
 
 ## 7. The method that actually worked
 
