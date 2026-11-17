@@ -1354,6 +1354,48 @@ launched while the context sweep still held the GPU, and all 16 died at
 VRAM contention from a concurrent engine, not the flag.  The experiment is queued for when the GPU is free, and must be
 scored as a RATE (collapses per N runs), not a single pair, because the defect is stochastic.
 
+
+### 8q. CATCHUP_ALL does NOT fix the desync (rate test), and what HipKittens-RDNA is actually worth here
+
+**8p's proposed fix is refuted.**  `STRATA_MTP_CATCHUP_ALL` (catch the drafter's K/V up over the whole verified window,
+rejected rows included) was run as a RATE test - 10 runs per arm, interleaved, one binary, spec 4 / min-p 0.5:
+
+    arm                collapses (<20 tok/s)    good-run mean
+    CATCHUP_ALL off        2 of 10                 23.45 tok/s
+    CATCHUP_ALL on         2 of 10                 23.26 tok/s
+
+Identical.  Collapsed runs looked the same in both arms (62-63 rounds, accept 0.062; 48-53 rounds, accept 0.38-0.40).
+So the drafter's K/V catch-up over rejected rows is NOT the desync path.  The diagnosis from 8p stands - after the
+divergence the draft head reports p1 0.6-0.99 while accepting 0 - but the mechanism lies elsewhere, and this flag is
+closed.  (A rate test was the right instrument: a single pair would have "confirmed" either answer.)
+
+**HipKittens-RDNA.**  Worth taking seriously because the fork carries `include/rdna2` explicitly for **gfx1031** - this
+exact chip.  But read what it contains before planning around it:
+
+  * upstream HipKittens targets **CDNA3/4/5** (gfx942 / gfx950 / gfx1250) and its tile primitives are *sized to the
+    tensor-core units*.  gfx1031 has **no matrix cores**, which is exactly why this engine is `v_dot4`-based.  So there
+    is no drop-in GEMM to lift, and no CDNA tile shape to copy.
+  * the RDNA2 path is a real ops layer (`register`, `shared`, `memory`, `sync`, `group` + `types`), and its `memory`
+    utilities are where the transferable value is:
+      - `make_srsrc()` builds a **buffer resource** (with the 13:0 row-stride and the swizzle-enable bit) and loads go
+        through `llvm.amdgcn.raw.buffer.load.b128`.  A buffer load carries its own address descriptor, so it sidesteps
+        the generic-address computation a `flat_load` needs.
+      - a `move<T>` trait exists specifically "to prevent generic addressing" (`ds_`/`global_`/`buffer_` rather than
+        `flat_`).
+      - the `*_async` helpers are not DMA engines - they are the same instruction with **`s_waitcnt` deferred**, so N
+        loads can be issued before one wait.  That is the classic RDNA latency-hiding idiom.
+  * there is no `ds_read_b128`; it uses `b64`.
+
+**Why that matters to OUR bottleneck.**  The A stage's body is 2,115 instructions carrying 128 `dp4a` = **6 % MAC
+density**, and its weight path is `lat_ld4()`: for every 16 values it does **four 32-bit loads plus four
+`__funnelshift_r`** to realign a 550-byte row with 2-byte misalignment.  That is address/realignment work, which is
+precisely what `make_srsrc` + `buffer_load_dwordx4` collapses into **one** instruction - and what 8h's flat scatter of
+fill/occupancy/registers/smem/staging could never explain, because none of those change the instruction count of the
+load path.  The honest status is "strong lead, unmeasured": the right instrument is a standalone probe comparing
+`lat_ld4` against a buffer-load form on the same misaligned 550-byte layout, at rows = 1/8/16/31/64, with the engine's
+own `isa_extract.py`/`isa_mix.py` counting the body.  That is a probe build, not an engine patch, so it carries no risk
+to the shipped binary.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
