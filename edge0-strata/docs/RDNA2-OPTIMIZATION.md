@@ -1574,6 +1574,40 @@ instrumented build, not another flag sweep.**
 The refusal stands (the probe changes were reverted and the tree rebuilt), which remains the right behaviour: the flag
 still returns a wrong answer, and a wrong answer that looks fast is worse than a refusal.
 
+
+### 8w. FOUND IT: `auto` never reads the expert cache (0 of 0 lookups); `explicit` reads it and the slots are wrong
+
+Every CLI axis was eliminated in 8v, so the next discriminant had to come from an instrumented build - and the engine
+already had the tap.  generate.cpp:19463 prints an `R4 expert-cache hits` line (hits / lookups / admitted / refused), and
+`STRATA_POOL_TRACE` covers the pool side.  Same binary, same prompt, same chunk, refusal temporarily disabled:
+
+    arm          R4 expert-cache hits                                    output
+    auto         0 of 0 = 0.0000  (0 admitted, 0 refused, 0.0000% full)   CORRECT
+    explicit     6915 of 14914 = 0.4637  (0 admitted, 7999 refused, 100% ) ALL ZERO
+
+**That separates the two runs completely.**  `auto` consults the cache ZERO times - every expert is computed by the CPU
+pool, so the cache cannot make it wrong.  An explicit `--expert-cache 1472` consults it 14,914 times, takes 6,915 hits,
+and those hits return garbage.  The defect is therefore **not** in sizing, borrowing, ring staging or the chunk: it is
+that **the cached slots do not contain the experts the plan says they do**, and the explicit path is the only one that
+trusts them.
+
+"0 admitted" in BOTH arms is the corroborating detail: nothing is admitted at runtime, so the cache's content is entirely
+whatever the startup profile preload wrote - and `100.0000 % full` says the slots were allocated and marked occupied.
+So the preload marks capacity without (correctly) publishing the experts into it.
+
+**Why this took so long, and the lesson:** 1fc98ed's comment blamed "a profile-filled explicitly-sized cache discards its
+resident rows".  That was close but unfalsifiable from the CLI, so five plausible downstream hypotheses were tested and
+killed first (capacity, borrow, hit decision, open_sized, ring depth, chunk, g_cache_slots publish).  The one line that
+would have ended it immediately was the hit/lookup counter that already existed - **read the existing counters before
+inventing a bisect.**
+
+**The fix is now a bounded question:** either the preload must actually publish each slot's expert (making the hits
+valid), or the hit path must not claim a slot resident unless its content was verified.  The second is the safe
+sequencing: a slot is only a hit once the fill has been confirmed, which is how `auto` effectively behaves today (it
+never claims one).
+
+The tree was restored after the probe (refusal back on, rebuilt); no code change from this turn survives.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
