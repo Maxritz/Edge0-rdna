@@ -1545,6 +1545,49 @@
 > whose 32-token output is not checked is untrustworthy, and the corruption shows up as *wrong output*, not as a
 > slow run - which is exactly how it would slip through a throughput-only harness.
 
+> ### 0.46 The prefill model, corrected: the host does 263 ms of work and waits for the rest; the ceiling is 277
+>
+> 0.45's claim that the copy-issue path runs "at 9.2 GB/s against a 37 GB/s host ceiling" is **withdrawn**.  The
+> engine already measures this and says otherwise, in its own timing footer:
+>
+> ```
+> GPU timeline 17683 ms, wall 17688 ms, host staging 112 ms, streamed 63715 blobs (63715 by DMA), resident 358
+> host: chunk setup (PLE rows, the expert stream plan) 33 ms, waiting for each chunk 72 ms,
+>       after each chunk (the draft layer, progress) 41 ms, PLE 3 ms
+> ```
+>
+> **The host's entire real work for the 17.7 s prefill is 112 ms of staging + 149 ms of everything else = 261 ms.**
+> So the 9,361 ms and 8,132 ms buckets are both *stalls* - the host blocked, not slow.  There is no host-side
+> inefficiency to fix, and the three turns spent on "host grouping" were chasing a bucket that contains no work.
+>
+> What the numbers do say, unambiguously:
+>
+> | quantity | value | source |
+> |---|---|---|
+> | expert bytes streamed | 73.5 GB (63,715 blobs) | timing footer |
+> | all of it `by DMA`, from the pinned arena | 63,715 / 63,715 | timing footer |
+> | exposed transfer (`wait copy`, device) | 2,945-2,985 ms | ledger |
+> | implied PCIe rate | **24.6 GB/s** (73.5 GB / 2.99 s) | arithmetic, matches the measured ~28 GB/s |
+> | GPU compute (timeline minus that idle) | 14.70 s | arithmetic |
+>
+> So `wait copy` is not host lag - it is **the expert transfer time itself, exposed**, and everything else is GPU
+> compute.  The prefill ceiling follows directly:
+>
+> * hide the transfer completely -> 14.70 s -> **~277 tok/s** (from 230).  That is the whole available gain from
+>   overlap, not the ~8 s / ~450 that 0.44/0.45 claimed.
+> * reach the ~430 reference -> 9.4 s, which needs the GPU timeline 1.56x faster *as well*.  The A stage alone is
+>   5,387 ms of it (30.5 %), so this is a kernel campaign, not a scheduling change.
+>
+> And the overlap is not free: staging a full layer ahead needs ~166 ring slots (193 MB a layer), against the 80
+> that fit now.  That tradeoff is already measured - 96 / 80 / 112 ring slots are flat at 235.34 / 235.46 /
+> 237.12 tok/s, and 192 / 256 **regress** to 187 / 189 because the ring comes out of the expert cache and more
+> streaming follows.  A deeper ring cannot buy the overlap on this box's 12 GiB.
+>
+> Prefill is therefore at a structural limit: 14.70 s of GPU compute that must be reduced by kernel work, plus
+> 2.99 s of transfer that must be overlapped, on a card that cannot afford the staging depth to overlap it.
+> Remaining device items, in order: A stage 5,387 (30.5 %), gdn 3,086 (17.5 %), gemm down 1,146 (6.5 %), gather
+> 972 (5.5 %), hc read down+silu 681 (3.9 %), qsa attn 633 (3.6 %).
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
