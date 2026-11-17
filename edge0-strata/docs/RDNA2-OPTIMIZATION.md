@@ -1494,6 +1494,49 @@ now the addressing mode.  What remains untested there is the instruction MIX its
 `dp4a` = 6 % MAC density, with 128 cvt and ~72 `v_div_scale_f32` in an int8 body - which is a different kind of work
 from everything above.
 
+
+### 8u. `--expert-cache N` zeros: the sized-slot theory is DISPROVEN; the fault is in the verify WINDOW, not the cache
+
+The defect 1fc98ed refused is still unfixed, but this turn moved it from "unexplained" to a named subsystem, and
+disproved the explanation the refusal itself suggests ("a profile-filled explicitly-sized cache discards its resident
+rows").
+
+**Disproved.**  The explicit size was the ONLY caller of `xcache.open_sized()` (variable-size slots from the profile);
+`auto` always uses the uniform `open()`.  So the sized-slot path was bypassed - an explicit N now clamped and opened as
+UNIFORM slots, sized_slots left empty.  Result:
+
+    --expert-cache auto   1472 slots, 1.60 GiB  -> output 248046 198 248045 74455 ... (correct)
+    --expert-cache 1472   1472 slots, 1.60 GiB  -> ALL ZERO
+    --expert-cache 800     800 slots, 0.87 GiB  -> ALL ZERO
+    --expert-cache 2000   2000 slots, 2.17 GiB  -> ALL ZERO
+    --expert-cache 3000   3000 slots, 3.25 GiB  -> ALL ZERO
+
+An IDENTICAL cache (same slots, same GiB) still returns zeros, so the cache fill, the sizing and `open_sized` are all
+exonerated.  The fit is not the problem either - 1472 is exactly `auto`'s own number.
+
+**Where it actually is.**  Diffing the two logs, the explicit run differs in exactly two ways, and both are in the
+verify window machinery (src/core/verify.cpp), not the cache:
+
+    auto only:      prefill ring: N slots (base N, ring_slots N, budget N, cap N, cache slots N, T=N)
+                    K0-LAUNCH-QUERY SUCCESS(idle)
+    explicit only:  K0-STAGE-RESET t=... h_seq=...        (repeated)
+                    K0-LAUNCH-QUERY NOTREADY(busy)        (repeated)
+
+  * `stage_slots()` (prefill.cpp:414) prints on its FIRST call - `said` starts at -1 - so the explicit run **never
+    calls it at all**.  The prompt path is not staging through the ring.
+  * the window then sits in `STAGE-RESET` / `NOTREADY(busy)`, i.e. **the GPU never rings** (verify.cpp:3323, :3664).
+    That is the same class as the confidently-wrong drafts in 8p: the host waits, the window emits zeros, and because
+    prefill still streams experts the run looks healthy at 284-295 tok/s.
+
+So the next attempt should start at **why an explicit `--expert-cache` skips `stage_slots()`**, i.e. what routes the
+prompt path around the ring plan when `o.expert_cache` was given explicitly - not at the cache itself.  The uniform-slot
+change was REVERTED (it fixed nothing and gave up VRAM packing), so the refusal stands, which is still the correct
+behaviour for a wrong answer that looks fast.
+
+**Method note:** this is the third hypothesis about this block that died on measurement (capacity, borrow, hit
+decision, now sized slots).  Each was plausible and each was cheap to test because the OUTPUT check is immune to the
+GPU clock throttle - which is why this work could proceed on a throttled card at all.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
