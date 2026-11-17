@@ -744,6 +744,43 @@ reuse/shape, not the data type - and the ceiling for THIS shape has never been m
 achieved MACs and staged bytes), so the '5-8x headroom' claimed earlier was an inference from a different kernel
 and is withdrawn.
 
+### 6f. Decode's per-layer fixed cost is a producer wait, NOT node overhead (measured)
+
+Decode re-baselined on the current binary (`STRATA_VERIFY_PROFILE=1`, 64 generated tokens, 29 rounds):
+
+```
+round phases   window 71.178 ms   draft_next 5.467   (76.690 ms/round)
+decode         64 tokens in 2334.5 ms -> 27.41 tok/s
+window         hc1 norm 12.712 (T2) -> 14.398 (T4)
+```
+
+The 22.0 ms / 86.65 ms figures quoted earlier in this session are STALE - three fixes (ring depth, chunk-aware
+ring, VRAM-cliff guard) changed residency and the window since.  Fit the slot across window widths:
+
+```
+slope      = (14.398 - 12.712) / (4 - 2) = 0.843 ms per extra token
+intercept  = 12.712 - 2 x 0.843          = 11.03 ms per window (48 layers) = 0.230 ms/layer FIXED
+```
+
+93 % of the slot does not depend on the token count.  A 2,560-element sum-of-squares in 0.23 ms is impossible as
+work for ~10 KB.
+
+**What it is NOT**, measured with the engine's own `STRATA_DUMMY_NODES=k` (k empty kernel nodes per layer):
+
+```
+nodes 0   window 70.868 ms
+nodes 4   window 71.519 ms   -> 192 nodes  = 3.4 us/node
+nodes 8   window 71.950 ms   -> 384 nodes  = 2.8 us/node
+```
+
+**One dependent kernel node costs ~3 us.**  The 0.230 ms/layer fixed cost is ~25x that, so it is not dispatch or
+launch overhead - and fusing the norm into a neighbouring kernel would buy ~9 us/layer, about 4 % of the slot.
+It is a genuine WAIT on whoever produces the norm's input (the CPU pool's rows / the doorbell), so the fix is to
+make that producer deliver earlier, not to merge kernels.
+
+`qkv gemv` (+12 %) and `hc1 up` (+12 %) show the same sublinear shape, so the same diagnosis applies to at least
+three decode slots: the window pays ~11 ms per layer of serialisation around ~2 ms of work.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
