@@ -1333,6 +1333,33 @@
 > highest-value single change is now the same treatment for the *GPU rows'* U and the D stage: both are the same
 > `latent_u_grouped` / grouped-gather shape that just moved the CPU rows from 81 to 126 GB/s.
 
+> ### 0.40 `STRATA_LATENT_U_WARPS` is a non-lever, and long A/B batches degrade - two of four arms were invalid
+>
+> latent.cu's note calls the block width "the knob that matters" for decode's U and promises every width is
+> bit-identical.  Measured, alternating, `STRATA_VERIFY_U_PROF` open:
+>
+> | arm | `u: gemv` | `u: matvec` | window | output |
+> |---|---|---|---|---|
+> | 8 (default) | 17.355 ms | 10.947 ms | 137.79 ms | correct |
+> | 16 | 17.755 ms | 10.664 ms | 137.10 ms | correct |
+> | 32 | 20.142 ms | 10.867 ms | - | **WRONG** (diverges at token 11) |
+> | 8 (repeat) | 17.659 ms | 11.164 ms | 136.60 ms | **WRONG** (diverges at token 11) |
+>
+> Width is **not** a lever: 16 is 0.7 ms inside the noise and 32 is 2.8 ms worse on `u: gemv`, which is the
+> note's own prediction - a few big blocks lose the latency hiding that the cold U rows need.  Default stays 8.
+>
+> **The fourth arm is the important one.**  It is the default configuration, byte-for-byte identical to the first
+> arm, and it produced *different tokens* and took 4160 ms for 32 tokens against 1736 ms.  That is a degraded
+> run, not measurement noise, and it reinterprets the "decode 18.8-21.1 tok/s" spread seen all session: some of
+> that is not the machine being noisy, it is runs going wrong late in a long batch (VRAM pressure, thermal, or a
+> driver state).  Two consequences:
+>
+> * the 32-token output gate is not optional on every arm - it is what caught this, twice;
+> * a decode A/B finishing late in a batch is untrustworthy unless its output is checked.  Prefer the stage-level
+>   slot with alternating pairs, which stayed consistent within a pair even across this (137.79 / 137.10 ms
+>   against 136.60 ms in the degraded arm), over end-to-end tok/s.
+'
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
