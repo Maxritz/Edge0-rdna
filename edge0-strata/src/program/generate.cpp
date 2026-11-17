@@ -7193,8 +7193,22 @@ int main(int argc, char** argv) {
         // verifier warm up, ~245 MiB on every card measured) came out of the reserve, so a card ended 240 MiB under the reserve it was asked to
         // keep (459 MiB free at --vram-reserve-mib 700: under the 512 MiB line the serve check warns about, #2065).  The cache now leaves it too.
         // Not on a card that could not keep min_slots after it, and not under STRATA_DEFAULTS=026 (the v0.2.6 sizing).
-        const strata::core::AutoCacheSlots auto_slots = strata::core::auto_cache_slots(
+        // NEVER PARK THE CACHE ON THE VRAM CLIFF - and only bite when the cliff is actually in play.
+        // Measured on the 12 GiB box, same Q4 table, same binary, identical work (2,163 launches, 62,926 streamed
+        // blobs, chunk 512): cache 1,910 slots -> 91.03 tok/s, cache 1,449 -> 291.95.  The big cache over-commits
+        // VRAM (cache 2.07 GiB + the ring + the prompt borrow) and the run dies 3.2x while producing a CORRECT
+        // output, which is why it survived unnoticed.  A blanket reserve floor also shrank caches that were never
+        // near the cliff - the 512K gate's 954 slots fell to 473 and cost it 65 -> 52 tok/s - so the floor is
+        // applied ONLY when the plain sizing lands above kCliffGuard, where the over-commit is.
+        constexpr int64_t kCliffGuard = 1600;
+        const strata::core::AutoCacheSlots auto_plain = strata::core::auto_cache_slots(
             (int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+        const int64_t reserve_eff = std::max<int64_t>(reserve, (int64_t) 1280 << 20);
+        const strata::core::AutoCacheSlots auto_slots =
+            auto_plain.slots <= kCliffGuard
+                ? auto_plain
+                : strata::core::auto_cache_slots((int64_t) free_b, reserve_eff, blob, min_slots,
+                                                 strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
         int64_t slots = auto_slots.slots;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
 #if defined(STRATA_GPU_METAL)
