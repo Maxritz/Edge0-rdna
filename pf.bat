@@ -1,5 +1,5 @@
 @echo off
-rem Is the PROFILE the discriminator?  Same explicit cache, with and without --expert-profile.
+rem FALSIFIER: with NO pcie expert lane (--pcie-frac 0) the tail must vanish.  If uWait stays high it is a label.
 setlocal
 cd /d C:\Users\rr\Desktop\Edge0-rdna\edge0-strata\build
 set STRATA_LATENT_A=E:/Edge0-120B-q3k/experts.bin
@@ -12,12 +12,12 @@ set STRATA_LATENT_FUSED_DU=1
 set STRATA_LATENT_U_GPU=1
 set STRATA_LAT_FUSED_Q3K=1
 set STRATA_MTP_SIDE_STREAM=1
-set COMMON=--pack E:\Edge0-120B-q3k --native E:\Edge0-120B-q3k\model-skeleton.gguf --native-dense-gguf E:\Edge0-120B-q3k\model-skeleton.gguf --ple-gguf E:\Edge0-120B-q3k\ple-fp8.gguf --ple-io direct --expert-cache 800 --prefill 512 --spec 4 --spec-min-p 0.5 --mtp E:\Edge0-120B-q3k\mtp --tokens-file C:\Users\rr\Desktop\Edge0-rdna\prompt4k.txt --max-context 4096 --kv int8 --pcie-frac 0.1 --gpu 0 --max-new 32 --stats --vram-reserve-mib 512
-echo ===== 800 WITH profile =====
-strata.exe %COMMON% --expert-profile E:\Edge0-120B-q3k\profile.bin > C:\Users\rr\Desktop\Edge0-rdna\pf_with.log 2>&1
-echo a=%ERRORLEVEL%
-echo ===== 800 NO profile =====
-strata.exe %COMMON% > C:\Users\rr\Desktop\Edge0-rdna\pf_without.log 2>&1
-echo b=%ERRORLEVEL%
+set STRATA_VERIFY_PROFILE=1
+set BASE=--pack E:\Edge0-120B-q3k --native E:\Edge0-120B-q3k\model-skeleton.gguf --native-dense-gguf E:\Edge0-120B-q3k\model-skeleton.gguf --ple-gguf E:\Edge0-120B-q3k\ple-fp8.gguf --ple-io direct --expert-profile E:\Edge0-120B-q3k\profile.bin --expert-cache auto --prefill 512 --spec 4 --spec-min-p 0.5 --mtp E:\Edge0-120B-q3k\mtp --tokens-file C:\Users\rr\Desktop\Edge0-rdna\prompt64.txt --max-context 1024 --kv int8 --gpu 0 --max-new 64 --vram-reserve-mib 512
+strata.exe %BASE% --pcie-frac 0.4 > C:\Users\rr\Desktop\Edge0-rdna\pf4_a1.log 2>&1
+strata.exe %BASE% --pcie-frac 0 > C:\Users\rr\Desktop\Edge0-rdna\pf0_b1.log 2>&1
+strata.exe %BASE% --pcie-frac 0.4 > C:\Users\rr\Desktop\Edge0-rdna\pf4_a2.log 2>&1
+strata.exe %BASE% --pcie-frac 0 > C:\Users\rr\Desktop\Edge0-rdna\pf0_b2.log 2>&1
+strata.exe %BASE% --pcie-frac 0.1 > C:\Users\rr\Desktop\Edge0-rdna\pf1_c1.log 2>&1
 echo PF_DONE
 endlocal

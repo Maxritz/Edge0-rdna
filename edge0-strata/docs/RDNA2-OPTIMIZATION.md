@@ -1156,6 +1156,61 @@ Consequence for the work list: the 4,063-token prefill at chunk 832 is 11.5 s, o
 and everything else is either at ~50 % of its own peak or is a fixed per-chunk cost already harvested by the chunk
 choice.  The remaining 1.22x to 430 tok/s lives in the A stage, not in the dense projections.
 
+
+### 8m. Decode, attacked - the tail theory is DEAD, the real cost is pool+rings being serial, and there is a 3x intermittent defect
+
+Decode is 30.82-31.38 tok/s against a 62.9 link ceiling.  Three things measured this turn, in order of how much they
+matter.
+
+**(1) The per-layer expert-blob latency tail is REFUTED by its own falsifier.**  The tail theory said `pcie/uWait`
+(8-17 ms a window) is the PCIe expert copy chain.  `--pcie-frac 0` removes that lane entirely, so uWait must collapse:
+
+    arm                 pcie experts/layer   cpu experts/layer   pcie/uWait ms   waitB ms   window ms   decode
+    pcie-frac 0.40           4.83                  8.82            2.56 - 3.43    5.83       73.7      28.4
+    pcie-frac 0.10           0.84                 12.23            8.39           0.91       70.7      27.6
+    pcie-frac 0              0                    13.25            9.36 - 9.45    0.18       71.4      29.2
+
+With ZERO PCIe experts uWait nearly TRIPLES.  It is therefore not the copy chain - it is the generic wait for whichever
+lane supplies the expert, and it grows when the CPU pool is asked to do more.  **The slot that does track the lane is
+`waitB`** (5.83 -> 0.91 -> 0.18, monotone with the share).  One-layer-ahead PCIe prefetch, which the tail theory
+prescribed, would have optimised the wrong slot - it was not built.
+
+**(2) The real decode cost is that the CPU pool and the ring wait are SEQUENTIAL, not overlapped.**
+
+    arm            window   wait for rings   pool      sum
+    0.40           73.73        45.15        22.58    67.7
+    0.10           70.74        41.12        24.02    65.1
+    0             71.67        41.26        24.76    66.0
+
+rings + pool ~= 66 of a 72 ms window, so the round is the SUM of the two, not the max.  The 22-25 ms of CPU pool
+(13.3 ms gate/up + 8.2 ms down, at 24.7-34.5 GB/s i.e. the DDR4 ceiling) is fully exposed every window.  Overlapping it
+with the GPU's 41-45 ms of ring consumption would take the window toward max(41, 25) ~= 45 ms: 29.2 -> ~46 tok/s,
+which is most of the way to the 62.9 ceiling.  That is the decode target, and it is an architecture change, not a flag.
+
+**(3) There is a 3x intermittent defect, and it is the most damaging thing in decode.**  In about one run in six the
+speculative acceptance collapses to 0.06-0.14 and decode falls from ~31 to ~11 tok/s.  Observed this session: 10.88,
+12.49, 10.81, 11.60, 11.44 - five occurrences.  Mechanism, from the per-round tallies:
+
+    run                 window choices                          drafts accepted        tok/s
+    good (ns1)   T1:6  T2:2 T3:2 T5:1 T6:11            0:8  1:3 2:3 3:2 4:1 5:5      30.91
+    bad  (ns5)   T1:39 T2:4 T3:2 T6:13                 0:54 1:2 2:2                 11.44
+    bad  (s6f0a) T1:38 T2:10 T3:1 T6:11                0:57 2:1                      10.81
+
+The collapsed runs DO run T=6 windows (11-13 of them) and accept ~6 drafts out of ~65 across those rounds, so the drafts
+themselves are near-useless for the WHOLE run - the controller is right to fall back to T=1, and T=1 then feeds the
+estimator its own zero.  It is a run-level draft-head defect (state/init), not window tuning.  It is NOT the MTP side
+stream (5 good + 1 bad with `STRATA_MTP_SIDE_STREAM=0`) and NOT the expert lane (occurred at pcie-frac 0.40 AND 0).
+This costs more than every other decode item combined: the expected decode is ~0.83*31 + 0.17*11 = 27.6, not 31.
+
+**(4) `--pcie-frac 0` is faster but changes the ARITHMETIC, so it is documented, not defaulted.**  At 1k context, four
+alternating pairs each: 0.40 -> 28.28 / 28.37 / 28.41 / 28.47, `0` -> 29.14 / 29.17 / 29.19 / 29.23 (**+2.8 %**, and
+the ranges do not overlap).  At 512K on the never-break gate: default 12.14 tok/s, `--pcie-frac 0` **15.28 tok/s
+(+25.9 %)** - because with a small long-context cache the PCIe share is large.  BUT the gate's tokens change from
+`715 1822 363 313` to `248046 198 248045 74455`, because pcie_frac decides whether an expert is computed on the GPU
+(cache resident) or on the CPU, and those round differently - the engine says so itself.  So it is a numerics knob
+wearing a performance label, it needs a KL-gate decision and a re-baselined token contract, and it was left as an
+explicit flag: `--pcie-frac 0` for the +2.8 % / +25.9 %, default unchanged at 0.40.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
