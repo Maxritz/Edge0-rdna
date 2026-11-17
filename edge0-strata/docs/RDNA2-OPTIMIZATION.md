@@ -1263,6 +1263,54 @@ and it costs 3x.  Nothing in this session has isolated it.
 4/10 done and worth 22 % not 57 %.  What is left for decode is either the per-layer chain (48 layers x ~1.5 ms) or the
 draft head's run-level corruption, and both are deep.
 
+
+### 8o. Context capability (the actual requirement) and WHY long-context prefill falls behind
+
+**Context is verified, not estimated.**  Every row is `run_512k_mtp.ps1 -Embed 1` with turbo3 KV, MTP on,
+`--kv-resident 65536`, reserve 300:
+
+    context    result                                    KV pinned   VRAM free after session   expert cache
+    256K       exit 0, tokens 715 1822 363 313              -              -                  1,259 / 1.37 GiB
+    384K       exit 0, tokens 715 1822 363 313              -              -                  1,056 / 1.15 GiB
+    512K       exit 0, tokens 715 1822 363 313           2.34 GiB        4,864 MiB             852 / 0.92 GiB
+    512K rot4  exit 0, tokens 248046 198 248045 74455     -              -                  1,049 / 1.14 GiB
+    768K       exit 0, tokens 715 1822 363 313           3.52 GiB        2,688 MiB             670 / 0.73 GiB
+    896K       CRASH, exit -529697949 = 0xE06D7363      4.10 GiB        2,456 MiB               -
+    1M         exit 1, "0 MiB free", MapViewOfFile 1450     -                0                    -
+
+So **768K (786,432) is the verified maximum with VRAM still free (2,688 MiB)**, 512K runs with 4,864 MiB free, and the
+requirement "at least 512K with turboquant and roto" is met on both KV modes.  Two defects fall out of the sweep:
+**896K dies with an unhandled C++ exception (0xE06D7363) instead of a clean refusal**, and 1M exhausts RAM
+(`MapViewOfFile` win32 error 1450 = ERROR_NO_SYSTEM_RESOURCES) after reporting 0 MiB free.  Both bounds are
+pinned-KV/RAM, not VRAM - VRAM is still 2.4-2.7 GiB free when it fails.
+
+**Why our long-context prefill gets SLOWER while the reference gets FASTER.**  The reference (16 GiB VRAM + 20 GiB RAM,
+Q3_K) reports 430 tok/s at 4K and **778 at 16K**.  Ours, measured this session on a 16,255-token prompt:
+
+    prompt   tok/s    streamed blobs   cache slots
+    4,063    351.52      43,774           1,472
+    16,255   280.47     243,225             810
+    16,255   245.00     347,582           1,017   (chunk 512 instead of 832)
+    32,511   273.93     534,109             608
+
+The traffic is the whole story: **4x the tokens costs 5.6x the blobs** (43,774 -> 243,225) and the cache shrinks
+1,472 -> 810 at the same time.  At chunk 832 a 16K prompt needs 20 chunks, and each chunk re-streams ~253 of the layer's
+512 experts (243,225 / (20 x 48) = 253), so the total is set by tokens x chunks rather than by the expert set.  The
+reference's 16 GiB card can use a much larger chunk, so it streams each expert closer to once and its per-token cost
+FALLS with length.
+
+The one-pass alternative is priced and impossible here: the prompt buffers cost `160 + chunk*680/1024` MiB, so
+chunk = 16,384 would need ~11 GB of a 12 GiB card.  **The long-context prefill gap is a VRAM-size boundary, not a
+kernel defect** - 1.22x short at 4K (351.5 vs 430) but 2.77x short at 16K (280 vs 778), and the widening is exactly the
+cache/traffic effect above.
+
+**Where the two shortfalls really live, in one line each:**
+  * 4K prefill 1.22x: the int8 A stage at 3.4 % of the dp4a peak and ~48 % PCIe duty (8h), everything dense at 48-50 %
+    of its fp16 peak (8l) - i.e. about one block, on a card where the expert stream and the expert cache share 12 GiB.
+  * decode 2.0x: the per-window layer chain is ~73 ms and nearly INDEPENDENT of T (8n), so 62.4 tok/s needs 4.6 tokens
+    a round against the 2.3-3.0 achieved.  The reference's 62.4 is, to within 1 %, this box's own PCIe link ceiling
+    (62.9) at zero residency - so the reference saturates its link in decode and we run it at ~48 % duty.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a

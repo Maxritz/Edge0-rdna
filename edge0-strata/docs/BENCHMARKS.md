@@ -18,9 +18,35 @@ or in the commit message that introduced it.  Nothing in this file is an estimat
 ```
 prefill @ --max-context 4096    351.02 / 351.47 tok/s     (borrows the prompt loan, chunk 832 - new default)
 prefill @ --max-context 8192    344.02 tok/s              (owns its buffers, chunk 832)
+prefill @ 16K prompt            280.47 tok/s              (chunk 832; 245.00 at chunk 512; 273.93 at 32K)
 decode   @ 4096                  30.82 / 30.88 tok/s       (spec 6 / min-p 0.3; 27.3-29.5 at spec 4 / 0.5)
-512K + MTP                       exit 0, tokens 715 1822 363 313, prefill 64.50, decode 12.31
+512K + MTP                       exit 0, tokens 715 1822 363 313, prefill 64.22, decode 12.04
 ```
+
+### Context capability (verified, `-Embed 1`, turbo3 unless noted)
+
+| context | result | KV pinned | VRAM free after session | expert cache |
+|---|---|---|---|---|
+| 256K | exit 0, tokens `715 1822 363 313` | — | — | 1,259 / 1.37 GiB |
+| 384K | exit 0, tokens `715 1822 363 313` | — | — | 1,056 / 1.15 GiB |
+| **512K** turbo3 **and** rot4 | exit 0 | 2.34 GiB | **4,864 MiB** | 852 / 0.92 GiB (1,049 on rot4) |
+| **768K** | exit 0, tokens `715 1822 363 313` | 3.52 GiB | **2,688 MiB** | 670 / 0.73 GiB |
+| 896K | **CRASH** `0xE06D7363` unhandled C++ exception | 4.10 GiB | 2,456 MiB | — |
+| 1M | exit 1, `0 MiB free`, MapViewOfFile 1450 | — | 0 | — |
+
+Verified maximum is **768K**. Both failure bounds are **pinned RAM / Windows commit**, not VRAM — the 26.66 GiB arena
+had already degraded to "47 slices pinned" at 896K. 896K should refuse cleanly rather than throw (defect).
+
+### Long-context prefill scaling (the reference's 778 @16K)
+
+| prompt | tok/s | blobs | cache |
+|---|---|---|---|
+| 4,063 | 351.52 | 43,774 | 1,472 |
+| 16,255 | 280.47 | 243,225 | 810 |
+| 32,511 | 273.93 | 534,109 | 608 |
+
+**4x the tokens costs 5.6x the blobs** and the cache shrinks 1,472 → 810. A one-pass chunk needs ~11 GB of prompt
+buffers on a 12 GiB card, so this is a VRAM boundary, not a kernel defect: 1.22x short at 4K but 2.77x at 16K.
 
 ### Decode caveats (measured, not yet shipped as defaults)
 
