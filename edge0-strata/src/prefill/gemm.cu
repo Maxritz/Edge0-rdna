@@ -29,7 +29,9 @@
 
 #include <algorithm>
 #include <climits>
+#include <chrono>
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -1459,8 +1461,23 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         side_cur_ ^= 1;
         return;
     }
-    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
-    f16(X, scratch_, Y, T, N, K, ldy, beta);
+    // STRATA_GEMM_SPLIT=1 (diagnostic, the first 40 calls): the dequant into scratch against the GEMM that
+    // follows it, each synced, so the gdn window's 3,078 ms can be ATTRIBUTED instead of inferred from FLOPs -
+    // 0.53 and 0.55 both inferred it and both were wrong (0.56: three GEMM implementations, identical time).
+    static const bool gsplit = std::getenv("STRATA_GEMM_SPLIT") != nullptr;
+    static int gsplit_n = 0;
+    auto gs_time = [&](const char* what, const std::function<void()>& fn) {
+        if (!gsplit || gsplit_n >= 40) { fn(); return; }
+        (void) cudaDeviceSynchronize();
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        (void) cudaDeviceSynchronize();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "gemm split: #%d %-7s T=%lld N=%lld K=%lld %.2f ms\n", ++gsplit_n, what, (long long) T,
+                     (long long) N, (long long) K, ms);
+    };
+    gs_time("dequant", [&] { strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_); });
+    gs_time("gemm", [&] { f16(X, scratch_, Y, T, N, K, ldy, beta); });
 }
 
 }  // namespace strata::prefill

@@ -1935,6 +1935,38 @@
 > verified: output byte-identical, decode 20.65, and `run_512k_mtp.ps1 -Embed 1` exits 0 with
 > `output : 715 1822 1822 1822`.
 
+> ### 0.57 `gdn` attributed from the inside: it IS the GEMM (11.0 ms a layer at 4.09 TFLOP/s), the dequant is nothing
+>
+> `STRATA_GEMM_SPLIT=1` times the dequant-into-scratch and the GEMM after it separately, each synced (the same
+> instrument that settled the host window in 0.44).  Layer 0, two consecutive chunks:
+>
+> | call | shape | dequant | GEMM |
+> |---|---|---|---|
+> | qkv, chunk 1 | T=512 N=10240 K=2560 | **10.67 ms** | 6.75 ms |
+> | qkv, chunk 2 | T=512 N=10240 K=2560 | **0.36 ms** | **6.57 ms** |
+> | gate | T=512 N=6144 K=2560 | 0.22 | 3.21 |
+> | ssm_out | T=512 N=2560 K=6144 | 0.21 | 1.20 |
+> | pair of 640-wide shared projections | | 0.12 each | 0.38 each |
+>
+> **The dequant is a first-touch artefact, not a per-chunk cost.**  10.67 ms on the first call and 0.36 ms on the
+> next one with the identical shape - that is the weight's pages being read for the first time, and afterwards it
+> is 0.2-0.4 ms.  Steady state a layer is therefore **dequant 0.79 ms against GEMM 11.0 ms**, so:
+>
+> * 0.56's plan ("the w16_ cache is gated on > 2 GiB free so the weight may be re-dequantized every chunk") is
+>   **wrong** - it is not, and fixing that gate would buy ~0.8 ms of 3,078.
+> * `gdn` really is the GEMM: qkv alone is 26.85 GFLOP / 6.57 ms = **4.09 TFLOP/s**, and the layer total is
+>   6.57 + 3.21 + 1.20 + 0.76 = 11.0 ms, which is the ledger's 10.7 ms.
+>
+> **So the open question is now precise and narrow**: why do two independent implementations - rocBLAS and this
+> tree's new packed-fp16 kernel, at both 64 x 64 and 128 x 128 - all land on the same 4.09 TFLOP/s, 16 % of this
+> card's 24.6 TFLOP/s fp16 peak?  `STRATA_GEMM_DOT2=1` was confirmed ON in every arm that measured it (the
+> launcher's startup line was in all three logs), and the three GEMM arms differ by 3 ms of 3,074.  A shared
+> ceiling that is not the peak, and that neither the code nor the tiling moves, is the thing to find next - the
+> candidates are the f16 weight read (52.4 MB a call, which at 6.57 ms is 8.0 GB/s and cannot be it) or the
+> fp16-output + widen epilogue (63 MB a call, ~0.4 ms, also not it), so the next instrument is per-kernel.
+>
+> Diagnostic (`STRATA_GEMM_SPLIT=1`, first 40 calls, off by default) ships.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
