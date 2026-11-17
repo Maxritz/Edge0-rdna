@@ -1,0 +1,20 @@
+@echo off
+rem With the loan OFF, what chunk does AUTO pick at 8192, and how fast is it?  (CLI only.)
+setlocal
+cd /d C:\Users\rr\Desktop\Edge0-rdna\edge0-strata\build
+set STRATA_LATENT_A=E:/Edge0-120B-q3k/experts.bin
+set STRATA_LATENT_LABELS=E:/Edge0-120B-q3k/labels.bin
+set STRATA_LATENT_DENSE=E:/Edge0-120B-q3k/latent_dense_q4.bin
+set STRATA_LATENT_DENSE_FMT=
+set STRATA_EMBED_VRAM=1
+set STRATA_LATENT_FUSED=1
+set STRATA_LATENT_FUSED_DU=1
+set STRATA_LATENT_U_GPU=1
+set STRATA_LAT_FUSED_Q3K=1
+set STRATA_MTP_SIDE_STREAM=1
+set BASE=--pack E:\Edge0-120B-q3k --native E:\Edge0-120B-q3k\model-skeleton.gguf --native-dense-gguf E:\Edge0-120B-q3k\model-skeleton.gguf --ple-gguf E:\Edge0-120B-q3k\ple-fp8.gguf --ple-io direct --expert-profile E:\Edge0-120B-q3k\profile.bin --expert-cache auto --spec 4 --spec-min-p 0.5 --mtp E:\Edge0-120B-q3k\mtp --tokens-file C:\Users\rr\Desktop\Edge0-rdna\prompt4k.txt --kv int8 --pcie-frac 0.1 --gpu 0 --max-new 32 --stats --vram-reserve-mib 512 --max-context 8192
+strata.exe %BASE% --prefill auto --no-prefill-borrow > C:\Users\rr\Desktop\Edge0-rdna\ab8k_1.log 2>&1
+strata.exe %BASE% --prefill auto --no-prefill-borrow > C:\Users\rr\Desktop\Edge0-rdna\ab8k_2.log 2>&1
+strata.exe %BASE% --prefill auto --no-prefill-borrow --max-context 4096 > C:\Users\rr\Desktop\Edge0-rdna\ab4k_1.log 2>&1
+echo AB_DONE
+endlocal

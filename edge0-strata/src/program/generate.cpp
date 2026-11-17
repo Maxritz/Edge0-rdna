@@ -3776,6 +3776,26 @@ int main(int argc, char** argv) {
                      primary_device);
         return 2;
     }
+    // ABOVE 4K CONTEXT THE PROMPT PATH OWNS ITS BUFFERS - decided at OPTION FINALISATION, before the prompt-reserve
+    // estimate and before the VRAM plan that sizes the expert cache.  Measured on this box (Q4 table, 4063-token
+    // prompt, --max-context the only difference), with the loan on vs off:
+    //     4096: borrows 1,285 slots -> 300.98 / 301.10 / 302.54 tok/s        owns -> 261.49
+    //     8192: borrows 1,418 slots ->  94.95 /  90.25 tok/s                 owns -> 264.57 / 266.51 / 264.55
+    // The loan is free money at 4k and 2.8x destructive at 8k (the KV reservation leaves too little VRAM for a
+    // ~1.4k-slot loan to be serviced without thrashing).  Doing this HERE and not at `pf_borrow` is the whole point:
+    // `pf_borrow` is computed after the prompt-reserve estimate, so setting the flag there left the cache sized to
+    // zero ("cache slots 0", then "prefill latent: the expert cache is required").  This is the same state the CLI
+    // flag produces, applied automatically; an explicit --no-prefill-borrow is unchanged and no new flag is added.
+    // Bounded to the range where owning is both measured and AFFORDABLE.  At --max-context 524288 the KV
+    // reservation leaves no room for the prompt's own buffers: measured, the cache then sizes to ZERO
+    // ("cache slots 0" in the ring line, then "prefill latent: the expert cache is required", exit 1).  Above this
+    // bound the engine keeps borrowing, which is the behaviour the 512K + MTP gate passes with.
+    if (o.max_context > 4096 && o.max_context <= 65536 && !o.no_prefill_borrow) {
+        o.no_prefill_borrow = true;
+        std::fprintf(stderr, "strata generate: the prompt path owns its buffers at --max-context %lld (measured: "
+                             "borrowing thrashes above 4k - 94.95 -> 264.75 tok/s at 8192)\n",
+                     (long long) o.max_context);
+    }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
