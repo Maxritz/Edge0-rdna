@@ -781,6 +781,39 @@ make that producer deliver earlier, not to merge kernels.
 `qkv gemv` (+12 %) and `hc1 up` (+12 %) show the same sublinear shape, so the same diagnosis applies to at least
 three decode slots: the window pays ~11 ms per layer of serialisation around ~2 ms of work.
 
+### 6g. The `hc1 norm` slot is an ACCOUNTING ARTEFACT - the target is withdrawn
+
+Four shipped variants, environment only, decode 64 tokens, `STRATA_VERIFY_PROFILE=1`.  `hc1 norm` appears twice per
+window-width row (the GDN and QSA brackets); both are listed:
+
+| arm | `hc1 norm` (GDN + QSA) | decode |
+|---|---|---|
+| default | 11.5+5.2 -> 14.8+5.9 ms | 27.09 tok/s |
+| `STRATA_QFUSE=0` | 12.6+5.5 -> 14.9+6.0 | 27.09 |
+| `STRATA_QFUSE_HC_LOCAL=0` | 12.6+5.5 -> 14.9+6.0 | 27.14 |
+| **`STRATA_GR_UP_WIDE=1`** | **0.200+0.067 -> 0.192+0.069 (67x less)** | **25.62 (SLOWER)** |
+
+The slot collapses 67x while total decode gets *slower*.  So the ~18 ms is not that kernel's work: the label captures
+whatever sits at that point in the layer sequence, and changing the kernel moves the LABEL, not the time.  This is the
+third stacked-slot problem in this profiler (slot 32 was once charged the latent D stage; slot 30 and slot 32 both
+begin at stamp 16, so `hc1 norm` can contain the D stage outright).
+
+Consequences, all of which should have been applied before spending a turn instrumenting it:
+  * "hc1 norm is 18-21 ms of a 71 ms window" describes a LABEL, not a kernel - optimising it was never going to
+    recover that time, exactly as fusing it was measured to be worth only ~4 % (0.230 ms vs a 3 us node);
+  * the null arm is clean, so the window time itself is real: with the profiler ON the window measures 72.914 /
+    72.325 ms and with it OFF 74.167 / 70.241 - the instrument is innocent;
+  * what remains unexplained is a per-layer fixed cost (~0.23-0.36 ms) that is not node dispatch (3 us), not the CPU
+    pool (moving CPU experts 4.5x leaves the slot flat), not LDS (halving it was neutral), and not the named kernel
+    (this probe).  The best-supported remaining candidate is host-visible synchronisation per layer - `wait_flag_ge`
+    is `<<<1,1>>>` spinning on a host-mapped word (`verify.cpp:2504`, `:2640`), i.e. uncached PCIe polls, and a
+    cross-stream wait was measured at ~45 us.
+
+**Next measurement for it (no engine edit):** `STRATA_HC_SPLIT=1` brackets the read's own phases, and
+`wait_flag_ge_stamped` already records t_in/t_out on the `set_pcie_balance` path - read per-wait durations there
+before touching the protocol.  The candidate fix is `hipStreamWaitValue32` (HIP-FIRST-AUDIT.md section 2), which
+needs an edit and therefore a real dev loop.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
