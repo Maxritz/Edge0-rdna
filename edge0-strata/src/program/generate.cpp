@@ -7377,6 +7377,24 @@ int main(int argc, char** argv) {
                          profile.size(), o.expert_profile.c_str(), profile.size());
         o.expert_cache = (int) sized_slots.size();
     }
+    // A --expert-cache too small to lend the prompt path its buffers is a HARD ERROR, not a silent wrong answer.
+    // Measured: explicit caches of 512 and 3000 slots produced all-zero output while `auto` was correct, because
+    // the prompt path fell back to its own buffers ("no cache slots to borrow") and the latent prefill path then
+    // required a cache it could not use - and the run returned zeros instead of failing.  The minimum is the
+    // engine's own borrow expression (min_slots: bytes_needed(256) + the 128 slots a loan leaves), so the message
+    // can name it exactly.  `auto` never trips this: it is sized so the borrow succeeds by construction.
+    const int64_t need_chunk = o.prefill_chunk > 0 ? (int64_t) o.prefill_chunk : 256;   // the chunk actually used
+    const int64_t need_slots = ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, need_chunk) +
+                                (int64_t) nibble_max_slot_bytes() - 1) / (int64_t) nibble_max_slot_bytes() + 128;
+    if (!auto_cache && o.expert_cache > 0 && !o.no_prefill_borrow && !o.expert_profile.empty() &&
+        (int64_t) o.expert_cache < need_slots) {
+        std::fprintf(stderr, "strata generate: --expert-cache %d is too small: the prompt path needs the cache to lend "
+                             "it chunk(%lld) + ring + 128 = %lld slots.\n"
+                             "  Raise --expert-cache to at least %lld, or pass --no-prefill-borrow to let the prompt "
+                             "path own its buffers (a fixed %lld KiB of VRAM instead of the loan).\n",
+                     o.expert_cache, (long long) need_chunk, (long long) need_slots, (long long) need_slots);
+        return 1;
+    }
     // #533: --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU,
     // no helper caches, serve mode: anything else keeps the one cudaMalloc, said once.
     if (o.vram_elastic) {
