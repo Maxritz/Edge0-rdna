@@ -23,6 +23,16 @@ bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t 
                         float beta, void* stream = nullptr);
 /// The same with row strides ldx >= K and ldw >= K (multiples of 8): a 4 KB-multiple row stride (K 2048 / 4096 /
 /// 6144) camps on the memory channels, K + 64 does not (S23 gemm_probe7/8: K 6144 19 -> 35 TFLOPS).
+/// RDNA2 (gfx103x) has no matrix cores, so the WMMA kernels above refuse there and the dense GEMM fell to
+/// rocBLAS - measured 4.0 TFLOP/s on the gdn projections (edge-0-analysis-rdna2.md 0.54), 16 % of this card's
+/// 24.6 TFLOP/s fp16 peak.  This is the same product on V_DOT2_F32_F16, the packed-fp16 form RDNA2 does have:
+/// two fp16 multiplies per instruction with an f32 accumulate.  Y = beta * Y + X . W^T, FP16 in, FP32 out,
+/// beta 0 or 1, K a multiple of 32, T >= 32, N a multiple of 8.  NOT bit-identical to rocBLAS - a different
+/// blocking and accumulation tree, which is the change the owner approved; the harness is
+/// tests/hip/gemm_f16_io_parity (rel-L2 against an FP64 reference, the bound the shipped FP16 path already meets).
+/// False (nothing launched) otherwise, and off gfx103x.
+bool strata_pf_gemm_f16_dot2(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
+                             int64_t ldy, float beta, void* stream = nullptr);
 /// S23 (STRATA_PF_HCDOWN=1): lo[t, n] = sum_k X[t, k] Wd[n, k] (n < nd) and inj[t, n] = sum_k X[t, k] Wi[n, k]
 /// (n < ni) in one BF16 WMMA GEMM over X (T x K, token stride ldx >= K, a multiple of 8; Wd / Wi row-major, stride
 /// K); lo T x nd and inj T x ni, FP32.  K a multiple of 64, T >= 64.  False (nothing launched) otherwise / off gfx11.

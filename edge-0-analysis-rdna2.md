@@ -1861,6 +1861,46 @@
 >
 > Everything that could be had without such a decision has been taken or measured away this stretch.
 
+> ### 0.55 The packed-fp16 GEMM is built and correct - and exactly as fast as rocBLAS, so it ships opt-in
+>
+> The owner approved a bounded numerical change, so this was implemented rather than argued: `src/prefill/dot2_gemm.cu`,
+> a 64 x 64 block tile with a 32-k slab, 256 threads (16 x 16), 4 x 4 f32 accumulators a thread, and
+> `v_dot2_f32_f16` (two fp16 multiplies per instruction, f32 accumulate) taken from native_bf16.cu's proven asm
+> form.  Per k-pair a thread issues 8 LDS + 16 dot2.
+>
+> It works: `hip_gemm_f16_io_parity` passes all six cases, and the numbers are **identical to the rocBLAS run to
+> six digits** (rel_l2 0.000206 / 0.000207 / ... / 3.9e-07).  That is not a coincidence and it is worth
+> recording: rel-L2 at that size is dominated by the **fp16 output format**, not by the accumulation order, so
+> that harness cannot distinguish two correct fp32-accumulating kernels.  It bounds the format, not the tiling.
+>
+> **It is not faster.**  Alternating pairs in one binary (`STRATA_GEMM_DOT2=1/0`), the gdn ledger row:
+>
+> | arm | `gdn` |
+> |---|---|
+> | dot2 ON | 3,078 / 3,074 ms |
+> | rocBLAS | 3,078 / 3,078 ms |
+>
+> Identical to the millisecond, i.e. this kernel and rocBLAS both land at ~4 TFLOP/s on these shapes.  Two
+> things follow, and the second is the useful one:
+>
+> * **the tiling, not the instruction, was never the limit.**  64 x 64 x 32 with 16 accumulators is a modest
+>   configuration; rocBLAS's generic RDNA2 path is also modest.  Matching it says the win has to come from a
+>   *better* tile (128 x 128, more accumulators a thread, deeper k unroll), not from swapping the multiply.
+> * **one ON arm diverged at token ~22 while the other matched byte-for-byte**, so correctness is not
+>   established either - and that divergence is indistinguishable from this box's known late-arm corruption
+>   (0.40, 0.45).  A kernel whose speedup is zero and whose correctness is unsettled does not ship on.
+>
+> **Shipped opt-in** (`STRATA_GEMM_DOT2=1`, default off, with a one-line startup notice naming the path).  The
+> default path is verified unchanged: output byte-identical to baseline, prefill 236.28 tok/s, decode 20.44,
+> and `run_512k_mtp.ps1 -Embed 1` exits 0 with `output : 715 1822 1822 1822`.
+>
+> Also fixed on the way, and worth knowing for any future gfx103x kernel here: the first two versions of the
+> launcher silently never launched.  `__gfx1031__` and the `kBK`/`kBM` constants were inside a device-arch
+> guard, but the launcher is **host** code, where those macros do not exist - so it compiled to `return false`
+> and the parity harness reported the rocBLAS numbers unchanged, which is exactly how it was caught.  And
+> `hipDeviceProp_t::gcnArchName` comes back **empty on Windows HIP**, so the arch test has to use
+> `major/minor` (10.3 = gfx103x).  The launcher now prints which path it took, once.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

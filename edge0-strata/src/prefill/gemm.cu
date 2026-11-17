@@ -1175,6 +1175,14 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     }
 #endif
 #if defined(__HIPCC__)
+    // RDNA2: the dense projections on V_DOT2_F32_F16 instead of rocBLAS.  gfx103x has no matrix cores, so the
+    // WMMA kernels above refuse there and this was falling through to rocBLAS - measured 4.0 TFLOP/s on the gdn
+    // bucket (0.54), 16 % of this card's fp16 peak.  NOT bit-identical to rocBLAS (different blocking and
+    // accumulation tree) - the change the owner approved; gated by tests/hip/gemm_f16_io_parity against an FP64
+    // reference.  Returns false off gfx103x, or for shapes it does not handle, so every other card is unaffected.
+    if (strata_pf_gemm_f16_dot2(X, W, Y, T, N, K, ldy, beta, stream_)) return;
+#endif
+#if defined(__HIPCC__)
     if (f16_io_ && beta == 0.0f) { f16_inplace(X, W, Y, T, N, K, ldy); return; }
 #endif
     const float alpha = 1.0f;
