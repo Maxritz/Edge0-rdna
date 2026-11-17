@@ -1222,6 +1222,47 @@ there is no arithmetic difference to gate either.  **So no default was changed**
 decode claim at long context must run >= ~10 tokens so there are several rounds, and any claim needs the acceptance
 ratio printed beside it, because acceptance moved 0.735 <-> 0.783 between these arms while throughput did not move at all.
 
+
+### 8n. Decode: the pool is already ~44 % overlapped, and the window cost is INDEPENDENT of the token count
+
+Section 8m left one instruction: overlap the CPU pool with the GPU's ring consumption for ~25 ms a window
+(29.2 -> ~46 tok/s).  Both halves of that arithmetic are wrong, and a single falsifier shows it.
+
+**Falsifier: starve the pool and see whether decode notices.**  `--pool-workers 1` makes the pool ~5x slower.  If the
+pool were exposed, the window would grow by the pool's growth; if it were fully hidden, the window would not move.
+
+    arm                    decode      accept   pool ms   rings ms   window ms
+    default                28.61       0.800     23.15     44.00      73.03
+    --pool-workers 1       26.83       0.800     33.21     39.84      78.62
+    --pool-workers 1 (2)   26.71       0.800     33.59     39.79      78.92
+
+**+10.0 ms of pool bought only +5.6 ms of window** - so 4.4 of every 10 ms of pool is ALREADY hidden behind the GPU, and
+only ~56 % (about 13 ms of the 23 ms) is exposed.  A perfect overlap is therefore worth ~13 ms a window, i.e.
+73 -> ~60 ms and 28.6 -> **~35 tok/s, not 46**.  (Note also `rings` FALLING 44.0 -> 39.8 as `pool` rises: that is the
+overlap moving, and it is the signature of a partially hidden pool.)
+
+**And the window cost barely depends on the token count at all.**  The collapsed run below runs mostly a ONE-token window
+and still pays 81.8 ms:
+
+    run        rounds   accept          tok/round   window ms   window sizes
+    good          28    0.800 (36/45)      2.29       73.03     T1:9 T2:2 T3:8 T4:9
+    collapsed     63    0.059 (1/17)       1.02       81.78     T1:52 T2:7 T3:2 T4:2
+
+A T=1 window must still run all 48 layers, each with ~8 distinct experts, so 81.8 ms of layer chain buys one token
+instead of 2.3.  That is why the collapse is a 3x loss rather than a 2x one, and it reframes the whole decode target:
+**62.4 tok/s needs either 4.6 tokens a round at today's ~73 ms, or ~33 ms rounds at today's 2.3** - the per-layer chain
+is the wall, not the pool, and not the PCIe lane.
+
+**What the collapse is, precisely.**  It is NOT drafts being generated and rejected.  The collapsed run makes only
+**17 drafts in 63 rounds** because the controller latches at T=1 (52 of 63 rounds), so almost nothing is speculated at
+all; the 1-of-17 that were drafted were also wrong, so the draft head really is bad for that run.  `DIAGHQ` is present
+with `nan=0` in every run and is not the signal.  It is run-level draft-head state, it occurs in roughly 1 run in 3-6,
+and it costs 3x.  Nothing in this session has isolated it.
+
+**So neither of 8m's two decode targets survives inspection:** the tail was a misread slot, the pool overlap is already
+4/10 done and worth 22 % not 57 %.  What is left for decode is either the per-layer chain (48 layers x ~1.5 ms) or the
+draft head's run-level corruption, and both are deep.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
