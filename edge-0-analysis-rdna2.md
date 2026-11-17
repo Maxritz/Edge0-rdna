@@ -1720,6 +1720,30 @@
 > from the dp4a sequence and the staged-tile traffic, not from having too few waves, which is why 6 waves and 4
 > waves measure the same and why the spills (real waste) mattered and the wave count did not.
 
+> ### 0.51 The spills were NOT the waste: the down kernel lost 53 of them and gained nothing
+>
+> 0.48 credited the A-stage gain to removing 28 spills.  Tested directly on the sibling kernel, which is worse:
+>
+> | `lat_q3k_down.cu` (gemm down, 1,144 ms) | VGPRs | spills | waves/SIMD | `gemm down` |
+> |---|---|---|---|---|
+> | as shipped | 256 | **53** | 4 | 1,144 / 1,144 ms |
+> | `#pragma unroll 1` on the `s` loop | **144** | **0** | **7** | 1,166 / 1,145 ms |
+>
+> **53 spills removed, occupancy 4 -> 7 waves/SIMD, and the stage moved by nothing** (1,166 / 1,145 against
+> 1,144 / 1,144 - inside its own variance).  Reverted: a neutral change is churn.
+>
+> That corrects 0.48's interpretation.  The A stage did gain 11.7 % from `unroll 1`, but **not because the spills
+> went away** - this kernel proves spill count is not predictive here.  The gain has to be the unroll change
+> itself: at `unroll 4` the four `s` iterations are expanded together, so every one of their staged-tile loads
+> and address computations is live at once and the scheduler interleaves four independent dp4a chains; at
+> `unroll 1` it is one chain whose loads are hoisted per iteration.  The `down` kernel is evidently bound by
+> something else again (its 1,144 ms is stable to 2 ms across every change tried), so it does not care either way.
+>
+> Both kernels are **not register-, spill- or occupancy-limited**.  Their time is in the dp4a sequence and the
+> staged-tile traffic, which is what 0.50 concluded from the wave count and this confirms from the spill count.
+> Anything that is going to move them has to change the work: fewer instructions per weight, or fewer weight
+> bytes - not the allocation.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
