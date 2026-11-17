@@ -35,3 +35,17 @@ edge0-strata/tok-*
 edge0-strata/tok_*
 edge0-strata/logpos-*
 edge0-strata/out_*
+
+# session scratch: harness output, logs, dumps, probe binaries. Nothing here is source.
+scratch/
+*.log
+*.err
+*.hipi
+*.tmp.bc
+tmp_*.obj
+build_out.txt
+commit_msg.txt
+probe_*.exe
+dev_*.elf
+isa_*.txt
+fat*.bin

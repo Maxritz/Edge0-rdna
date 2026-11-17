@@ -397,6 +397,257 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
 #endif
 }
 
+__global__ void __launch_bounds__(LTHREADS, 1)
+lat_q3k_fused_gu_kernel_rdna(const uint8_t* const* __restrict__ blob, const int32_t* __restrict__ starts, int n_groups,
+                        const uint8_t* __restrict__ xq, uint8_t* __restrict__ hbuf,
+                        const int32_t* __restrict__ counts, const int32_t* __restrict__ ent_tok) {
+#if defined(__HIPCC__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
+    extern __shared__ __align__(16) uint8_t smem[];
+    // (assigned, not brace-initialized: clang promotes a pointer array initialized from the LDS base to a static
+    // initializer, and ROCm's amdgcn-link rejects the addrspacecast that needs)
+    uint8_t* wst[2];
+    uint8_t* ast[2];
+    int* srow;
+    {
+        uint8_t* const base = smem;
+        wst[0] = base;
+        wst[1] = base + WROWS * LWPITCH;
+        ast[0] = base + 2 * WROWS * LWPITCH;
+        ast[1] = base + 2 * WROWS * LWPITCH + kTileRows * LAPITCH;
+        srow = (int*) (base + 2 * WROWS * LWPITCH + 2 * kTileRows * LAPITCH);
+    }
+
+    const bool a_nat = g_a_nat != 0;    // STRATA_A_NAT: natural dp4a staging (1) or the historical permuted order (0)
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, mg = lane >> 2, tig = lane & 3;
+    const int wf = warp & 3, nb0 = 16 * (warp >> 2);
+    const int wrow = tid >> 1, whalf = tid & 1;         // 2 threads a weight row, one 32-value half each
+    const int arow = tid >> 1, ahalf = tid & 1;
+
+    const int fb = blockIdx.x;                          // this launch's 128 features of the item
+    for (int g = blockIdx.y; g < n_groups; g += gridDim.y) {
+        const uint8_t* bl = blob[g];
+        if (bl == nullptr) continue;
+        const int e0 = starts[g];
+        // the group's row count: counts[] when the caller has it (the engine's flushes are not in group order)
+        const int e1 = counts != nullptr ? e0 + counts[g] : starts[g + 1];
+        for (int row0 = e0 + (int) blockIdx.z * kTileRows; row0 < e1; row0 += (int) gridDim.z * kTileRows) {
+            const int nrows = min(kTileRows, e1 - row0);
+            const int arows = min(kTileRows, (nrows + 15) & ~15);
+            // the stage's row: gate rows 128 * fb .. , then their up rows 128 rows later
+            const int fr = 128 * fb + (wrow & 127);
+            const uint8_t* wsrc = wrow < 128 ? bl + (size_t) fr * kGuRow : bl + kUpOff + (size_t) fr * kGuRow;
+            __syncthreads();
+            // the activation row of a tile row: the entry itself, or the token row ent_tok gives it (H stays
+            // entry-indexed: row0 + r is the entry)
+            if (tid < kTileRows) {
+                const int er = row0 + min(tid, nrows - 1);
+                srow[tid] = ent_tok != nullptr ? ent_tok[er] : er;
+            }
+            __syncthreads();
+
+            GuStaged wc[2];
+            uint32_t aq[8], adw = 0;
+            auto load_chunk = [&](int kb) {
+                const uint8_t* blk = wsrc + 110 * (kb >> 2);
+                wc[kb & 1] = lat_gu_decode(blk, kb, whalf, a_nat);
+                if (tid < 2 * arows) {
+                    // the plain q8_1 row: 72 B a chunk (two 32-value blocks), word 0 of a block is its ds
+                    const uint32_t* ap = (const uint32_t*) (xq + (size_t) srow[arow] * kXqRow + (size_t) 72 * kb);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) aq[i] = ap[1 + 9 * ahalf + i];
+                    adw = ap[9 * ahalf];
+                }
+            };
+            auto store_chunk = [&](int kb) {
+                uint8_t* wr = wst[kb & 1] + (size_t) wrow * LWPITCH;
+                const GuStaged& w = wc[kb & 1];
+#pragma unroll
+                for (int gg = 0; gg < 2; ++gg) {
+                    const int s = 2 * whalf + gg;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) *(uint32_t*) (wr + 16 * s + 4 * k) = w.w[gg][k];
+                    *(float*) (wr + 64 + 4 * s) = w.sc[gg];
+                }
+                if (tid < 2 * arows) {
+                    uint8_t* ar = ast[kb & 1] + (size_t) arow * LAPITCH;
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int s = 2 * ahalf + h;
+                        const uint32_t* wp = &aq[4 * h];
+                        if (a_nat) {
+                            // natural dp4a order, matching lat_stage_codes: 4 straight stores, no permutation
+#pragma unroll
+                            for (int k = 0; k < 4; ++k) *(uint32_t*) (ar + 16 * s + 4 * k) = wp[k];
+                        } else {
+                            // the historical CUDA mma-fragment order, kept so the two can alternate in ONE binary
+#pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                const uint32_t p1 = __byte_perm(wp[0], wp[1], k | ((k + 4) << 4));
+                                const uint32_t p2 = __byte_perm(wp[2], wp[3], k | ((k + 4) << 4));
+                                *(uint32_t*) (ar + 16 * s + 4 * k) = __byte_perm(p1, p2, 0x5410u);
+                            }
+                        }
+                    }
+                    *(__half*) (ar + 64 + 2 * ahalf) = __ushort_as_half((unsigned short) (adw & 0xFFFFu));
+                }
+            };
+
+            load_chunk(0);
+            store_chunk(0);
+            if (kChunks > 1) load_chunk(1);
+            const bool on0 = nb0 < nrows, on1 = nb0 + 8 < nrows;
+            // float2 accumulators on purpose: RDNA2 has packed fp32 (v_pk_fma_f32), so the per-sub-block scaling
+            // runs two lanes of math a instruction.  Packed fp32 FMA is IEEE per lane, so this is bit-identical to
+            // the scalar form it replaces - it is not a numerical change.  [q] 0 = (gate even, gate odd),
+            // 1 = (up even, up odd).
+            float2 acc[4][2][2];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int n = 0; n < 2; ++n)
+#pragma unroll
+                    for (int q = 0; q < 2; ++q) acc[i][n][q] = make_float2(0.0f, 0.0f);
+            for (int kb = 0; kb < kChunks; ++kb) {
+                __syncthreads();
+                if (on0) {
+                    const uint8_t* wc8 = wst[kb & 1];
+                    const uint8_t* ac = ast[kb & 1];
+#pragma unroll 1
+                    for (int s = 0; s < 4; ++s) {
+#if !defined(__HIPCC__)
+                        uint32_t bq[2];
+#endif
+                        float dx0[2], dx1[2];
+                        for (int n = 0; n < 2; ++n) {
+                            if (n == 1 && !on1) break;
+                            const uint8_t* ar = ac + (size_t) (nb0 + 8 * n + mg) * LAPITCH;
+#if !defined(__HIPCC__)
+                            bq[n] = *(const uint32_t*) (ar + 16 * s + 4 * tig);
+#endif
+                            const half2 ds0 = *(const half2*) (ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 64);
+                            const half2 ds1 = *(const half2*) (ac + (size_t) (nb0 + 8 * n + 2 * tig + 1) * LAPITCH + 64);
+                            dx0[n] = __half2float((s & 2) ? ds0.y : ds0.x);
+                            dx1[n] = __half2float((s & 2) ? ds1.y : ds1.x);
+                        }
+                        // RDNA-first (STRATA_A_RDNA=1): the weight words and sub-block scales depend on (s, i) ONLY,
+                        // but the original reads them inside the n loop - every weight word fetched TWICE per sub-block.
+                        // The stage measures ~120 % of the LDS read bandwidth (5.65 MB of LDS reads per 14,700 ns tile
+                        // against 128 B/clk x 36,750 clk = 4.7 MB), so that redundancy is the bound.  Read once per
+                        // (s,i), reused across both n halves: same words, same order -> BIT-IDENTICAL.
+                        uint32_t aw4[4][4], bw4[4][4];
+                        float da4[4], db4[4];
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int hra = 32 * wf + 8 * i + mg, hrb = hra + 128;
+                            const uint32_t* hwa = (const uint32_t*) (wc8 + (size_t) hra * LWPITCH + 16 * s);
+                            const uint32_t* hwb = (const uint32_t*) (wc8 + (size_t) hrb * LWPITCH + 16 * s);
+                            #pragma unroll
+                            for (int kw = 0; kw < 4; ++kw) { aw4[i][kw] = hwa[kw]; bw4[i][kw] = hwb[kw]; }
+                            da4[i] = *(const float*) (wc8 + (size_t) hra * LWPITCH + 64 + 4 * s);
+                            db4[i] = *(const float*) (wc8 + (size_t) hrb * LWPITCH + 64 + 4 * s);
+                        }
+                        for (int n = 0; n < 2; ++n) {
+                            if (n == 1 && !on1) break;
+                            // The activation words depend on (n, s, tig) ONLY - not on i - so they are loaded once
+                            // here and reused by all four i.  They used to be fetched inside the i loop, which made
+                            // 32 of the 64 shared loads per (s, n) the same eight words re-read four times.  0.51
+                            // showed this kernel is not register-, spill- or occupancy-limited, so instructions are
+                            // the only lever left.  Every acc[i][n][q] still accumulates over s and kb in the same
+                            // order, so the result stays bit-identical.  Measured adjacent to the un-hoisted build:
+                            // gemm gate/up 4,589 / 4,639 against 4,717 / 4,759 ms (-2.6 %).
+                            const uint8_t* ar0 = ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 16 * s;
+                            const uint8_t* ar1 = ar0 + LAPITCH;
+                            int b0v[4], b1v[4];
+#pragma unroll
+                            for (int kw = 0; kw < 4; ++kw) {
+                                b0v[kw] = (int) *(const uint32_t*) (ar0 + 4 * kw);
+                                b1v[kw] = (int) *(const uint32_t*) (ar1 + 4 * kw);
+                            }
+                            for (int i = 0; i < 4; ++i) {
+                                const int ra = 32 * wf + 8 * i + mg;          // the gate row (its up row is ra + 128)
+                                const int rb = ra + 128;
+#if !defined(__HIPCC__)
+                                const uint32_t a0 = *(const uint32_t*) (wc8 + (size_t) ra * LWPITCH + 16 * s + 4 * tig);
+                                const uint32_t a1 = *(const uint32_t*) (wc8 + (size_t) rb * LWPITCH + 16 * s + 4 * tig);
+#endif
+                                const float da = da4[i], db = db4[i];
+                                int d[4] = {0, 0, 0, 0};
+#if defined(__HIPCC__)
+                                // RDNA2 has no matrix cores, so the m16n8k16 s8 product above is four signed
+                                // byte products at a time (v_dot4_i32_i8 through __dp4a).  The four results are
+                                // the mma's C fragment exactly: (row ra, token 2*tig), (ra, 2*tig + 1),
+                                // (row rb, 2*tig), (rb, 2*tig + 1) - so the scaling below is unchanged.  The
+                                // 16 codes a lane does not hold are read from the staged tile, which holds
+                                // the same bytes the mma's fragments were built from; int32 adds are exact,
+                                // so the result is bit-identical to the CUDA tensor-core path.
+#pragma unroll
+                                for (int kw = 0; kw < 4; ++kw) {
+                                    d[0] = __dp4a((int) aw4[i][kw], b0v[kw], d[0]);
+                                    d[1] = __dp4a((int) aw4[i][kw], b1v[kw], d[1]);
+                                    d[2] = __dp4a((int) bw4[i][kw], b0v[kw], d[2]);
+                                    d[3] = __dp4a((int) bw4[i][kw], b1v[kw], d[3]);
+                                }
+#else
+                                asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
+                                    "{%0,%1,%2,%3};\n"
+                                    : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                                    : "r"(a0), "r"(a1), "r"(bq[n]));
+#endif
+                                const float2 sg = make_float2(da * dx0[n], da * dx1[n]);
+                                const float2 su = make_float2(db * dx0[n], db * dx1[n]);
+                                const float2 cg = make_float2((float) d[0], (float) d[1]);
+                                const float2 cu = make_float2((float) d[2], (float) d[3]);
+                                acc[i][n][0] = acc[i][n][0] + sg * cg;    // -> v_pk_fma_f32 (2 lanes, IEEE each)
+                                acc[i][n][1] = acc[i][n][1] + su * cu;
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+                if (kb + 1 < kChunks) {
+                    store_chunk(kb + 1);
+                    if (kb + 2 < kChunks) load_chunk(kb + 2);
+                }
+            }
+            if (!on0) continue;
+            // SwiGLU of feature 32 * (4 * fb + wf) + 8 i + mg, H to q8_1 as q8_1_store (the amax over the warp's 32
+            // features, d = q8_1_finite(amax / 127), the code rounding) into the staged row the down half reads -
+            // moe_fused.cu's latent_kernel<true> epilogue, with no NVFP4 tail (the q3k pack has none: scales 1)
+            const int blk = 4 * fb + wf;
+            for (int n = 0; n < 2; ++n) {
+                if (n == 1 && !on1) break;
+                for (int c = 0; c < 2; ++c) {
+                    float h[4], am = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float gt = c == 0 ? acc[i][n][0].x : acc[i][n][0].y;   // gate: (even, odd)
+                        const float uv = c == 0 ? acc[i][n][1].x : acc[i][n][1].y;   // up
+                        h[i] = __fmul_rn(__fdiv_rn(gt, 1.0f + __expf(-gt)), uv);
+                        am = fmaxf(am, fabsf(h[i]));
+                    }
+                    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 16));
+                    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 8));
+                    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 4));
+                    const float d = strata::kernels::q8_1_finite(__fdiv_rn(am, 127.0f));
+                    const int r = nb0 + 8 * n + 2 * tig + c;
+                    if (r < nrows) {
+                        uint8_t* o = hbuf + (size_t) (row0 + r) * kHqRow + (size_t) (blk >> 1) * LAPITCH;
+                        const int hh = blk & 1;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int v = 8 * i + mg;
+                            o[16 * (2 * hh + (v >> 4)) + 4 * (v & 3) + ((v & 15) >> 2)] =
+                                (uint8_t) strata::kernels::q8_1_quant(h[i], d, am);
+                        }
+                        if (mg == 0) *(__half*) (o + 64 + 2 * hh) = __float2half(d);
+                    }
+                }
+            }
+        }
+    }
+#endif
+}
+
 int lat_sms() {
     static const int sms = [] {
         int dev = 0, n = 0;
@@ -467,8 +718,15 @@ void lat_q3k_fused(const uint8_t* const* blob, const int32_t* starts, int n_grou
         static bool a_nat_set = false;
         if (!a_nat_set) { cudaMemcpyToSymbol(g_a_nat, &a_nat_env, sizeof(int)); a_nat_set = true; }
     }
-    lat_q3k_fused_gu_kernel<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
-        blob, starts, n_groups, (const uint8_t*) xq, (uint8_t*) hbuf, counts, ent_tok);
+    static const bool a_rdna = [] { const char* v = std::getenv("STRATA_A_RDNA");
+        return v != nullptr && std::atoi(v) != 0; }();
+    if (a_rdna) {   // RDNA-first: weights read once per (s,i), reused across both n halves
+        lat_q3k_fused_gu_kernel_rdna<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
+            blob, starts, n_groups, (const uint8_t*) xq, (uint8_t*) hbuf, counts, ent_tok);
+    } else {
+        lat_q3k_fused_gu_kernel<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
+            blob, starts, n_groups, (const uint8_t*) xq, (uint8_t*) hbuf, counts, ent_tok);
+    }
     dck(cudaGetLastError(), "launch gu+swiglu+q8_1");
     // the down: the shipped M1 kernel, on the H rows just written (same stream, so ordered)
     lat_q3k_down(blob, starts, n_groups, hbuf, out, ld, (void*) stream, counts, ent_dst);
