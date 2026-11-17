@@ -4823,7 +4823,30 @@ int main(int argc, char** argv) {
     // `bench/micro/graph_node_cost.cu` measures the same kernels on a real stream at 3.63 us ungrapped and
     // 0.805 us inside a graph.  **That is an ~8x penalty on every launch in the engine.**
     cudaStream_t main_stream = nullptr;
-    if (cudaStreamCreateWithFlags(&main_stream, cudaStreamNonBlocking) != cudaSuccess) {
+    // HIGH-PRIORITY COMPUTE QUEUE.  On AMD the CUs are homogeneous, but the hardware queue a stream feeds is not:
+    // hipStreamCreateWithPriority takes the top of hipDeviceGetStreamPriorityRange and the HQD scheduler then
+    // dispatches that queue's work ahead of a default-priority one.  Every other stream in the engine (the MTP
+    // draft stream, dflash's, the copy stream behind `cp`) already takes a priority; the main compute stream, which
+    // is where prefill and the verify window actually run, was the one left at default.  STRATA_MAIN_PRIO=0 is the
+    // A/B arm.
+    static const bool want_prio = [] {
+        const char* v = std::getenv("STRATA_MAIN_PRIO");
+        return v == nullptr || v[0] != '0';
+    }();
+    bool made = false;
+#if defined(STRATA_USE_HIP)
+    if (want_prio) {
+        int lo = 0, hi = 0;
+        if (hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess && lo != hi &&
+            hipStreamCreateWithPriority(&main_stream, hipStreamNonBlocking, hi) == hipSuccess) {
+            made = true;
+            std::fprintf(stderr, "strata generate: the main compute stream is on the high-priority queue (priority %d)\n", hi);
+        } else {
+            (void) hipGetLastError();
+        }
+    }
+#endif
+    if (!made && cudaStreamCreateWithFlags(&main_stream, cudaStreamNonBlocking) != cudaSuccess) {
         std::fprintf(stderr, "strata generate: cannot create the main stream\n");
         return 1;
     }
