@@ -1203,6 +1203,40 @@
 > full`, i.e. the R4 counters are not being driven at all on that path, while the pinned path drives them
 > (14,737 lookups).  Whoever next reasons about cache hit rate from that line under `auto` will be misled.
 
+> ### 0.37 SHIPPED, +38 % prefill on the DEFAULT config: the staging ring default 96 -> 80
+>
+> This is the first time this stretch removed time, and it removes it from the configuration every user gets,
+> with no pinning.
+>
+> 0.36 showed the box now offers 1.80-1.82 GiB of VRAM where the 249 tok/s tuning had 1.89-1.90 GiB.  The auto
+> scan's binding test is not the ring fill but the lend headroom, `chunk + ring + 128 <= slots`:
+>
+> * ring 96: `512 + 96 + 128 = 736 > 721` -> chunk 512 rejected -> auto falls to **256** -> **165.92-167.53 tok/s**
+> * ring 80: `512 + 80 + 128 = 720 <= 721` -> chunk 512 kept -> **231.19-236.30 tok/s**
+>
+> The 3/4-ring hysteresis I tried first changed nothing (167.34 / 167.27 / 167.64 / 167.83 across four
+> alternating arms) because the ring *fill* was never the binding condition.  The ring depth itself is flat at a
+> fixed chunk on this card - chunk 512 with 96 / 80 / 112 slots gives **235.34 / 235.46 / 237.12** tok/s, 0.8 %
+> apart - so the 16 slots cost nothing and buy the chunk.
+>
+> Shipped as `stage_slots()`'s base (prefill.cpp), with the whole history in the comment: 96 was chosen when the
+> margin existed, the comment there even predicted this exact failure ("pushes this box past the point where chunk
+> 512 can still have a full ring and there the chunk collapses to 256 and prefill falls from 250 to 165").
+>
+> Verified on the shipped default, no env overrides, `--prefill auto --expert-cache auto`:
+>
+> | | chunk | prefill | decode | output |
+> |---|---|---|---|---|
+> | before (ring 96) | 256 | 165.92 / 167.34 / 167.53 | 19.40-20.45 | byte-identical |
+> | **after (ring 80)** | **512** | **231.39 / 231.19** | 20.04 / 20.37 | byte-identical |
+>
+> **+38.4 %** prefill (165.92 -> 231.39).  Decode unchanged inside its noise.  `run_512k_mtp.ps1 -Embed 1`
+> still passes: **exit 0 after 31 s**, `output : 715 1822 1822 1822`, the same four tokens as the recorded
+> 512K + MTP runs, so the never-break constraint holds.
+>
+> Repro harnesses: `rs_ab.bat` (auto chunk vs ring depth), `cr_ab.bat` (ring depth at a fixed chunk),
+> `hy_ab.bat` (the hysteresis arm that did nothing).
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

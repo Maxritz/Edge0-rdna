@@ -419,11 +419,18 @@ inline int stage_slots(size_t T) {
         const char* v = std::getenv("STRATA_STAGE_SLOTS");
         return v != nullptr ? std::atoi(v) : 0;
     }();
-    // 96 and not 128: the auto chunk/ring budget demands a FULL ring at the chosen chunk, so a ring
-    // that is 37 MB bigger pushes this box past the point where chunk 512 can still have a full ring -
-    // and there the chunk collapses to 256 and prefill falls from 250 to 165 tok/s.  96 measured 246.34
-    // tok/s with chunk 512 and keeps that margin.
-    const int base = env > 0 ? env : 96;
+    // 80 and not 96.  The history: 96 was chosen because the auto scan demanded a FULL ring at the chosen chunk,
+    // so a ring 37 MB bigger pushed this box past the point where chunk 512 could still have one, and the chunk
+    // collapsed to 256 (250 -> 165 tok/s).  96 measured 246.34 tok/s at chunk 512 and kept that margin.
+    // That margin has since gone: the box now offers 1.80-1.81 GiB of VRAM where it used to offer 1.89-1.90 GiB,
+    // so at 96 the scan no longer has room for chunk 512 and the same collapse happens - measured 165.92 tok/s at
+    // chunk 256 against 236.30 / 236.17 at 512 with 80 slots (alternating pairs, output byte-identical).
+    // The binding test is not the ring fill but the lend headroom in the scan, `chunk + ring + 128 <= slots`:
+    // 512 + 96 + 128 = 736 > 721, while 512 + 80 + 128 = 720 <= 721.
+    // Ring depth itself is measured FLAT at a fixed chunk on this card - 96 / 80 / 112 slots give 235.34 /
+    // 235.46 / 237.12 tok/s (0.8 % apart) - so the 16 slots cost nothing and buy the chunk.  A deeper ring is
+    // still reachable with STRATA_STAGE_SLOTS, and a box with more free VRAM keeps picking 512 either way.
+    const int base = env > 0 ? env : 80;
     return std::min(std::max(base, std::max(ring_slots(T), STAGE_GRP)), ring_cap());
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
