@@ -5619,7 +5619,7 @@ if (lat_du) {
                                     const char* v = std::getenv("STRATA_LATENT_D_TILE");
                                     return (v != nullptr && v[0] == '0') ? 0 : 1;
                                 }();
-                                if (lat_d_tile > 0 && m.lat_fmt == 8 && (N % 64) == 0) {
+                                if (lat_d_tile > 0 && (m.lat_fmt == 8 || m.lat_fmt == 4) && (N % 64) == 0) {
                                     strata::kernels::latent_d_tiled(m.lat_d_dev + (size_t) l * m.lat_d.d_bytes(),
                                                                     m.lat_xq, T, (int) N, (int64_t) G * ELL, m.xl,
                                                                     m.cs, m.lat_fmt);
@@ -6618,7 +6618,7 @@ if (lat_du) {
                                     const int r = v != nullptr ? std::atoi(v) : 0;
                                     return r > 0 ? r : 0;
                                 }();
-                                if (lat_u_tile > 0 && m.lat_fmt == 8 && m.lat_scratch != nullptr && (ELL % 64) == 0)
+                                if (lat_u_tile > 0 && (m.lat_fmt == 8 || m.lat_fmt == 4) && m.lat_scratch != nullptr && (ELL % 64) == 0)
                                     strata::kernels::latent_u_tiled(
                                         m.lat_u_dev + (size_t) l * m.lat_d.u_bytes(), m.ylq, m.ids_p,
                                         m.lat_labels_dev + (size_t) l * m.lat_E, m.lat_E, (int64_t) (T * K), (int) ELL,

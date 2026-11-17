@@ -321,13 +321,13 @@ inline size_t u_tile_smem_bytes() {
 __global__ void __launch_bounds__(kUTileThreads, 2)
 latent_u_tile_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq,
                 const int32_t* __restrict__ rows, const int32_t* __restrict__ goff, int n_groups, int ELL,
-                int H, float* __restrict__ out, int64_t n_ident) {
+                int H, float* __restrict__ out, int64_t n_ident, int fmt) {
     extern __shared__ __align__(16) uint8_t smem[];
     uint8_t* wst = smem;                                  // kUTileCols staged weight rows
     uint8_t* ast = smem + (size_t) kUTileCols * kUPitch;  // kUTileRows staged activation rows
 
     const int nbchunk = ELL >> 6;             // 64-value chunks along K (20 for ELL 1280)
-    const size_t wrowb = (size_t) (ELL / 32) * 34;   // a Q8_0 weight row {half d; int8 qs[32]}
+    const size_t wrowb = (size_t) (ELL / 32) * (fmt == 4 ? 18 : 34);   // Q8_0 34 B or Q4_0 18 B a 32-weight block {half d; int8 qs[32]}
     const size_t arowb = (size_t) (ELL / 32) * 36;   // a q8_1 activation row {half d; half s; int8 qs[32]}
 
     // this tile's group (the rows of one label share their U slice) and its first routed row.
@@ -373,11 +373,21 @@ latent_u_tile_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ yl
             const int b = 2 * kb + whalf;
             const int wcol = min(col0 + wrow, H - 1);   // a short last column tile repeats its edge row
             const uint8_t* wp = u_q8 + (size_t) g * (size_t) H * wrowb + (size_t) wcol * wrowb +
-                                (size_t) b * 34;
+                                (size_t) b * (fmt == 4 ? 18 : 34);   // the block stride is the SAME size as the row's
             uint8_t* ws = wst + (size_t) wrow * kUPitch + whalf * 32;
             const uint8_t* qs = wp + 2;
+            if (fmt == 4) {
+                // Q4_0: 16 nibble bytes -> the same 32 int8 codes the Q8 path stages.  Byte j carries element j
+                // (low nibble) and element j+16 (high nibble), value = nibble - 8 (lat_blk_dot_q4's convention).
+                for (int j = 0; j < 16; ++j) {
+                    const int byte_ = qs[j];
+                    ws[j] = (uint8_t) ((byte_ & 0xF) - 8);
+                    ws[16 + j] = (uint8_t) ((byte_ >> 4) - 8);
+                }
+            } else {
 #pragma unroll
             for (int i = 0; i < 8; ++i) *(uint32_t*) (ws + 4 * i) = (uint32_t) latent_ld4_i8(qs + 4 * i);
+            }
             *(__half*) (wst + (size_t) wrow * kUPitch + 64 + 2 * whalf) = *(const __half*) wp;
         }
         if (tid < 2 * kUTileRows) {
@@ -465,7 +475,7 @@ void latent_u_runs(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, 
 
 void latent_u_tiled(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
                     int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt, int G) {
-    if (n <= 0 || fmt != 8 || G <= 0 || (ELL & 63) != 0 || scratch == nullptr) return;
+    if (n <= 0 || (fmt != 8 && fmt != 4) || G <= 0 || (ELL & 63) != 0 || scratch == nullptr) return;
     if (u_q8 == nullptr || ylq == nullptr || ids == nullptr || labels_dev == nullptr || out == nullptr) {
         std::fprintf(stderr, "latent_u_tiled: NULL pointer\n");
         std::abort();
@@ -491,7 +501,7 @@ void latent_u_tiled(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids,
     }
     const int64_t ntiles = (n + kUTileRows - 1) / kUTileRows + G;
     dim3 grid((unsigned) ntiles, (unsigned) ((H + kUTileCols - 1) / kUTileCols));
-    latent_u_tile_k<<<grid, kUTileThreads, u_tile_smem_bytes(), s>>>(u_q8, ylq, rows, goff, G, ELL, H, out, n);
+    latent_u_tile_k<<<grid, kUTileThreads, u_tile_smem_bytes(), s>>>(u_q8, ylq, rows, goff, G, ELL, H, out, n, fmt);
     u_run_ck(cudaGetLastError(), "latent_u_tile");
 }
 
@@ -523,13 +533,13 @@ inline size_t u_small_smem_bytes() {
 __global__ void __launch_bounds__(kUSmallThreads, 2)
 latent_u_tile_s_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq,
                   const int32_t* __restrict__ rows, const int32_t* __restrict__ goff, int n_groups, int ELL,
-                  int H, float* __restrict__ out, int64_t n_ident) {
+                  int H, float* __restrict__ out, int64_t n_ident, int fmt) {
     extern __shared__ __align__(16) uint8_t smem[];
     uint8_t* wst = smem;                                    // kUSmallCols staged weight rows
     uint8_t* ast = smem + (size_t) kUSmallCols * kUPitch;   // kUSmallRows staged activation rows
 
     const int nbchunk = ELL >> 6;                    // 64-value chunks along K (20 for ELL 1280)
-    const size_t wrowb = (size_t) (ELL / 32) * 34;   // a Q8_0 weight row
+    const size_t wrowb = (size_t) (ELL / 32) * (fmt == 4 ? 18 : 34);   // Q8_0 34 B or Q4_0 18 B a 32-weight block
     const size_t arowb = (size_t) (ELL / 32) * 36;   // a q8_1 activation row
 
     int tile = blockIdx.x, g = 0, base = 0, nrows = 0;
@@ -563,14 +573,29 @@ latent_u_tile_s_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ 
             // ({half d; int8 qs[32]}) and 36 ({half d; half s; int8 qs[32]}), so the second block's codes
             // do NOT follow the first block's contiguously - they start after its scale.
             const int wcol = min(col0 + tid, H - 1);
-            const uint8_t* wp = u_q8 + (size_t) g * (size_t) H * wrowb + (size_t) wcol * wrowb + (size_t) kb * 68;
+            const uint8_t* wp = u_q8 + (size_t) g * (size_t) H * wrowb + (size_t) wcol * wrowb +
+                                (size_t) kb * (fmt == 4 ? 36 : 68);
             uint8_t* ws = wst + (size_t) tid * kUPitch;
+            if (fmt == 4) {
+                // Q4_0: two 18 B blocks cover the same 64 codes.  Byte j of a block carries element j (low
+                // nibble) and element j+16 (high nibble), value = nibble - 8 (lat_blk_dot_q4 convention).
+                for (int j = 0; j < 16; ++j) {
+                    const int a = wp[2 + j], c = wp[20 + j];
+                    ws[j] = (uint8_t) ((a & 0xF) - 8);
+                    ws[16 + j] = (uint8_t) ((a >> 4) - 8);
+                    ws[32 + j] = (uint8_t) ((c & 0xF) - 8);
+                    ws[48 + j] = (uint8_t) ((c >> 4) - 8);
+                }
+                *(__half*) (ws + 64) = *(const __half*) wp;
+                *(__half*) (ws + 66) = *(const __half*) (wp + 18);
+            } else {
 #pragma unroll
             for (int i = 0; i < 8; ++i) *(uint32_t*) (ws + 4 * i) = (uint32_t) latent_ld4_i8(wp + 2 + 4 * i);
 #pragma unroll
             for (int i = 0; i < 8; ++i) *(uint32_t*) (ws + 32 + 4 * i) = (uint32_t) latent_ld4_i8(wp + 36 + 4 * i);
             *(__half*) (ws + 64) = *(const __half*) wp;
             *(__half*) (ws + 66) = *(const __half*) (wp + 34);
+            }
         }
         if (tid < kUSmallRows) {   // one thread a row: its 64 codes + the two scales
             const int rr = rows != nullptr ? rows[base + tid] : base + tid;
@@ -612,7 +637,7 @@ latent_u_tile_s_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ 
 void latent_u_tiles(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
                     int64_t E, int64_t n, int ELL, int H, float* out, void* scratch, void* stream, int fmt,
                     int G) {
-    if (n <= 0 || fmt != 8 || G <= 0 || (ELL & 63) != 0 || scratch == nullptr) return;
+    if (n <= 0 || (fmt != 8 && fmt != 4) || G <= 0 || (ELL & 63) != 0 || scratch == nullptr) return;
     if (u_q8 == nullptr || ylq == nullptr || ids == nullptr || labels_dev == nullptr || out == nullptr) {
         std::fprintf(stderr, "latent_u_tiles: NULL pointer\n");
         std::abort();
@@ -629,7 +654,7 @@ void latent_u_tiles(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids,
     }
     const int64_t ntiles = (n + kUSmallRows - 1) / kUSmallRows + G;
     dim3 grid((unsigned) ntiles, (unsigned) ((H + kUSmallCols - 1) / kUSmallCols));
-    latent_u_tile_s_k<<<grid, kUSmallThreads, u_small_smem_bytes(), s>>>(u_q8, ylq, rows, goff, G, ELL, H, out, n);
+    latent_u_tile_s_k<<<grid, kUSmallThreads, u_small_smem_bytes(), s>>>(u_q8, ylq, rows, goff, G, ELL, H, out, n, fmt);
     u_run_ck(cudaGetLastError(), "latent_u_tile_s");
 }
 
@@ -699,7 +724,7 @@ void latent_d_tiled(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, in
     // uses G*ELL outputs whatever its route), so the same staged tile serves it with rows == nullptr -
     // identity row order.  T=512 gives 8 full 64-row tiles, i.e. no padding at all, where the U side
     // runs at 39 % fill.
-    if (M <= 0 || K <= 0 || n_out <= 0 || fmt != 8 || (K & 63) != 0) return;
+    if (M <= 0 || K <= 0 || n_out <= 0 || (fmt != 8 && fmt != 4) || (K & 63) != 0) return;
     if (w_q8 == nullptr || xq == nullptr || out == nullptr) {
         std::fprintf(stderr, "latent_d_tiled: NULL pointer\n");
         std::abort();
@@ -713,7 +738,7 @@ void latent_d_tiled(const uint8_t* w_q8, const uint8_t* xq, int64_t M, int K, in
     }
     dim3 grid((unsigned) ((M + kUTileRows - 1) / kUTileRows), (unsigned) ((n_out + kUTileCols - 1) / kUTileCols));
     latent_u_tile_k<<<grid, kUTileThreads, u_tile_smem_bytes(), s>>>(w_q8, xq, nullptr, nullptr, 1, K, (int) n_out,
-                                                                    out, M);
+                                                                    out, M, fmt);
     u_run_ck(cudaGetLastError(), "latent_d_tile");
 }
 

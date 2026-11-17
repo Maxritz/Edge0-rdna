@@ -296,6 +296,54 @@ output plus `run_512k_mtp.ps1` are the regression gates.
 It also corrected the geometry a third time: **ELL = 1280**, not 1792 (48 x 55,705,600 B = the file exactly, and
 the kernel logs `ELL=1280`), so D/U traffic is **2.67 GB a round**, not 4.7.
 
+### 6d. Q4_0 latent D/U, SHIPPED - and the second win it unlocked
+
+The three edits diagnosed in 6c landed, plus one more hardcode the first three would have left behind:
+
+| defect | where | fix |
+|---|---|---|
+| `latent_u_tiled` / `latent_u_tiles` refuse fmt 4 | `latent.cu` guards | accept 4 or 8 |
+| prefill's U dispatch requires fmt 8 | `prefill.cpp:6621` | `lat_fmt == 8 \|\| lat_fmt == 4` |
+| `latent_u_tile_k` row stride `(ELL/32)*34` | `latent.cu:330` | `(ELL/32) * (fmt == 4 ? 18 : 34)` |
+| **`latent_u_tile_k` within-row block stride `b * 34`** | `latent.cu:376` | `b * (fmt == 4 ? 18 : 34)` |
+| `latent_u_tile_s_k` two-block stride 68 | `latent.cu:577` | `kb * (fmt == 4 ? 36 : 68)` |
+| `latent_d_tiled` + prefill's D dispatch require fmt 8 | `latent.cu:727`, `prefill.cpp:5622` | accept 4 or 8 |
+
+The Q4 nibble unpack stages into the **same int8 layout the Q8 path already uses** - byte j gives element
+`j = (b & 0xF) - 8` and element `j + 16 = (b >> 4) - 8`, one scale per 32-value block - so the compute path
+is untouched.
+
+A/B, alternating pairs, chunk pinned 512, output compared every arm:
+
+| arm | decode tok/s | prefill tok/s |
+|---|---|---|
+| **F4** | **21.55 / 21.42** | **270.41 / 263.22** |
+| F8 | 20.52 / 20.59 | 259.10 / 251.50 |
+
+decode **+4.5 %**, prefill **+4.5 %** - no trade.  Ledger, the two rows the diagnosis named:
+
+| component | fmt=4 now | fmt=4 before | fmt=8 |
+|---|---|---|---|
+| `gemm down` | **1,139** | 7,465 | 1,175 |
+| `gather` | **993** | 4,159 | 1,030 |
+| `wait copy` | 2,573 | 1,858 | 3,030 |
+| `gemm gate/up` | 4,562 | 4,767 | 4,659 |
+
+Gate: KL mean **7.58e-3** (p50 2.46e-3, p95 2.71e-2), top-1 **100 %** (16/16 coherent prefix) = **6.1x** the
+calibrated 1.25e-3 floor.  PASS.
+
+**The second win, and it is bigger at long context.**  Halving the table returns ~1.3 GiB of VRAM, and the expert
+cache is sized from free VRAM:
+
+```
+Q8: 1.67 GiB free ->   597 expert-cache slots -> chunk auto 256 -> 16 chunks, 105,756 experts streamed
+Q4: 2.97 GiB free -> 1,793 slots               -> chunk auto 512 ->  8 chunks,  62,739 experts streamed
+```
+
+So the lever pays twice: 18/34 of the D/U bytes, and a larger auto-chunk because the latent table no longer
+competes with the expert cache - **-40.7 % expert fetches**.  At `--max-context 8192`: prefill 180.58 -> 264.19
+tok/s (+46.3 %), decode 21.93 -> 24.93 (+13.7 %).  Any lever that frees VRAM should now be evaluated on this
+axis too, not just on its own stage.
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
