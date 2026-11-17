@@ -1814,6 +1814,53 @@
 > Sized honestly: 2x would be ~1.5 s of the 17.0 s prefill (~240 -> ~262 tok/s), and it is a kernel rewrite with
 > its own byte-exact gate (`gemm_f32_parity` / `gemm_bf16_parity` exist).
 
+> ### 0.54 Correction: the dense GEMM has no inner loop of ours - it is rocBLAS at 4.0 TFLOP/s, 16 % of fp16 peak
+>
+> 0.53 proposed rewriting "f16_inplace's inner loop" in packed fp16.  **That loop does not exist**, and the plan
+> was wrong: `Gemm::f16_inplace` is a library call.
+>
+> ```cpp
+> done = try_rocblas_f16o(...);                    // rocBLAS, the gfx103x tuning table's kernel for this shape
+> if (!done) ck(cublasGemmEx(... CUDA_R_16F out ... CUBLAS_COMPUTE_32F ...));   // hipBLASLt
+> widen_rows_f16<<<T, 256>>>(Y, N, ldy);           // fp16 result -> f32
+> ```
+>
+> And the engine says so at startup: "HIP device 0 gfx1031 - FP16 prompt GEMMs ENABLED (**rocBLAS tuned on
+> gfx103x**; not bit-identical to BF16 ...)".  So rocBLAS is active and tuned, and it already emits packed-fp16
+> instructions internally on RDNA2 - there is nothing of ours to convert.
+>
+> **The real dimensions**, from `STRATA_COLD_TRACE=1` (layer 0, T=512):
+>
+> | projection | N | K | cold ms | GFLOP |
+> |---|---|---|---|---|
+> | `attn_qkv` | 10240 | 2560 | 13.53 | 26.85 |
+> | `attn_gate` | 6144 | 2560 | 3.66 | 16.11 |
+> | `ssm_alpha` | 48 | 2560 | 0.41 | 0.13 |
+> | `ssm_beta` | 48 | 2560 | 0.30 | 0.13 |
+> | (`ssm_out`, the out-proj row) | 2560 | 6144 | 1.32 | 16.11 |
+>
+> 43.2 GFLOP a layer for the `gdn` bucket, x 288 layer-chunks = 12.4 TFLOP over 3,080 ms = **4.0 TFLOP/s**,
+> which is **16 % of this card's 24.6 TFLOP/s fp16 peak** (40 CU x 64 lanes x 2 x 2 packed x 2.4 GHz).  The
+> earlier "~1 TFLOP/s" was my guess at the dimensions, not a measurement; 4.0 is the measured figure and it is
+> rocBLAS's number, not an engine bug.  `widen_rows_f16` is not the cost either - for qkv it moves 31.5 MB,
+> ~0.19 ms against 13.53.
+>
+> **So the lever is real but it is not a drop-in.**  Beating rocBLAS on RDNA2 means writing the packed-fp16 GEMM
+> ourselves (`v_pk_fma_f16` / `V_DOT2_F32_F16`), and any such kernel has its own blocking and accumulation tree,
+> i.e. **a different summation order and therefore different bits**.  The engine already tolerates that class of
+> difference across backends - it prints "not bit-identical to BF16" about the FP16 GEMM it ships - but the
+> 32-token output would move, exactly as a Q4_0 table would.
+>
+> That makes this the **second** large lever gated on accepting a bounded numerical change rather than on any
+> measurement or code difficulty:
+>
+> | lever | prize | gate needed |
+> |---|---|---|
+> | Q4_0 latent D/U tables (decode) | ~20 -> ~26 tok/s | KL/NLL quality gate |
+> | custom packed-fp16 GEMM (prefill) | 3,080 -> ~1,500 ms, ~240 -> ~270 tok/s | accept a changed GEMM accumulation order |
+>
+> Everything that could be had without such a decision has been taken or measured away this stretch.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
