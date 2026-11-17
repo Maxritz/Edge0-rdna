@@ -81,6 +81,7 @@ Both conclusions were artefacts of the bug.
 | **Removing 53 spills in the down kernel** | 256 → 144 VGPR, 4 → 7 waves | `gemm down` 1,144 → 1,145/1,166 ms — **nothing** |
 | **Stream priority** (`STRATA_MTP_HIP_PRIO=1`) | decode 20.60/20.91 vs 21.03/19.27 | inside noise |
 | **`STRATA_PF_GEMM=1` / `STRATA_WMMA_GEMM=1`** on gfx103x | `gdn` 3,079 / 3,084 vs 3,075/3,082 | both decline (need the gfx11 WMMA product) |
+| **dot2 tile 256x128** (512 threads, 64 acc, half the blocks) | qkv per call **3.28** vs 2.85 (128x128); gate 2.09 vs 1.80 | **worse** — halving the block count loses more parallelism than the staging saves. 128x128 stays; opt-in via `STRATA_GEMM_DOT2_TILE=256` |
 | **dot2 tile 128x128** (64 acc, 4:1 vs 2:1) | **RETESTED after the launch bug was fixed**: qkv 3.17 → **2.84 ms**, gate 1.96 → 1.81; `gdn` 1,702 → **1,545 ms (-9.2 %)**, prefill 249.7 → 251.9 (profiler on), output byte-identical in all four arms | **wins — 128x128 is the shipped tile.**  The earlier "flat" reading was an artefact of §5.1 (the kernel was not launching), which is exactly why a measurement taken through a suspected-broken code path must be re-run |
 
 Two lessons from the bottom rows: **spill count is not predictive** (removing 53 bought nothing, while the

@@ -31,6 +31,11 @@ constexpr int kLDK = kBK + 2;   // padded: without the +2 the 16 thread rows lan
 // multiply.  This is the wider tile: 128 x 128 a block with 8 x 8 accumulators a thread, so a thread issues
 // 16 LDS for 64 dot2 (4:1) instead of 8 LDS for 16 dot2 (2:1).
 constexpr int kBM2 = 128, kBN2 = 128;
+// 0.60: a TALLER block tile.  The 128x128 tile cannot take a deeper double-buffered k-slab (BK 64 needs 67.6 KB
+// of shared memory against the 64 KB a workgroup gets), so the way to fewer blocks and less staging overhead per
+// output is more rows a block: 256 x 128 with 512 threads still gives each thread 8 x 8 = 64 accumulators (the
+// 4:1 dot2-to-LDS ratio that won), and its shared tiles are 34816 + 17408 = 52 KB.
+constexpr int kBM3 = 256, kBN3 = 128, kThreads3 = 512;
 
 #if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
 
@@ -178,6 +183,77 @@ __global__ void __launch_bounds__(256) dot2_gemm_kernel128(const _Float16* __res
 #endif
 }
 
+// 256 x 128 with 512 threads, 8 x 8 a thread (the same per-thread shape and ratio as the 128 x 128 tile, half the
+// blocks).  Same per-element k order, so the same bits.
+__global__ void __launch_bounds__(kThreads3) dot2_gemm_kernel256(const _Float16* __restrict__ X, int ldx,
+                                                                 const _Float16* __restrict__ W, int ldw,
+                                                                 float* __restrict__ Y, int M, int N, int K, int ldy,
+                                                                 int accumulate) {
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
+    __shared__ __align__(16) _Float16 sA[2][kBM3][kLDK];
+    __shared__ __align__(16) _Float16 sB[2][kBN3][kLDK];
+    const int tid = threadIdx.x;
+    const int m0 = (int) blockIdx.x * kBM3;
+    const int n0 = (int) blockIdx.y * kBN3;
+    auto stage = [&](int buf, int k0) {
+        const int r = tid >> 2, q = tid & 3;          // A: 128 rows a pass, 2 passes; B: exactly 128 rows
+        const int n = min(n0 + r, N - 1);
+        *reinterpret_cast<uint4*>(&sB[buf][r][8 * q]) =
+            *reinterpret_cast<const uint4*>(W + (size_t) n * ldw + k0 + 8 * q);
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int ra = r + 128 * p;
+            const int m = min(m0 + ra, M - 1);
+            *reinterpret_cast<uint4*>(&sA[buf][ra][8 * q]) =
+                *reinterpret_cast<const uint4*>(X + (size_t) m * ldx + k0 + 8 * q);
+        }
+    };
+    const int tm = tid >> 4, tn = tid & 15;           // 32 x 16; rows tm*8..+8 (256), cols tn*8..+8 (128)
+    float acc[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] = 0.0f;
+    int buf = 0;
+    stage(0, 0);
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += kBK) {
+        const bool more = k0 + kBK < K;
+        if (more) stage(buf ^ 1, k0 + kBK);
+#pragma unroll
+        for (int k = 0; k < kBK; k += 2) {
+            uint32_t ap[8], bp[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                ap[i] = *reinterpret_cast<const uint32_t*>(&sA[buf][tm * 8 + i][k]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                bp[j] = *reinterpret_cast<const uint32_t*>(&sB[buf][tn * 8 + j][k]);
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[i][j] = dot2(ap[i], bp[j], acc[i][j]);
+        }
+        if (more) {
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int m = m0 + tm * 8 + i;
+        if (m >= M) continue;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int n = n0 + tn * 8 + j;
+            if (n >= N) continue;
+            float* y = Y + (size_t) m * ldy + n;
+            *y = accumulate ? *y + acc[i][j] : acc[i][j];
+        }
+    }
+#endif
+}
+
 }  // namespace
 
 bool strata_pf_gemm_f16_dot2(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
@@ -227,7 +303,12 @@ bool strata_pf_gemm_f16_dot2(const uint16_t* X, const uint16_t* W, float* Y, int
     // NO ARCH GUARD HERE.  The launch must be visible to the HOST pass, where __gfx103x__ is not defined; the
     // blocks are guarded only by the runtime `on_rdna2` check above.  Guarding the launch is what made three
     // earlier "measurements" of this kernel compare rocBLAS against itself (0.59).
-    if (tile != 64) {
+    if (tile == 256) {
+        const dim3 g3((unsigned) ((T + kBM3 - 1) / kBM3), (unsigned) ((N + kBN3 - 1) / kBN3));
+        dot2_gemm_kernel256<<<g3, kThreads3, 0, (hipStream_t) stream>>>(
+            (const _Float16*) X, (int) K, (const _Float16*) W, (int) K, Y, (int) T, (int) N, (int) K, (int) ldy,
+            beta == 1.0f ? 1 : 0);
+    } else if (tile != 64) {
         const dim3 g2((unsigned) ((T + kBM2 - 1) / kBM2), (unsigned) ((N + kBN2 - 1) / kBN2));
         dot2_gemm_kernel128<<<g2, 256, 0, (hipStream_t) stream>>>(
             (const _Float16*) X, (int) K, (const _Float16*) W, (int) K, Y, (int) T, (int) N, (int) K, (int) ldy,
