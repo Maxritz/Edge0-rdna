@@ -1433,6 +1433,34 @@ its range, and the row offset becomes `blob[g] - base + row*kGuRow + ...` in 32-
 become five `buf_load_b32` calls.  The gate is the usual one: alternating pairs, the 32-token output check, and
 `run_512k_mtp.ps1 -Embed 1` expecting exit 0 with tokens `715 1822 363 313`.
 
+
+### 8s. The buffer-resource port was ATTEMPTED, REJECTED on correctness, and reverted
+
+8r measured 1.7-3.0x on the load pattern, so it was ported into `lat_ld4` (`STRATA_A_BUF`, default on, both paths in one
+binary via a `__device__` flag like `g_a_nat`).  It BUILT and it was WRONG:
+
+    arm                    gemm gate/up      prefill     32-token output
+    buffer resource        7,894 / 7,484     101.9 / 113.4   DIFFERS from the baseline string
+    STRATA_A_BUF=0 (flat)  8,447 / 8,000     107.9 / 113.2   matches the baseline
+
+The buffer path changes the output, i.e. it reads the wrong bytes, so it was reverted with
+`git checkout HEAD -- src/prefill/lat_q3k_fused.cu`.  The shipped single-buffer A stage is intact.
+
+**The timing in that table is worthless and must not be quoted.**  Both arms ran ~3x slow, and so did the REVERTED build
+(`gemm gate/up` 7,476 ms, 110.69 tok/s) on IDENTICAL work - cache 1,472 slots, ring 64, 43,774 blobs, the same numbers
+as the 351.52 tok/s run (`l4k.log`).  Same work, same cache, 3.2x slower, no competing process, CPU at 2 %: the GPU was
+clock-throttled for that whole window.  (I briefly read the flat arm's 8,447 ms as a regression from my branch; the
+reverted build's 7,476 ms on identical work shows that reading was wrong.  Nothing in the engine had regressed.)
+
+**What is actually settled:** the descriptor formulation as written is incorrect - most likely the 256-byte page base
+plus a nominal 512-byte range is not a valid descriptor for this access pattern (the working probe used the allocation
+base and a full-allocation range, which is 4096-aligned and large).  The next attempt should keep the probe's exact
+formulation: a 4096-aligned base and a range covering the blob, rather than a per-page descriptor.
+
+**And a hard constraint learned:** no performance number can be trusted on this box without a clock sanity check.  A
+canonical run (`--prefill 832`, 4k, 43,774 blobs) is **351.5 tok/s**; anything near 110 on the same workload means the
+card is throttled and the window must be discarded.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
