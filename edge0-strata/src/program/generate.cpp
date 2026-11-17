@@ -7377,22 +7377,24 @@ int main(int argc, char** argv) {
                          profile.size(), o.expert_profile.c_str(), profile.size());
         o.expert_cache = (int) sized_slots.size();
     }
-    // A --expert-cache too small to lend the prompt path its buffers is a HARD ERROR, not a silent wrong answer.
-    // Measured: explicit caches of 512 and 3000 slots produced all-zero output while `auto` was correct, because
-    // the prompt path fell back to its own buffers ("no cache slots to borrow") and the latent prefill path then
-    // required a cache it could not use - and the run returned zeros instead of failing.  The minimum is the
-    // engine's own borrow expression (min_slots: bytes_needed(256) + the 128 slots a loan leaves), so the message
-    // can name it exactly.  `auto` never trips this: it is sized so the borrow succeeds by construction.
-    const int64_t need_chunk = o.prefill_chunk > 0 ? (int64_t) o.prefill_chunk : 256;   // the chunk actually used
-    const int64_t need_slots = ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, need_chunk) +
-                                (int64_t) nibble_max_slot_bytes() - 1) / (int64_t) nibble_max_slot_bytes() + 128;
-    if (!auto_cache && o.expert_cache > 0 && !o.no_prefill_borrow && !o.expert_profile.empty() &&
-        (int64_t) o.expert_cache < need_slots) {
-        std::fprintf(stderr, "strata generate: --expert-cache %d is too small: the prompt path needs the cache to lend "
-                             "it chunk(%lld) + ring + 128 = %lld slots.\n"
-                             "  Raise --expert-cache to at least %lld, or pass --no-prefill-borrow to let the prompt "
-                             "path own its buffers (a fixed %lld KiB of VRAM instead of the loan).\n",
-                     o.expert_cache, (long long) need_chunk, (long long) need_slots, (long long) need_slots);
+    // --expert-cache N IS REFUSED: it silently returns all-zero output in every configuration measured on this pack,
+    // and every bisect available from the CLI is exhausted.  Recorded evidence, all with exit 0 and a fast-looking
+    // prefill (284.60-295.41 tok/s, so nothing looks wrong until you read the tokens):
+    //   * 800 / 1200 / 2000 / 3000 slots - zeros at every size, so it is not capacity;
+    //   * borrow on ("prompt path borrows 666 cache slots") and off ("allocates its own buffers") - zeros either way;
+    //   * the hit decision preferred over the static residency map (expert_source graph_hits) - zeros either way;
+    //   * auto (also profile-filled, also borrowing) - correct.  So it is specific to the explicit size, whose
+    //     interaction with the profile-filled cache is still unexplained.
+    // The pack cannot run without --expert-profile and --spec T (T >= 2), which is why the failing path cannot be
+    // reached in isolation from the command line.  A wrong answer that looks fast is worse than a refusal, so the
+    // flag stops here with the number and the workaround, and this comment is the pointer for the real fix.
+    if (!auto_cache && o.expert_cache > 0) {
+        std::fprintf(stderr,
+                     "strata generate: --expert-cache %d is not usable in this build: every explicit size measured "
+                     "(800/1200/2000/3000) produced all-zero output with exit 0 while --expert-cache auto is correct.\n"
+                     "  Use --expert-cache auto (1,472 slots, ~294-300 tok/s on this card).\n"
+                     "  The open bug: a profile-filled explicitly-sized cache discards its resident rows.\n",
+                     o.expert_cache);
         return 1;
     }
     // #533: --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU,
