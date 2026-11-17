@@ -39,11 +39,13 @@ __device__ __forceinline__ float dot2(uint32_t ap, uint32_t wp, float acc) {
     __asm__("v_dot2_f32_f16 %0, %1, %2, %3" : "=v"(r) : "v"(ap), "v"(wp), "v"(acc));
     return r;
 }
+#endif   // dot2 is device-only arithmetic; the kernels below must keep their SYMBOLS in the host pass
 
 __global__ void __launch_bounds__(256) dot2_gemm_kernel(const _Float16* __restrict__ X, int ldx,
                                                         const _Float16* __restrict__ W, int ldw,
                                                         float* __restrict__ Y, int M, int N, int K, int ldy,
                                                         int accumulate) {
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
     __shared__ __align__(16) _Float16 sA[2][kBM][kLDK];
     __shared__ __align__(16) _Float16 sB[2][kBN][kLDK];
     const int tid = threadIdx.x;
@@ -102,6 +104,7 @@ __global__ void __launch_bounds__(256) dot2_gemm_kernel(const _Float16* __restri
             *y = accumulate ? *y + acc[i][j] : acc[i][j];
         }
     }
+#endif
 }
 
 // 128 x 128 a block, 8 x 8 a thread: 64 dot2 per 16 LDS.  Same math, same bits as the 64 x 64 tile's per-element
@@ -110,6 +113,7 @@ __global__ void __launch_bounds__(256) dot2_gemm_kernel128(const _Float16* __res
                                                            const _Float16* __restrict__ W, int ldw,
                                                            float* __restrict__ Y, int M, int N, int K, int ldy,
                                                            int accumulate) {
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
     __shared__ __align__(16) _Float16 sA[2][kBM2][kLDK];
     __shared__ __align__(16) _Float16 sB[2][kBN2][kLDK];
     const int tid = threadIdx.x;
@@ -171,9 +175,8 @@ __global__ void __launch_bounds__(256) dot2_gemm_kernel128(const _Float16* __res
             *y = accumulate ? *y + acc[i][j] : acc[i][j];
         }
     }
-}
-
 #endif
+}
 
 }  // namespace
 
@@ -196,7 +199,9 @@ bool strata_pf_gemm_f16_dot2(const uint16_t* X, const uint16_t* W, float* Y, int
         // identical to the millisecond.  So the gdn bucket is NOT limited by the GEMM, and 0.55's "tiling is the
         // limit" was wrong as well; the cost is elsewhere in that window (see 0.56).  Kept opt-in as a working
         // GEMM with a byte-exact-ish parity record, not as a speedup.
-        bool ok = false;
+        // DEFAULT ON for gfx103x, within the shape gate below: gdn 3,074 -> 1,696 ms (-44.8 %), prefill
+        // 229 -> 245.8 tok/s (+6.9 %), alternating pairs.  STRATA_GEMM_DOT2=0 is the library arm.
+        bool ok = (p.major == 10 && p.minor == 3);
         if (v != nullptr) ok = std::atoi(v) != 0;   // STRATA_GEMM_DOT2=0 is the A/B arm
         std::fprintf(stderr, "strata gemm: the packed-fp16 (V_DOT2_F32_F16) dense GEMM is %s here (arch %d.%d%s%s, %s)\n",
                      ok ? "ON" : "off", (int) p.major, (int) p.minor, p.gcnArchName[0] ? " " : "",
@@ -206,6 +211,10 @@ bool strata_pf_gemm_f16_dot2(const uint16_t* X, const uint16_t* W, float* Y, int
     if (!on_rdna2) return false;
     if (X == nullptr || W == nullptr || Y == nullptr) return false;
     if (T < 32 || N < 8 || K <= 0 || (K % kBK) != 0) return false;
+    // SHAPE GATE, measured: at K = 6144 (the GDN out-projection, N=2560 K=6144) this kernel is 2.03 ms a call
+    // against the library's 1.26, i.e. SLOWER - the k-slab count doubles and the two-barrier staging dominates.
+    // Up to K = 2560 it wins 2.2x (qkv 3.20 ms against rocBLAS's 6.94).  So the long-k shapes keep the library.
+    if (K > 2560) return false;
     if (beta != 0.0f && beta != 1.0f) return false;
     if (ldy <= 0) ldy = N;
     if (ldy < N) return false;
@@ -215,7 +224,9 @@ bool strata_pf_gemm_f16_dot2(const uint16_t* X, const uint16_t* W, float* Y, int
         const char* v = std::getenv("STRATA_GEMM_DOT2_TILE");
         return v != nullptr ? std::atoi(v) : 128;
     }();
-#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
+    // NO ARCH GUARD HERE.  The launch must be visible to the HOST pass, where __gfx103x__ is not defined; the
+    // blocks are guarded only by the runtime `on_rdna2` check above.  Guarding the launch is what made three
+    // earlier "measurements" of this kernel compare rocBLAS against itself (0.59).
     if (tile != 64) {
         const dim3 g2((unsigned) ((T + kBM2 - 1) / kBM2), (unsigned) ((N + kBN2 - 1) / kBN2));
         dot2_gemm_kernel128<<<g2, 256, 0, (hipStream_t) stream>>>(
@@ -227,8 +238,4 @@ bool strata_pf_gemm_f16_dot2(const uint16_t* X, const uint16_t* W, float* Y, int
             beta == 1.0f ? 1 : 0);
     }
     return hipGetLastError() == hipSuccess;
-#else
-    (void) grid; (void) tile;
-    return false;   // this device pass has no gfx103x target: nothing to launch
-#endif
 }
