@@ -4715,6 +4715,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     } else {
                         // group the (token, k) pairs by expert on the host
+                        // STRATA_PREFILL_HOSTPROF=1: where the host's ~9.3 s in this window actually goes.  The
+                        // window between kPfHostGroup and kPfGather is 840 lines and the ledger charges all of it
+                        // to one bucket, so "host grouping 52.8 %" cannot distinguish CPU work from the host
+                        // blocking on the stager or on a GPU stall.  Buckets, in order: ids download, cpu-share
+                        // decision, prune diagnostics, the grouping loop, the plan tables, the CPU pool setup, the
+                        // stager job build + start, and the copy issue.  Printed once at exit, totals in ms.
+                        struct PfHostProf {
+                            bool on = std::getenv("STRATA_PREFILL_HOSTPROF") != nullptr;
+                            enum { N = 7 };
+                            double ms[N] = {};
+                            int open = -1;
+                            std::chrono::steady_clock::time_point t{};
+                            void hit(int i) {
+                                if (!on) return;
+                                const auto n = std::chrono::steady_clock::now();
+                                if (open >= 0 && open < N) ms[open] += std::chrono::duration<double, std::milli>(n - t).count();
+                                t = n;
+                                open = i;
+                            }
+                            ~PfHostProf() {
+                                if (!on) return;
+                                std::fprintf(stderr,
+                                             "host window (ms): ids %.0f | share+diag %.0f | group %.0f | "
+                                             "plan %.0f | cpupool+stagerbuild %.0f | copies %.0f | tail %.0f\n",
+                                             ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6]);
+                            }
+                        };
+                        static PfHostProf hp;
+                        hp.hit(0);
                         pt.mark(kPfHostGroup, cs);
                         // (the sync below also orders this layer's writes of slot/src/bounds after the previous
                         // layer's kernels that read them)
@@ -4758,6 +4787,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cpu_set = (int) (i & 1);
                             cudaEventRecord(m.cpu_wall[2 * cpu_set], m.cs);
                         }
+                        hp.hit(1);
                         if (cpu_maybe && cpu_arm) {
                             const size_t want = (size_t) T * N;
                             if (m.cpu_x_n < want) {
@@ -5192,6 +5222,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (!shared_expert()) return false;
                             pt.mark(kPfHostGroup, cs);
                         }
+                        hp.hit(2);
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
@@ -5318,6 +5349,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,
                                                            detail::mmq_resident_sort_span(order.size(), MMQ_GROUP, sort_full));
                         if (grp_mapped) {
+                            hp.hit(3);
                             copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
                             copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
                         } else {
@@ -5445,6 +5477,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
                         std::vector<int> job_of(order.size(), -1);
                         if (!stream_all) {
+                            hp.hit(4);
                             std::vector<Stager::Job> js;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
@@ -5502,6 +5535,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             m.stager->start(std::move(js));
                         }
+                        hp.hit(5);
                         StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];

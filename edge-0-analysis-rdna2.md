@@ -1482,6 +1482,45 @@
 > Doing (2) alone is the trap this ledger exposes: it would take the GPU to ~12 s and leave the wall at the
 > host's 17.7 s.
 
+> ### 0.44 "host grouping 9,335 ms" is a mislabel: the grouping loop is 15 ms, and the host/GPU take turns
+>
+> `STRATA_PREFILL_HOSTPROF=1` splits the 840-line window between `kPfHostGroup` and `kPfGather` into seven host
+> buckets (`prefill.cpp`, a local `PfHostProf`, printed once at exit).  Same run as 0.43's ledger:
+>
+> ```
+> host window (ms): ids 1 | share+diag 9361 | group 15 | plan 5 | cpupool+stagerbuild 1 | copies 8132 | tail 0
+> ```
+>
+> | bucket | host ms |
+> |---|---|
+> | ids download | 1 |
+> | **CPU-share arm + stall** | **9,361** |
+> | **the grouping loop itself** | **15** |
+> | plan tables | 5 |
+> | cpu pool + stager job build | 1 |
+> | **copy issue (incl. `stager->wait`)** | **8,132** |
+>
+> **The grouping loop costs 15 ms out of 17.5 s.**  The ledger's `host grouping` bucket is 52.8 % of host because
+> it is charged to the phase that was *open*, and what is open there is the CPU-share arm's setup and whatever
+> the host blocks on - the code's own comment at that spot says it: "a stall here is the GPU (this layer's
+> attention and router, or the previous layer's work), not the host".  Optimising "the grouping" was chasing a
+> name; there is nothing there.
+>
+> What the split does show is the shape of the problem: **the host and the GPU take turns instead of
+> overlapping.**  Per layer-chunk the host stalls 24 ms on the GPU (bucket 2), then spends 21 ms issuing copies
+> while the GPU idles (`wait copy` device 2,985 ms, host 7,535 ms from the same window).  Two waits that
+> alternate, each idle while the other works.  That is the same diagnosis prefill.cpp already records for the
+> copy path ("the engine is idle ~85 % of the time, i.e. the copies are ring-starved, not link-bound") - and it
+> is a *scheduling* defect, not a kernel one.
+>
+> The fix is to stop the alternation: the host should be building layer L+1's grouping and issuing L+1's copies
+> while the GPU computes layer L, so neither side ever waits.  That is a change to the layer loop's structure
+> (the prompt path already has the pieces - the staging ring, `Stager`, `warm_prev` - but drives them
+> synchronously per layer).  It is worth up to the smaller of the two buckets, ~8 s, i.e. prefill 230 -> ~450
+> tok/s if it can be made to overlap cleanly, which is the whole remaining gap to the ~430 reference.
+>
+> `STRATA_PREFILL_HOSTPROF=1` ships as the instrument (off by default, no cost).
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
