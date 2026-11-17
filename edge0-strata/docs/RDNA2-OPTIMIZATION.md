@@ -956,6 +956,45 @@ So the reference targets are not arbitrary: **430 prefill is ~12 % of the prefil
 ceiling of the current residency design.**  Decode beyond ~114 needs a card with more VRAM or a faster link; prefill
 beyond ~1000 needs the A-stage redesign in 8e plus uniform 3.4x.
 
+
+### 8h. A stage: the spills were the cost, occupancy is measured DEAD - single-buffered staging is the default
+
+The A-stage tile double-buffered BOTH its weight staging (`2*256*80 = 40,960 B`, 80 % of the 51,456 B dynamic smem)
+and its activation staging.  Single-buffering them (`lat_q3k_fused_gu_kernel<SINGLE>`, `STRATA_A_SINGLE_BUF`) leaves
+`WROWS`, `kItems`, `ra`, `rb`, the dp4a body and the accumulation order untouched - only where the staged bytes sit
+changes - so the product is bit-identical (verified: the 32-token output string is identical across both arms and both
+repeats).
+
+    arm                                regs  scratch   smem    blocks/cu  gate/up ms        prefill tok/s
+    two buffers (control)              213     96     51,456       1       4,498 / 4,474     301.23 / 300.69
+    single buffer  <- THE DEFAULT      164      0     25,856       1       4,317 / 4,304     302.51 / 302.64
+    single + __launch_bounds__(512, 8) 128     96     25,856       2       4,476 / 4,474     301.41 / 301.27
+
+Three conclusions, in order of how much they should change future work:
+
+1. **The gain is the spills, not the occupancy.**  Single-buffering removes all 96 B of scratch (213 -> 164 regs) and
+   measures `gemm gate/up` **-3.9 %** (4,486 -> 4,311 ms mean).  That is the whole win and it is what shipped.
+2. **Occupancy is measured DEAD.  Do not chase it again.**  `__launch_bounds__(LTHREADS, 8)` on the single-buffer form
+   reaches **blocks/cu = 2 and waves/cu = 32 of 64 - a genuine doubling** - and measures 4,476 / 4,474 ms and
+   301.41 / 301.27 tok/s, i.e. **-0.2 %, inside noise**.  The register cap that buys the second block re-creates the
+   spills (scratch back to 96) and hands the entire spill win back.  Combined with the earlier "regs 153 vs 256 and
+   4 vs 6 waves identical" and "-6.2 % instructions = 0 % time", the A stage is now triply shown not to be
+   fill/occupancy/issue-count limited at the margins available.
+3. **The LDS-cliff hypothesis was WRONG, and this is the measurement that says so.**  The claim was that 51,456 B of
+   smem blocks a second block per CU, so dropping under 32 KiB would double occupancy.  Measured: smem 30,976 B
+   (2 x that = 61,952 <= 65,536) and then **25,856 B, 39 % of the CU's 64 KiB - and blocks/cu was STILL 1.**  Reducing
+   LDS never buys a block; the binding term is the register budget, and it only moves when registers are capped.  So
+   the "reduce the live weight rows to cross the cliff" redesign would have crossed nothing.
+
+What is left for this block (~4,300 ms = 32 % of prefill) is therefore the dependent LDS chain and MAC density:
+2,115 instructions carry 128 dp4a = **6 % MAC density**, and at 0.71 T MAC/s the stage runs 3.3 % of the measured
+21.8 T MAC/s.  Neither fill, occupancy, registers, staging pattern (`STRATA_A_RDNA`/`STRATA_A_NAT` flat at
+4,444-4,509) nor bytes explains that; an instruction-mix change (hoisting the per-4-value rescale to 16-value blocks,
+and attributing the 72 `v_div_scale_f32` in an int8 body) is the untested head of the fishbone.
+
+Gates for the shipped default: 4k `301.23/300.69 -> 302.51/302.64`; 8k chunk 832 `341.43/340.00 -> 343.94/343.31`;
+512K + MTP exit 0, tokens `715 1822 363 313`, cache 872 slots; 32-token output identical in every arm.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a

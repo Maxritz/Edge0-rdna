@@ -82,8 +82,34 @@ constexpr int kTileRows = 64;
 constexpr int kXqRow = 1440;           // 40 q8_1 blocks of 36 B
 constexpr int kHqRow = 800;            // a staged H row: 10 chunks of 80 B (n_ff / 32 = 20 blocks)
 
-inline size_t lat_smem_bytes() {
-    return (size_t) 2 * WROWS * LWPITCH + (size_t) 2 * kTileRows * LAPITCH + (size_t) kTileRows * 4;
+// SINGLE = one staged weight buffer.  2*256*80 = 40,960 B of weights is 80 % of the 51,456 B dynamic smem, and
+// 2 x 51,456 does not fit a 64 KiB CU LDS - so the driver reports blocks/cu=1 and the launch occupies 16 of 64
+// waves.  Halving the weights to 20,480 makes the whole tile 30,976 B, which fits TWICE in 64 KiB: two blocks per
+// CU, 32 of 64 waves.  WROWS, kItems, ra, rb and the dp4a body do NOT change, and neither does the accumulation
+// order, so the product stays bit-identical - only where the staged bytes sit changes.
+inline size_t lat_smem_bytes(bool single = false) {
+    // SINGLE also aliases the two activation slots (the same argument as the weights), which takes the tile from
+    // 30,976 to 25,856 B - well clear of the 32 KiB half-CU mark, so LDS *allocation granularity* cannot be what
+    // keeps blocks/cu at 1 either.
+    return (size_t) (single ? 1 : 2) * WROWS * LWPITCH +
+           (size_t) (single ? 1 : 2) * kTileRows * LAPITCH + (size_t) kTileRows * 4;
+}
+
+// The single-buffered staging is the DEFAULT: it removes all 96 B of spills (regs 213 -> 164, scratch 96 -> 0) and
+// measures 4,298 / 4,304 ms on gemm gate/up against 4,484 / 4,506 for the two-buffer form (-4.2 %), with identical
+// output.  STRATA_A_SINGLE_BUF=0 selects the two-buffer control for an A/B inside one binary.
+//
+// OCCUPANCY IS MEASURED DEAD HERE, so do not chase it again.  Single-buffering also lets this tile fit two blocks per
+// CU (smem 51,456 -> 25,856, blocks/cu 1 -> 2, waves/cu 16 -> 32 of 64) provided the register budget is capped to 128
+// via __launch_bounds__(LTHREADS, 8).  Measured at that setting: gemm gate/up 4,476 / 4,474 ms and prefill
+// 301.41 / 301.27, against 4,484 / 4,506 and 301.51 / 302.10 for the one-block form - i.e. DOUBLING the occupancy is
+// -0.2 %, and the register cap costs back the spill win (scratch returns to 96).  The A stage is not fill-limited.
+inline bool lat_a_single_buf() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_A_SINGLE_BUF");
+        return e == nullptr ? true : std::atoi(e) != 0;
+    }();
+    return v;
 }
 
 // 16 bytes at p as four words; `sh` is 0 or 16, from the row's 2-byte misalignment (550 B rows)
@@ -160,6 +186,7 @@ __device__ __forceinline__ GuStaged lat_gu_decode(const uint8_t* blk, int kb, in
 }
 
 // ---- the kernel: 128 gate rows and their up rows per work item ------------------------------------------------
+template <bool SINGLE>
 __global__ void __launch_bounds__(LTHREADS, 1)
 lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* __restrict__ starts, int n_groups,
                         const uint8_t* __restrict__ xq, uint8_t* __restrict__ hbuf,
@@ -173,11 +200,14 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
     int* srow;
     {
         uint8_t* const base = smem;
+        // SINGLE aliases both weight slots and both activation slots onto one buffer each.  `kb & 1` stays in
+        // the loop either way, so the body is unchanged - it just resolves to the same address twice.
         wst[0] = base;
-        wst[1] = base + WROWS * LWPITCH;
-        ast[0] = base + 2 * WROWS * LWPITCH;
-        ast[1] = base + 2 * WROWS * LWPITCH + kTileRows * LAPITCH;
-        srow = (int*) (base + 2 * WROWS * LWPITCH + 2 * kTileRows * LAPITCH);
+        wst[1] = base + (SINGLE ? 0 : WROWS * LWPITCH);
+        ast[0] = base + (SINGLE ? 1 : 2) * WROWS * LWPITCH;
+        ast[1] = ast[0] + (SINGLE ? 0 : kTileRows * LAPITCH);
+        srow = (int*) (base + (SINGLE ? 1 : 2) * WROWS * LWPITCH +
+                       (SINGLE ? 1 : 2) * kTileRows * LAPITCH);
     }
 
     const bool a_nat = g_a_nat != 0;    // STRATA_A_NAT: natural dp4a staging (1) or the historical permuted order (0)
@@ -257,7 +287,7 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
 
             load_chunk(0);
             store_chunk(0);
-            if (kChunks > 1) load_chunk(1);
+            if (!SINGLE && kChunks > 1) load_chunk(1);   // SINGLE decodes the next chunk in the loop tail
             const bool on0 = nb0 < nrows, on1 = nb0 + 8 < nrows;
             // float2 accumulators on purpose: RDNA2 has packed fp32 (v_pk_fma_f32), so the per-sub-block scaling
             // runs two lanes of math a instruction.  Packed fp32 FMA is IEEE per lane, so this is bit-identical to
@@ -354,8 +384,12 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                 }
                 __syncthreads();
                 if (kb + 1 < kChunks) {
+                    // SINGLE has one buffer, so the next chunk must be decoded AFTER this chunk's maths (the
+                    // barrier above guarantees it) instead of during it.  That lost overlap is the whole cost of
+                    // the second block per CU - it is the trade this arm measures.
+                    if (SINGLE) load_chunk(kb + 1);
                     store_chunk(kb + 1);
-                    if (kb + 2 < kChunks) load_chunk(kb + 2);
+                    if (!SINGLE && kb + 2 < kChunks) load_chunk(kb + 2);
                 }
             }
             if (!on0) continue;
@@ -703,16 +737,26 @@ void lat_q3k_fused(const uint8_t* const* blob, const int32_t* starts, int n_grou
     if (n_groups <= 0 || blob == nullptr || starts == nullptr || xq == nullptr || hbuf == nullptr || out == nullptr)
         return;
     // (not a static initializer: ROCm's amdgcn-link rejects an LDS address taken in one)
-    static bool smem_set = false;
-    if (!smem_set) {
-        dck(cudaFuncSetAttribute(lat_q3k_fused_gu_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 (int) lat_smem_bytes()), "smem");
-        smem_set = true;
+    const bool a_single = lat_a_single_buf();
+    static bool smem_set[2] = {false, false};
+    if (!smem_set[a_single ? 1 : 0]) {
+        if (a_single) {
+            dck(cudaFuncSetAttribute(lat_q3k_fused_gu_kernel<true>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int) lat_smem_bytes(true)), "smem");
+        } else {
+            dck(cudaFuncSetAttribute(lat_q3k_fused_gu_kernel<false>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int) lat_smem_bytes(false)), "smem");
+        }
+        smem_set[a_single ? 1 : 0] = true;
     }
     const int sms = lat_sms();
     const unsigned gy = (unsigned) std::min(n_groups, 512);
     const unsigned gz = (sms > 0 && (int) (gy * kItems) < sms) ? 8u : 1u;
-    lat_info((const void*) lat_q3k_fused_gu_kernel, (unsigned) kItems, gy, gz, LTHREADS, lat_smem_bytes());
+    lat_info(a_single ? (const void*) lat_q3k_fused_gu_kernel<true>
+                      : (const void*) lat_q3k_fused_gu_kernel<false>,
+             (unsigned) kItems, gy, gz, LTHREADS, lat_smem_bytes(a_single));
     {   // STRATA_A_NAT=0 pins the historical permuted staging (the A/B arm); default is the natural order.
         static const int a_nat_env = [] { const char* v = std::getenv("STRATA_A_NAT"); return v != nullptr ? std::atoi(v) : 1; }();
         static bool a_nat_set = false;
@@ -720,11 +764,14 @@ void lat_q3k_fused(const uint8_t* const* blob, const int32_t* starts, int n_grou
     }
     static const bool a_rdna = [] { const char* v = std::getenv("STRATA_A_RDNA");
         return v != nullptr && std::atoi(v) != 0; }();
-    if (a_rdna) {   // RDNA-first: weights read once per (s,i), reused across both n halves
-        lat_q3k_fused_gu_kernel_rdna<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
+    if (a_single) {   // STRATA_A_SINGLE_BUF=1: one weight buffer, two blocks per CU (the occupancy arm)
+        lat_q3k_fused_gu_kernel<true><<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(true), (cudaStream_t) stream>>>(
+            blob, starts, n_groups, (const uint8_t*) xq, (uint8_t*) hbuf, counts, ent_tok);
+    } else if (a_rdna) {   // RDNA-first: weights read once per (s,i), reused across both n halves
+        lat_q3k_fused_gu_kernel_rdna<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(false), (cudaStream_t) stream>>>(
             blob, starts, n_groups, (const uint8_t*) xq, (uint8_t*) hbuf, counts, ent_tok);
     } else {
-        lat_q3k_fused_gu_kernel<<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(), (cudaStream_t) stream>>>(
+        lat_q3k_fused_gu_kernel<false><<<dim3((unsigned) kItems, gy, gz), LTHREADS, lat_smem_bytes(false), (cudaStream_t) stream>>>(
             blob, starts, n_groups, (const uint8_t*) xq, (uint8_t*) hbuf, counts, ent_tok);
     }
     dck(cudaGetLastError(), "launch gu+swiglu+q8_1");

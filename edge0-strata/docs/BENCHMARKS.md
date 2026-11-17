@@ -16,10 +16,10 @@ or in the commit message that introduced it.  Nothing in this file is an estimat
 ## Shipped state
 
 ```
-prefill @ --max-context 4096    301.97 / 301.00 tok/s     (borrows the prompt loan, chunk 512)
-prefill @ --max-context 8192    341.43 / 340.00 tok/s     (owns its buffers, chunk 832 - the new default)
+prefill @ --max-context 4096    302.51 / 302.64 tok/s     (borrows the prompt loan, chunk 512)
+prefill @ --max-context 8192    343.94 / 343.31 tok/s     (owns its buffers, chunk 832 - the new default)
 decode   @ 4096                  30.82 / 30.88 tok/s       (spec 6 / min-p 0.3; 27.3-29.5 at spec 4 / 0.5)
-512K + MTP                       exit 0, tokens 715 1822 363 313, prefill 64.59, decode 12.21
+512K + MTP                       exit 0, tokens 715 1822 363 313, prefill 64.00, decode 12.22
 ```
 
 Reference targets for this engine: **~430 tok/s prefill, 62.4 tok/s decode**.  So the shipped state is ~1.4x short on
@@ -36,6 +36,7 @@ prefill and ~2.2x short on decode.
 | 5 | **prompt path owns its buffers above 4k context** (option finalisation) | 8192-context prefill **94.95/90.25 → 265.21/264.59 (+179 %)**; 4k unchanged at 302.5 |
 | 6 | **own-buffers chunk = the traffic minimum just under expert saturation (832, not 2048)** | 8192 prefill **265.21/264.59 → 341.43/340.00 (+28.7 %)**; 4k unchanged; chunk 1024 collapses to 213.37 because it saturates all 512 experts per chunk |
 | 7 | **speculative window swept** (documented config, not a default) | decode **28.2 → 30.82/30.88 tok/s (+9.5 %)** at `--spec 6 --spec-min-p 0.3`; surface is sharply interactive (spec 4/0.3 is worse; spec 8/0.2 is 11.78) |
+| 8 | **single-buffered A-stage staging** (removes all 96 B of spills; `STRATA_A_SINGLE_BUF=0` selects the control) | `gemm gate/up` **4,486 → 4,311 ms (−3.9 %)**, regs 213 → 164, scratch 96 → 0; prefill 4k **301.0 → 302.6**, 8k **341.4 → 343.9**; bit-identical output. Occupancy was chased too and is **dead**: `__launch_bounds__(512,8)` reaches blocks/cu=2, waves 32/64, and measures **−0.2 %** |
 
 Earlier kernel-level wins that stand (committed before this file):
 
