@@ -1588,6 +1588,46 @@
 > Remaining device items, in order: A stage 5,387 (30.5 %), gdn 3,086 (17.5 %), gemm down 1,146 (6.5 %), gather
 > 972 (5.5 %), hc read down+silu 681 (3.9 %), qsa attn 633 (3.6 %).
 
+> ### 0.47 The A stage's occupancy, measured: 256 VGPRs at the cap with 28 spills, and both occupancy controls are inert
+>
+> The number the last three turns kept quoting for `lat_q3k_fused.cu` ("193 VGPRs, 4 waves/SIMD") was wrong - it
+> belongs to a different variant.  Compiled directly for gfx1031 with the resource pass:
+>
+> ```
+> clang ... --offload-arch=gfx1031 -O3 -Rpass-analysis=kernel-resource-usage -c src/prefill/lat_q3k_fused.cu
+>   src/prefill/lat_q3k_fused.cu:145:  TotalSGPRs: 41
+>                                      VGPRs: 256
+>                                      Occupancy [waves/SIMD]: 4
+>                                      SGPRs Spill: 0
+>                                      VGPRs Spill: 28
+> ```
+>
+> **256 VGPRs is the architectural maximum**, and the kernel is *already spilling 28 registers at that ceiling*.
+> It is not a kernel with room to trade registers for occupancy - it has exceeded the file and is paying local
+> memory for the overflow.
+>
+> And neither occupancy control does anything on this card.  Both were changed, rebuilt and re-measured; the
+> report is byte-identical in all three cases:
+>
+> | variant | VGPRs | spills | waves/SIMD |
+> |---|---|---|---|
+> | `__launch_bounds__(512, 1)` (shipped) | 256 | 28 | 4 |
+> | `__launch_bounds__(512, 2)` | 256 | 28 | 4 |
+> | `__launch_bounds__(512, 2)` + `__attribute__((amdgpu_waves_per_eu(8)))` | 256 | 28 | 4 |
+>
+> So the CUDA-style second parameter is ignored by AMD codegen exactly as the tree's earlier notes said, **and the
+> AMD-specific `amdgpu_waves_per_eu` hint is ignored too** - the allocator's behaviour bounds both.  The only way
+> left to change occupancy is to make the algorithm need fewer live registers, which is what the blunt
+> `amdgpu_num_vgpr(128)` attempt tried and paid for: 234 spills and 2.4x slower (0.22).
+>
+> The A stage is therefore **closed to configuration**, and open only to algorithmic restructuring: 5,387 ms at
+> ~1.7 TFLOP/s (14 % of fp32 peak), 256 VGPRs, 28 spills, 4 waves/SIMD, single kernel, 22.7 KB of Q3_K decode with
+> a frozen-SHA reference and byte-exactness requirements.  That is a multi-day kernel rewrite, not a knob - and it
+> is the largest single item in the engine (30.5 % of prefill device time), so it is the right thing for a
+> dedicated session with the byte-exact harness (`lat_q3k_fused_test`, which exists) as the gate.
+>
+> Reverted: both edits were no-ops and are not in the tree.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
