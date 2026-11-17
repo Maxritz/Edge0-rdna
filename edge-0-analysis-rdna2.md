@@ -1967,6 +1967,38 @@
 >
 > Diagnostic (`STRATA_GEMM_SPLIT=1`, first 40 calls, off by default) ships.
 
+> ### 0.58 `gdn` attributed at kernel granularity: it is 100 % the matmul; dequant and widen are both excluded
+>
+> The synced pair of 0.57 could not say which of the two holds the ceiling, so each GPU region is now timed
+> separately (`STRATA_GEMM_SPLIT=1` covers `native()`'s dequant-vs-gemm *and* `f16_inplace()`'s matmul-vs-widen).
+> Layer 0, T=512:
+>
+> | region | qkv (N=10240 K=2560) | gate (N=6144) | ssm_out (N=2560 K=6144) | alpha/beta (N=48) |
+> |---|---|---|---|---|
+> | dequant | 10.25 first touch, **0.22 steady** | 0.22 | 0.23 | - |
+> | **matmul** | **6.68 ms** | **3.19** | **1.16** | 0.40 / 0.34 |
+> | widen | 0.26 | 0.18 | 0.13 | 0.10 / 0.11 |
+> | gemm total | 6.97 | 3.39 | 1.31 | - |
+>
+> **The matmul is 97 % of each GEMM and the widen is 3.7 %; the dequant is a first-touch artefact (0.22 ms a
+> call in steady state).**  Both of the components that could have been ours are excluded, and the 4.09 TFLOP/s
+> ceiling lives inside the one call that is not ours: `cublasGemmEx` (hipBLASLt) or rocBLAS's tuned kernel.
+>
+> That also closes the loop on the three earlier guesses.  Was it the instruction (0.53)?  No - the call is a
+> library matmul.  The tiling (0.55)?  No - three implementations agree.  The dequant (0.56)?  No - 0.79 ms a
+> layer.  The component is the vendor matmul, full stop, and the direct measurement says so where the FLOP/time
+> ratio did not.
+>
+> **What that leaves, stated as the next real step and not as a conclusion**: a faster GEMM here means beating
+> rocBLAS/hipBLASLt on gfx1031, with a proper kernel.  This tree's dot2 kernel matches the library at both tiles
+> but sits ~4x below its own instruction-issue bound (16 dot2 per 8 LDS implies ~0.67 of peak, i.e. ~16 TFLOP/s,
+> against the 4.09 measured), which is the signature of a *barrier/dependency* limit rather than an issue limit -
+> the k-slab does two `__syncthreads()` per 32 k.  I am deliberately recording that as a hypothesis to measure,
+> **not** to implement, because three consecutive inferences about this stage have already been refuted by the
+> next measurement and the pattern is unambiguous: only the instrument has been reliable here.
+>
+> Shipped default verified after the instrumentation: output byte-identical, decode 20.93, prefill 234.51 tok/s.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

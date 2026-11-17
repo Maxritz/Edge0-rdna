@@ -1322,21 +1322,45 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     return true;
 }
 #endif
+// STRATA_GEMM_SPLIT=1 (diagnostic): each GPU-side region of a dense projection timed separately and synced, so the
+// stage can be ATTRIBUTED.  Used by native() (dequant vs gemm) and by f16_inplace (matmul vs widen); the synced
+// pair alone could not say which of the two holds a ceiling.  First 60 regions only, off by default.
+struct GemmSplitTrace {
+    bool on = std::getenv("STRATA_GEMM_SPLIT") != nullptr;
+    int n = 0;
+    template <typename F>
+    void operator()(const char* what, F&& fn, int64_t T, int64_t N, int64_t K) {
+        if (!on || n >= 60) { fn(); return; }
+        (void) cudaDeviceSynchronize();
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        (void) cudaDeviceSynchronize();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "gemm split: #%d %-7s T=%lld N=%lld K=%lld %.2f ms\n", ++n, what, (long long) T,
+                     (long long) N, (long long) K, ms);
+    }
+};
+GemmSplitTrace g_split;
+
 void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
 #if defined(__HIPCC__)
     const float one = 1.0f, zero = 0.0f;
     bool done = false;
+    g_split("matmul", [&] {
 #if defined(STRATA_ROCBLAS_AVAILABLE)
-    done = try_rocblas_f16o(rocblas_state_, X, W, Y, T, N, K, ldy);   // the table's kernel for this shape, if any
+        done = try_rocblas_f16o(rocblas_state_, X, W, Y, T, N, K, ldy);   // the table's kernel for this shape, if any
 #endif
-    if (!done) {
-        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W,
-                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy),
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
-           "cublasGemmEx f16 out");
-    }
+        if (!done) {
+            ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W,
+                            CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy),
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+               "cublasGemmEx f16 out");
+        }
+    }, T, N, K);
     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
-    widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
+    g_split("widen", [&] {
+        widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
+    }, T, N, K);
     if (dbg_nan) {   // debug only: a sync per GEMM
         unsigned long long bad = 0, zero_count = 0;
         (void) hipStreamSynchronize((hipStream_t) stream_);
@@ -1464,20 +1488,8 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     // STRATA_GEMM_SPLIT=1 (diagnostic, the first 40 calls): the dequant into scratch against the GEMM that
     // follows it, each synced, so the gdn window's 3,078 ms can be ATTRIBUTED instead of inferred from FLOPs -
     // 0.53 and 0.55 both inferred it and both were wrong (0.56: three GEMM implementations, identical time).
-    static const bool gsplit = std::getenv("STRATA_GEMM_SPLIT") != nullptr;
-    static int gsplit_n = 0;
-    auto gs_time = [&](const char* what, const std::function<void()>& fn) {
-        if (!gsplit || gsplit_n >= 40) { fn(); return; }
-        (void) cudaDeviceSynchronize();
-        const auto t0 = std::chrono::steady_clock::now();
-        fn();
-        (void) cudaDeviceSynchronize();
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "gemm split: #%d %-7s T=%lld N=%lld K=%lld %.2f ms\n", ++gsplit_n, what, (long long) T,
-                     (long long) N, (long long) K, ms);
-    };
-    gs_time("dequant", [&] { strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_); });
-    gs_time("gemm", [&] { f16(X, scratch_, Y, T, N, K, ldy, beta); });
+    g_split("dequant", [&] { strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_); }, T, N, K);
+    g_split("gemm", [&] { f16(X, scratch_, Y, T, N, K, ldy, beta); }, T, N, K);
 }
 
 }  // namespace strata::prefill
