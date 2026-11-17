@@ -1311,6 +1311,49 @@ cache/traffic effect above.
     a round against the 2.3-3.0 achieved.  The reference's 62.4 is, to within 1 %, this box's own PCIe link ceiling
     (62.9) at zero residency - so the reference saturates its link in decode and we run it at ~48 % duty.
 
+
+### 8p. The draft-head collapse is a DESYNC at one round, not a slow drift - and the p1 trace proves it
+
+Section 8m said the collapse (3x decode loss, ~1 run in 5) was "run-level draft-head state, nothing has isolated it".
+`STRATA_SPEC_TRACE=<file>` writes one line per round - `T accepted sfx round_ms p1..pN` - and diffing a good run against
+a collapsed one from the same binary (6 trials, 1 collapsed) locates it exactly.
+
+**The two runs are identical for 19 rounds, then split at one event.**  First 19 window choices, in order:
+
+    good (tr2)  1 1 1 1 1 1 1 1 2 4 3 3 3 4 3 3 4 4 3 | 2 4 4 4 3 3 4 4
+    bad  (tr5)  1 1 1 1 1 1 1 1 2 4 3 3 3 4 3 3 4 4 3 | 1 1 1 1 1 1 1 4 1 4 1 1 1 3 1 4 ... 1
+
+At round 19 both runs chose the SAME window (T=3) with the same-looking draft probability (p1 0.701 vs 0.723); the good
+run accepted 2 rows and the bad run accepted 0.  That is the whole divergence - after it the runs have committed
+different token sequences and never re-converge.
+
+**And after that split the draft head is confidently WRONG, which is the diagnostic.**  The bad run does keep choosing
+wide windows whenever p1 clears the 0.5 gate, and accepts **zero** rows on every one of them:
+
+    round   27    29    33    35    37    40    42
+    T        4     4     3     4     3     2     4
+    p1    0.899 0.596 0.823 0.725 0.759 0.889 0.989
+    accepted 0     0     0     0     0     0     0
+
+    wide-round acceptance:   good 1.89/round (36 of 19)     bad 0.89/round (16 of 18), 0 on every wide round after 19
+
+A draft head that reports p1 = 0.99 for a token the target then rejects is not tunned badly - it is conditioning on the
+wrong state.  Since the two runs agree for 19 rounds and differ only after an accepted-count mismatch, the mechanism is
+a **drafter K/V desync at the first round where the accepted count differs**, after which every draft is conditioned on a
+stale prefix.  The `T=1` latch that makes it cost 3x is a *symptom*: with drafts useless, p1 sits below the 0.5 gate in
+29 of 47 rounds, so no drafting happens at all and each round buys one token at a full T=1 window price.
+
+**The engine already has the recovery path, and it is the thing to test:**
+`STRATA_MTP_CATCHUP_ALL=1` - "catches the drafter's K/V up for the whole verified window, rejected rows included"
+(mtp.cpp:74).  If the default catch-up skips rejected rows and that is what desyncs the drafter, enabling it should
+either remove the collapse or measurably cut its rate.
+
+**An A/B of that was attempted and is INVALID, recorded so it is not mistaken for a result:** 8 runs per arm were
+launched while the context sweep still held the GPU, and all 16 died at
+`cudaMalloc(1538625024) ... failed (out of memory): 10676 MiB of 12272 MiB VRAM free` during the weight arena - i.e.
+VRAM contention from a concurrent engine, not the flag.  The experiment is queued for when the GPU is free, and must be
+scored as a RATE (collapses per N runs), not a single pair, because the defect is stochastic.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
