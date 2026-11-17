@@ -39,7 +39,7 @@ All of these are byte-identical output unless marked, and all but the last keep
 | 2 | **CPU-rows U on `latent_u_grouped`** instead of `latent_u_matvec` (`verify.cpp`) | per-stage | `u: matvec` **14.60 → 11.05 ms (-24.3 %)**, window -3.7 to -4.1 ms |
 | 3 | **`unroll 1` on the A-stage `s` loop** (`lat_q3k_fused.cu`) | 256 VGPR / 28 spills / 4 waves → **153 / 0 / 6** | `gemm gate/up` **5,386 → 4,756 ms (-11.7 %)** |
 | 4 | **Activation words hoisted out of the `i` loop** (`lat_q3k_fused.cu`) | 64 → 40 LDS per (s,n) | `gemm gate/up` **4,738 → 4,614 ms (-2.6 %)** |
-| 5 | **Packed-fp16 dense GEMM** (`dot2_gemm.cu`, `V_DOT2_F32_F16`) replacing rocBLAS on gfx103x | qkv call **6.94 → 3.20 ms (2.17x)**; 4.09 → **8.39 TFLOP/s** | `gdn` **3,074 → 1,696 ms (-44.8 %)**, prefill **231.4 → 261.86 tok/s (+13.2 %)**, profiler-off, chunk 512 auto |
+| 5 | **Packed-fp16 dense GEMM** (`dot2_gemm.cu`, `V_DOT2_F32_F16`) replacing rocBLAS on gfx103x, **128x128 tile** | qkv call **6.94 → 2.84 ms (2.44x)**; 4.09 → **9.46 TFLOP/s** | `gdn` **3,074 → 1,546 ms (-49.7 %)**, prefill **231.4 → 254.7 tok/s (+10.1 %)**, profiler off, chunk 512 auto |
 
 Cumulative prefill on the default config: **165.92 → 261.86 tok/s (1.58x)**.  Decode: **~20 tok/s**, unchanged by
 all of the above (see §6 for why).
@@ -81,7 +81,7 @@ Both conclusions were artefacts of the bug.
 | **Removing 53 spills in the down kernel** | 256 → 144 VGPR, 4 → 7 waves | `gemm down` 1,144 → 1,145/1,166 ms — **nothing** |
 | **Stream priority** (`STRATA_MTP_HIP_PRIO=1`) | decode 20.60/20.91 vs 21.03/19.27 | inside noise |
 | **`STRATA_PF_GEMM=1` / `STRATA_WMMA_GEMM=1`** on gfx103x | `gdn` 3,079 / 3,084 vs 3,075/3,082 | both decline (need the gfx11 WMMA product) |
-| **dot2 tile 128x128** (64 acc, 4:1 vs 2:1) | `gdn` 3,074/3,077 vs 3,073/3,075 | flat — measured while the kernel was not launching (§5.1) |
+| **dot2 tile 128x128** (64 acc, 4:1 vs 2:1) | **RETESTED after the launch bug was fixed**: qkv 3.17 → **2.84 ms**, gate 1.96 → 1.81; `gdn` 1,702 → **1,545 ms (-9.2 %)**, prefill 249.7 → 251.9 (profiler on), output byte-identical in all four arms | **wins — 128x128 is the shipped tile.**  The earlier "flat" reading was an artefact of §5.1 (the kernel was not launching), which is exactly why a measurement taken through a suspected-broken code path must be re-run |
 
 Two lessons from the bottom rows: **spill count is not predictive** (removing 53 bought nothing, while the
 A-stage's 28-spill removal had come with an unroll change that was the actual cause), and **occupancy is not the
@@ -184,7 +184,7 @@ and cannot touch DMA time — so a high-priority "compute" queue cannot fix expo
 | **A stage** `gemm gate/up` | ~4,600 ms (~27 % of device) | 153 VGPR / 0 spills / 6 waves; NOT register-, spill- or occupancy-limited, and 37 % fewer LDS bought only 2.6 %.  Needs real kernel work, not tuning. |
 | **exposed DMA** | **2.98 s** of `wait copy` = 73.5 GB at 24.6 GB/s | staging ≥ 1 layer ahead needs ~166 ring slots (193 MB) vs the 80 that fit on 12 GiB.  Measured trade, not a knob. |
 | **decode D/U tables** | ~4.7 GB/round at **103-168 GB/s** of a 170 GB/s ceiling | **Q4_0** halves the bytes → ~20 → ~26 tok/s.  **Approved by the owner; the KL/NLL quality gate does not exist and must be built first.** |
-| dot2 GEMM beyond 8.39 TFLOP/s | qkv 3.20 ms, 34 % of fp16 peak | deeper k-slab (fewer barriers), more blocks; the 128×128 tile was flat *while the kernel wasn't launching*, so retest it now. |
+| dot2 GEMM beyond 9.46 TFLOP/s | qkv 2.84 ms at 128x128, 38 % of fp16 peak | the tile scan is not exhausted (256x128, deeper k-slab for fewer barriers, 8-16 accumulators more per thread); each step is one constant and one alternating pair |
 | decode dense GEMVs | 18.25 ms | same dot2 machinery applies (decode is a different kernel shape). |
 
 Decode is at the memory rate for its byte volume: hc read ~26.7 ms, latent D/U ~4.7 GB/round, and the pool wait
