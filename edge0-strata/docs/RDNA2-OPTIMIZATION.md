@@ -108,6 +108,32 @@ Audited by grep over `src/` + `include/` (72 `__builtin_amdgcn_*` occurrences in
 | wave32 | default | `warpSize == 32` |
 | Infinity Cache | implicit | 480 GB/s on a resident stream |
 
+**Measured, not assumed - the SHIPPED device ELFs dumped and counted.** `tools/rdna2/isa_extract.py` pulls the
+`.hip_fat` section (COFF truncates `.hip_fatbin` to 8 bytes) and splits the clang offload bundle into its 79
+gfx1031 ELFs; `tools/rdna2/isa_mix.py` histograms a dump per kernel.
+
+| kernel | instructions | **VOPD** | **v_pk_/v_dual** | dp4a | notes |
+|---|---|---|---|---|---|
+| `latent_u_tile_k` (U *and* the tile D) | 2,509 | **0** | **0** | 512 (20 %) | ~300 VALU on 64-bit address math (99 `v_add_co_u32` + 99 `v_add_co_ci_u32` + 97 `v_lshlrev_b64`) |
+| `lat_q3k_fused_gu_kernel` (A stage, 4,562 ms) | 2,115 | **0** | **0** | 128 | 312 scalar FP (`v_fma_f32` 124 + `v_fmac_f32_e32` 88 + `v_mul_f32_e32` 100) and **72 `v_div_scale_f32`** |
+| `latent_u_tile_s_k` | 692 | **0** | **0** | 16 | 309 scalar `s_*`, incl. 64 `s_nop` |
+| `bf16_f32_dot2_*` (decode GEMVs) | 166-1,171 | **0** | **0** | 1-8 | |
+
+RDNA2's two "more work per instruction" features are **entirely unused** engine-wide - and both are available to
+this target: hand-written asm compiled for gfx1031 emitted cleanly,
+
+```
+v_dot8_i32_i4   v1, v1, v2, v3     <- 8 int4 MACs in one instruction: the Q4_0 nibble layout DIRECTLY
+v_pk_fma_f32    v2, v1, v1, v3     <- two packed fp32 FMAs in one instruction
+v_dual_fmac_f32 v3, v2, v1         <- the VOPD dual-issue form itself
+```
+
+`v_dot8_i32_i4` ranks first: the Q4 path unpacks 16 nibble bytes to 32 s8 codes and then runs `v_dot4c_i32_i8`
+(4 MACs), so it pays for the unpack *and* runs at half density.  dot8 consumes the nibbles as-is at 8 MACs a
+instruction - ~2x density, no unpack, on a kernel now on both the latent U and D hot paths.  Expect 25-30 % fewer
+instructions; whether that becomes time depends on issue-bound vs the memory rate (latent D/U measures 103-168
+GB/s of a 170 GB/s ceiling).
+
 **Unused and worth knowing:** `v_pk_*` packed arithmetic in general (only `v_dot2` is used); explicit
 `ds_read*`/`ds_write*` and LDS bank swizzle (LDS is used implicitly through `__shared__`); GDS append/consume.
 
