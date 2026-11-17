@@ -242,13 +242,18 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                 if (on0) {
                     const uint8_t* wc8 = wst[kb & 1];
                     const uint8_t* ac = ast[kb & 1];
+#pragma unroll 1
                     for (int s = 0; s < 4; ++s) {
+#if !defined(__HIPCC__)
                         uint32_t bq[2];
+#endif
                         float dx0[2], dx1[2];
                         for (int n = 0; n < 2; ++n) {
                             if (n == 1 && !on1) break;
                             const uint8_t* ar = ac + (size_t) (nb0 + 8 * n + mg) * LAPITCH;
+#if !defined(__HIPCC__)
                             bq[n] = *(const uint32_t*) (ar + 16 * s + 4 * tig);
+#endif
                             const half2 ds0 = *(const half2*) (ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 64);
                             const half2 ds1 = *(const half2*) (ac + (size_t) (nb0 + 8 * n + 2 * tig + 1) * LAPITCH + 64);
                             dx0[n] = __half2float((s & 2) ? ds0.y : ds0.x);
@@ -257,8 +262,14 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                         for (int i = 0; i < 4; ++i) {
                             const int ra = 32 * wf + 8 * i + mg;          // the gate row (its up row is ra + 128)
                             const int rb = ra + 128;
+#if !defined(__HIPCC__)
                             const uint32_t a0 = *(const uint32_t*) (wc8 + (size_t) ra * LWPITCH + 16 * s + 4 * tig);
                             const uint32_t a1 = *(const uint32_t*) (wc8 + (size_t) rb * LWPITCH + 16 * s + 4 * tig);
+#else
+                            // the RDNA2 path below reads its operands from the staged tile directly, so a0/a1 and
+                            // bq[] are dead here.  They are not computed at all: at 256 VGPRs with 28 spills every
+                            // live value costs a spill slot (0.47).
+#endif
                             const float da = *(const float*) (wc8 + (size_t) ra * LWPITCH + 64 + 4 * s);
                             const float db = *(const float*) (wc8 + (size_t) rb * LWPITCH + 64 + 4 * s);
                             for (int n = 0; n < 2; ++n) {
@@ -272,9 +283,6 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                                 // 16 codes a lane does not hold are read from the staged tile, which holds
                                 // the same bytes the mma's fragments were built from; int32 adds are exact,
                                 // so the result is bit-identical to the CUDA tensor-core path.
-                                (void) a0;
-                                (void) a1;
-                                (void) bq[n];
                                 const uint32_t* wa = (const uint32_t*) (wc8 + (size_t) ra * LWPITCH + 16 * s);
                                 const uint32_t* wb = (const uint32_t*) (wc8 + (size_t) rb * LWPITCH + 16 * s);
                                 const uint8_t* ar0 = ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 16 * s;

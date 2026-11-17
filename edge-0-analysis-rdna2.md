@@ -1628,6 +1628,41 @@
 >
 > Reverted: both edits were no-ops and are not in the tree.
 
+> ### 0.48 SHIPPED, -11.7 % on the prefill A stage: unrolling the s-loop removed all 28 VGPR spills
+>
+> The 28 spills 0.47 measured are gone, and they were worth more than the occupancy argument they came with.
+> One line - the inner `s` loop of the gate/up kernel, which was fully unrolled - plus removing values that were
+> dead on the RDNA2 path:
+>
+> | variant | VGPRs | spills | waves/SIMD | `gemm gate/up` | prefill |
+> |---|---|---|---|---|---|
+> | `unroll 4` (was shipped) | 256 | **28** | 4 | 5,386 / 5,387 ms | 231.75 / 231.39 |
+> | `unroll 2` | 201 | 0 | 4 | 4,770 / 4,783 | 238.91 / 238.77 |
+> | **`unroll 1` (shipped)** | **153** | **0** | **6** | **4,756 / 4,758** | **238.62 / 238.64** |
+>
+> `gemm gate/up` **-11.7 %** (5,386 -> 4,756 ms), prefill **+2.9 %**, 32-token output byte-identical in every
+> arm, and `run_512k_mtp.ps1 -Embed 1` exits 0 with `output : 715 1822 1822 1822` - unchanged.
+>
+> What made it work, and what did not:
+>
+> * **Occupancy attributes are inert** (0.47): `__launch_bounds__(512,2)` and `amdgpu_waves_per_eu(8)` both left
+>   the allocation at 256 VGPRs / 28 spills.  Nothing that *asks* for fewer registers works.
+> * **Removing dead values did nothing on its own**: on the RDNA2 path `a0`, `a1` and `bq[]` exist only for the
+>   CUDA `mma` asm and are `(void)`-ignored, yet guarding them out left the report at 256 / 28 - the compiler had
+>   already eliminated them.  They are still guarded out (correct, and free), just not the cause.
+> * **`unroll N` is the real register control on this toolchain.**  4 -> 2 drops 55 VGPRs and all 28 spills;
+>   2 -> 1 drops another 48 and takes occupancy from 4 to 6 waves/SIMD.  The spills were the fully-unrolled
+>   nest's address arithmetic, not the math: the `acc[4][2][4]` accumulators and the dp4a sequence are untouched,
+>   and the `s` order is preserved, which is why the output stays bit-identical.
+> * `unroll 1` and `unroll 2` are equal in throughput (4,757 vs 4,776 ms average) despite 153 vs 201 VGPRs, so
+>   the extra occupancy buys nothing *here* - but it is the lower-pressure choice at equal speed and it is what
+>   ships.
+>
+> A note on the last stretch's ceiling: 0.46 put prefill's recoverable time at ~2.99 s of exposed transfer and
+> said the compute needed a 1.56x kernel campaign.  This is the first instalment of the latter - 0.63 s of the
+> A stage, found in one line rather than a rewrite - and it confirms that the A stage has room.  The remaining
+> gap to 430 is still mostly the A stage's 4.76 s plus the 2.98 s of transfer.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
