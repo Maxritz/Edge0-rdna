@@ -259,21 +259,32 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                             dx0[n] = __half2float((s & 2) ? ds0.y : ds0.x);
                             dx1[n] = __half2float((s & 2) ? ds1.y : ds1.x);
                         }
-                        for (int i = 0; i < 4; ++i) {
-                            const int ra = 32 * wf + 8 * i + mg;          // the gate row (its up row is ra + 128)
-                            const int rb = ra + 128;
+                        for (int n = 0; n < 2; ++n) {
+                            if (n == 1 && !on1) break;
+                            // The activation words depend on (n, s, tig) ONLY - not on i - so they are loaded once
+                            // here and reused by all four i.  They used to be fetched inside the i loop, which made
+                            // 32 of the 64 shared loads per (s, n) the same eight words re-read four times.  0.51
+                            // showed this kernel is not register-, spill- or occupancy-limited, so instructions are
+                            // the only lever left.  Every acc[i][n][q] still accumulates over s and kb in the same
+                            // order, so the result stays bit-identical.  Measured adjacent to the un-hoisted build:
+                            // gemm gate/up 4,589 / 4,639 against 4,717 / 4,759 ms (-2.6 %).
+                            const uint8_t* ar0 = ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 16 * s;
+                            const uint8_t* ar1 = ar0 + LAPITCH;
+                            int b0v[4], b1v[4];
+#pragma unroll
+                            for (int kw = 0; kw < 4; ++kw) {
+                                b0v[kw] = (int) *(const uint32_t*) (ar0 + 4 * kw);
+                                b1v[kw] = (int) *(const uint32_t*) (ar1 + 4 * kw);
+                            }
+                            for (int i = 0; i < 4; ++i) {
+                                const int ra = 32 * wf + 8 * i + mg;          // the gate row (its up row is ra + 128)
+                                const int rb = ra + 128;
 #if !defined(__HIPCC__)
-                            const uint32_t a0 = *(const uint32_t*) (wc8 + (size_t) ra * LWPITCH + 16 * s + 4 * tig);
-                            const uint32_t a1 = *(const uint32_t*) (wc8 + (size_t) rb * LWPITCH + 16 * s + 4 * tig);
-#else
-                            // the RDNA2 path below reads its operands from the staged tile directly, so a0/a1 and
-                            // bq[] are dead here.  They are not computed at all: at 256 VGPRs with 28 spills every
-                            // live value costs a spill slot (0.47).
+                                const uint32_t a0 = *(const uint32_t*) (wc8 + (size_t) ra * LWPITCH + 16 * s + 4 * tig);
+                                const uint32_t a1 = *(const uint32_t*) (wc8 + (size_t) rb * LWPITCH + 16 * s + 4 * tig);
 #endif
-                            const float da = *(const float*) (wc8 + (size_t) ra * LWPITCH + 64 + 4 * s);
-                            const float db = *(const float*) (wc8 + (size_t) rb * LWPITCH + 64 + 4 * s);
-                            for (int n = 0; n < 2; ++n) {
-                                if (n == 1 && !on1) break;
+                                const float da = *(const float*) (wc8 + (size_t) ra * LWPITCH + 64 + 4 * s);
+                                const float db = *(const float*) (wc8 + (size_t) rb * LWPITCH + 64 + 4 * s);
                                 int d[4] = {0, 0, 0, 0};
 #if defined(__HIPCC__)
                                 // RDNA2 has no matrix cores, so the m16n8k16 s8 product above is four signed
@@ -285,16 +296,12 @@ lat_q3k_fused_gu_kernel(const uint8_t* const* __restrict__ blob, const int32_t* 
                                 // so the result is bit-identical to the CUDA tensor-core path.
                                 const uint32_t* wa = (const uint32_t*) (wc8 + (size_t) ra * LWPITCH + 16 * s);
                                 const uint32_t* wb = (const uint32_t*) (wc8 + (size_t) rb * LWPITCH + 16 * s);
-                                const uint8_t* ar0 = ac + (size_t) (nb0 + 8 * n + 2 * tig) * LAPITCH + 16 * s;
-                                const uint8_t* ar1 = ar0 + LAPITCH;
 #pragma unroll
                                 for (int kw = 0; kw < 4; ++kw) {
-                                    const int b0 = (int) *(const uint32_t*) (ar0 + 4 * kw);
-                                    const int b1 = (int) *(const uint32_t*) (ar1 + 4 * kw);
-                                    d[0] = __dp4a((int) wa[kw], b0, d[0]);
-                                    d[1] = __dp4a((int) wa[kw], b1, d[1]);
-                                    d[2] = __dp4a((int) wb[kw], b0, d[2]);
-                                    d[3] = __dp4a((int) wb[kw], b1, d[3]);
+                                    d[0] = __dp4a((int) wa[kw], b0v[kw], d[0]);
+                                    d[1] = __dp4a((int) wa[kw], b1v[kw], d[1]);
+                                    d[2] = __dp4a((int) wb[kw], b0v[kw], d[2]);
+                                    d[3] = __dp4a((int) wb[kw], b1v[kw], d[3]);
                                 }
 #else
                                 asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "

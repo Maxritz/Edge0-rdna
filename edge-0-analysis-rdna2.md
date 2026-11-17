@@ -1744,6 +1744,36 @@
 > Anything that is going to move them has to change the work: fewer instructions per weight, or fewer weight
 > bytes - not the allocation.
 
+> ### 0.52 SHIPPED: the activation words were being re-read 4x - hoisted out of the `i` loop, -2.6 % on the A stage
+>
+> 0.51 left one lever: instructions, not allocation.  The inner loop had a straight redundancy.  `ar0`/`ar1` and
+> therefore the eight activation words `b0`/`b1` are functions of `(n, s, tig)` only - **not of `i`** - yet they
+> were loaded inside the `i` loop, so the same eight shared words were fetched four times per `(s, n)`:
+>
+> ```
+> LDS per (s, n):   i(4) x kw(4) x (2 act + 2 w) = 64   ->   kw(4) x 2 act  +  i(4) x kw(4) x 2 w  = 40
+> ```
+>
+> Swapping the `i` and `n` loops and hoisting the eight words drops 24 of those 64 shared loads (37 %).  Every
+> `acc[i][n][q]` still accumulates over `s` and `kb` in the same order, so the output is bit-identical.
+>
+> Measured **adjacent** to the un-hoisted build, because this kernel's batch-to-batch drift is +-6 % and a
+> separated comparison cannot resolve 2 %:
+>
+> | build | `gemm gate/up`, 2 arms | mean |
+> |---|---|---|
+> | hoisted | 4,589 / 4,639 ms | **4,614** |
+> | un-hoisted, rebuilt and run immediately after | 4,717 / 4,759 ms | **4,738** |
+>
+> **-2.6 %** on the A stage, with the within-batch spread only +-25 ms.  VGPRs 153 -> 213 (the eight words are now
+> live across the unrolled `i` loop), still 0 spills; occupancy 6 -> 4 waves/SIMD, which 0.50/0.51 showed is worth
+> nothing here.  32-token output byte-identical, and `run_512k_mtp.ps1 -Embed 1` exits 0 with
+> `output : 715 1822 1822 1822`.
+>
+> Prefill as a whole barely moves (124 ms of 17,000), and the honest framing is that this is a *small* win: the
+> A stage is 4.6 s of dp4a work whose remaining cost is the arithmetic itself, not the loads.  Removing 37 % of
+> the shared traffic bought 2.6 %, which is the measure of how little of the stage was LDS-bound.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
