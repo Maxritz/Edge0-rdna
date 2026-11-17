@@ -1901,6 +1901,40 @@
 > `hipDeviceProp_t::gcnArchName` comes back **empty on Windows HIP**, so the arch test has to use
 > `major/minor` (10.3 = gfx103x).  The launcher now prints which path it took, once.
 
+> ### 0.56 A 4x wider GEMM tile changes nothing either - so `gdn` is not limited by the GEMM at all
+>
+> 0.55 ended on "the tiling, not the instruction, was never the limit", so the tiling was widened and measured.
+> 128 x 128 a block with 8 x 8 accumulators a thread raises the dot2-to-LDS ratio from 2:1 to 4:1:
+>
+> | arm | `gdn` |
+> |---|---|
+> | dot2 64 x 64 (16 acc, 2:1) | 3,073 / 3,075 ms |
+> | dot2 128 x 128 (64 acc, 4:1) | 3,074 / 3,077 ms |
+> | rocBLAS | 3,074-3,085 ms |
+>
+> **Three implementation/tiling combinations, identical to the millisecond.**  Both tiles pass
+> `hip_gemm_f16_io_parity` with the same rel-L2 (again format-dominated), and all four arms' 32-token output
+> matched the baseline byte-for-byte - which also retires 0.55's worry about the one diverging arm: with three
+> more arms clean, that divergence was the box's late-arm corruption, not this kernel.
+>
+> So `gdn`'s 3,078 ms is **not** the GEMM: not its instruction, not its tiling, not rocBLAS vs ours.  Two
+> inferences in a row were wrong here (0.53's "packed fp16 is the lever", 0.55's "tiling is the limit"), and
+> the pattern behind both is the same mistake - reasoning from the stage's FLOPs to its time without measuring
+> the stage's own interior.  The arithmetic says 43.2 GFLOP a layer / 10.7 ms = 4.0 TFLOP/s, but if the GEMM
+> is invariant across three implementations then the 10.7 ms is not all GEMM, and the FLOP/time ratio was
+> describing something that is not the dominant term.
+>
+> **The next step is the one that settled the host window (0.44): instrument inside the `gdn` window.**  Its four
+> calls (`native_proj` qkv, `native_proj` gate, `bf16_proj` alpha, `bf16_proj` beta) each do a dequant into
+> scratch followed by the GEMM, and the `w16_` weight cache that would amortise the dequant is gated on
+> `free_vram > bytes + 2 GiB`, which **fails on this box** (~1.8 GiB free) - so every layer-chunk dequantizes the
+> whole weight again.  That is the obvious suspect and it is the same shape of defect as 0.44's: a large cost
+> attributed to the wrong component.  Buckets to add: dequant, GEMM, and the bf16 alpha/beta pair.
+>
+> Shipped: the dot2 GEMM stays **opt-in** (`STRATA_GEMM_DOT2=1`, tile via `STRATA_GEMM_DOT2_TILE`).  Default
+> verified: output byte-identical, decode 20.65, and `run_512k_mtp.ps1 -Embed 1` exits 0 with
+> `output : 715 1822 1822 1822`.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
