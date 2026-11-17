@@ -1461,6 +1461,39 @@ formulation: a 4096-aligned base and a range covering the blob, rather than a pe
 canonical run (`--prefill 832`, 4k, 43,774 blobs) is **351.5 tok/s**; anything near 110 on the same workload means the
 card is throttled and the window must be discarded.
 
+
+### 8t. WITHDRAWN: 8r's "buffer-resource loads are 1.7-3.0x faster" was measuring ZERO-FILL, not data
+
+`tools/rdna2/probe_bufcheck.cpp` reads the same bytes two ways and compares the VALUES (no timing, so clock state
+cannot corrupt it):
+
+    words compared 8800   differing 8800
+    FIRST DIFF at word 0: flat=5e3914ef   srsrc=00000000
+    VERDICT: FORMULATION WRONG
+
+**The descriptor path returns zero for every single word.** A buffer load returning 0 for an in-range offset is the
+out-of-bounds result, so the descriptor as I built it is not addressing the memory at all.  Which means:
+
+  * 8r's 91.60 vs 30.25 Gvalues/s at 64 rows was not "3x faster loads" - it was **loading nothing**.  Zero-fill is
+    cheap, and the accumulated XOR of zeros is a perfectly optimisable loop, which is exactly why the "buffer" arm
+    looked flat in working-set size: it never touched the working set.
+  * the engine port's WRONG 32-token output (8s) is fully explained: it was multiplying by zeros.
+  * the 4096-aligned-base + 1 MiB-range correction does NOT rescue it; the failure is in the descriptor itself.
+
+**So the buffer-resource lead is withdrawn in full.**  The rule that caught it is worth keeping: a timing probe must
+compare VALUES against the reference path, not just report a rate.  `probe_bufcheck.cpp` now exists for that and would
+have saved two builds and a wrong engine edit.
+
+What would be needed to re-open it: a known-good srsrc example for gfx1031 (the `config` word and the base encoding are
+the suspects - `0x110000` was taken from HipKittens without verifying what its OOB_SELECT/stride bits do on RDNA2), and
+`probe_bufcheck` must report IDENTICAL before any timing is looked at again.
+
+**This leaves the A stage with no live lead.**  Everything measured on `gemm gate/up` (3,738-4,311 ms, 3.4 % of the
+dp4a peak) is flat: fill, occupancy (32/64 waves), registers (164, scratch 0), smem (25,856), staging order, bytes, and
+now the addressing mode.  What remains untested there is the instruction MIX itself - 2,115 instructions carrying 128
+`dp4a` = 6 % MAC density, with 128 cvt and ~72 `v_div_scale_f32` in an int8 body - which is a different kind of work
+from everything above.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
