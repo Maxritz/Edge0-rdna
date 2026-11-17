@@ -275,10 +275,23 @@ Prefill ledger, same binary, only the table changed:
 | **total** | **23,970** | **15,533** | **+8,437** |
 
 The regression lands in the **expert-stream phases**, not in a latent row, and `wait copy` *falls* - the shape of
-a stall charged to whichever phase is open, not of extra expert work.  Mechanism to verify: the fast latent
-kernels are **fmt==8-only** (`latent_u_runs` and the dense entries early-return on `fmt != 8`; fmt==4 block
-readers exist only in the slower per-column/matvec paths), so `STRATA_LATENT_DENSE_FMT=4` routes the D/U products
-onto the generic path per chunk.  Fix = extend the fast kernels to fmt 4, not add a fourth product.
+a stall charged to whichever phase is open, not of extra expert work.
+
+**CONFIRMED from the code, not inferred.**  The Q4 table silently loses the fast U path:
+
+* `latent_u_tiled` / `latent_u_tiles`: `if (n <= 0 || fmt != 8 || ...) return;` - they refuse fmt 4 outright;
+* `latent_u_tile_k` (the tiled kernel they launch): `const size_t wrowb = (size_t)(ELL / 32) * 34;  // a Q8_0
+  weight row` - **the block stride is hardcoded to Q8 and the kernel takes no `fmt` parameter at all**;
+* the `fmt == 4 ? 18 : 34` branches exist only in the *per-column* kernels (latent.cu:80 and :788), not in the
+  tile path.
+
+So with `STRATA_LATENT_DENSE_FMT=4` prefill drops to `latent_u_grouped` at 5,120 rows instead of the tiled kernel -
+which is exactly what the two runs' own log line said (`rows=5120` vs `rows=10`; the log prints once per process,
+so they had reached *different kernels*).  The fix is to give `latent_u_tile_k` a `fmt` and a Q4 block unpack
+(16 nibble bytes -> 32 int8 codes, `(b&0xF)-8` and `(b>>4)-8`, staged into the same int8 layout) and relax the two
+guards - not to add a fourth product.  That is a contained kernel change that needs its own verification cycle:
+the Q8 path's byte layout must stay untouched, `kl_gate.py` (1.25e-3 floor) is the quality gate, and the 32-token
+output plus `run_512k_mtp.ps1` are the regression gates.
 
 It also corrected the geometry a third time: **ELL = 1280**, not 1792 (48 x 55,705,600 B = the file exactly, and
 the kernel logs `ELL=1280`), so D/U traffic is **2.67 GB a round**, not 4.7.
