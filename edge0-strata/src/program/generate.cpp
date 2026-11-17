@@ -3925,7 +3925,27 @@ int main(int argc, char** argv) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         // 0.2.8 Strix Halo: the gfx1151 rule above chose a chunk that fits this box; the "keep them small" 2048 would throw
         // the whole 8K prompt back into 4 chunks (measured: 2048 against 8192 costs ~26% of an 8K prompt on this box).
-        o.prefill_chunk = o.prefill_own_keep_chunk ? o.prefill_chunk : 2048;
+        // THE OWN-BUFFERS CHUNK IS A MEASURED OPTIMUM, NOT "KEEP THEM SMALL".  The old 2048 was chosen to
+        // keep the reserved buffers small, but 2048 reserves 160 + 2048*680/1024 = 1,520 MiB and starves the
+        // expert cache to ~225 slots, which costs far more than the bytes it saves.  Measured on this box at
+        // --max-context 8192 (4063-token prompt, Q4 table, alternating pairs, loan held constant):
+        //     chunk  512: 60,338 blobs, 1,141 slots -> 287.98 / 296.26 tok/s
+        //     chunk  640: 54,320 blobs, 1,064 slots -> 311.91 / 312.43
+        //     chunk  768: 48,171 blobs,   988 slots -> 325.73 / 318.88
+        //     chunk  832: 42,514 blobs,   950 slots -> 341.17 / 341.72 / 341.75 / 339.01
+        //     chunk  896: 42,606 blobs,   911 slots -> 339.21
+        //     chunk  960: 41,837 blobs,   873 slots -> 332.08
+        //     chunk 1024: 80,785 blobs,   833 slots -> 213.37   <- SATURATION CLIFF, not a cache cliff
+        // The traffic minimum is NOT the largest chunk: at 1024 tokens a chunk routes nearly every one of the
+        // 512 experts, so distinct-per-chunk jumps and blobs nearly double (41.8k -> 80.8k).  The minimum sits
+        // just under expert saturation, at ~832, and it wins because it improves BOTH terms at once - 30 % fewer
+        // blobs than 512 and 1.9x the cache slots of 2048.  Deeper pipelining was measured and is NEUTRAL here
+        // (--prefill-pipe 2/3 and STRATA_PREFILL_RING 1024/2048: 339.0-342.0, and `wait copy` is already only
+        // 585-623 ms = 4.4 % at this chunk), so the chunk alone captures the win.
+        // Bounded to the regime that was measured: an explicit profile plus the own-buffers rule above.
+        const bool own_chunk_measured = o.no_prefill_borrow && !o.expert_profile.empty() &&
+                                        o.max_context > 4096 && o.max_context <= 65536;
+        o.prefill_chunk = o.prefill_own_keep_chunk ? o.prefill_chunk : (own_chunk_measured ? 832 : 2048);
     }
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};

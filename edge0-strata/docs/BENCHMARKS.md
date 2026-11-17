@@ -16,10 +16,10 @@ or in the commit message that introduced it.  Nothing in this file is an estimat
 ## Shipped state
 
 ```
-prefill @ --max-context 4096    302.48 / 302.41 tok/s     (borrows the prompt loan)
-prefill @ --max-context 8192    265.21 / 264.59 tok/s     (owns its buffers - the new default)
-decode   @ 4096                  27.5 / 24.0 tok/s        (window ~71 ms, round ~77 ms)
-512K + MTP                       exit 0, tokens 715 1822 363 313, prefill 65.03, decode 12.17
+prefill @ --max-context 4096    301.97 / 301.00 tok/s     (borrows the prompt loan, chunk 512)
+prefill @ --max-context 8192    341.43 / 340.00 tok/s     (owns its buffers, chunk 832 - the new default)
+decode   @ 4096                  30.82 / 30.88 tok/s       (spec 6 / min-p 0.3; 27.3-29.5 at spec 4 / 0.5)
+512K + MTP                       exit 0, tokens 715 1822 363 313, prefill 64.59, decode 12.21
 ```
 
 Reference targets for this engine: **~430 tok/s prefill, 62.4 tok/s decode**.  So the shipped state is ~1.4x short on
@@ -34,6 +34,8 @@ prefill and ~2.2x short on decode.
 | 3 | **VRAM-cliff guard** (conditional reserve floor; the cache was parked past a cliff) | shipped default **91.03 → 289.51/294.95 tok/s** (a 3.2x collapse that produced CORRECT output, so no output check could see it) |
 | 4 | **pcie-frac default 0.55 → 0.40** for HIP native packs | decode 25.72/27.33 → **29.19/29.28** at fixed cost; 512K decode 11.52 → 12.30 |
 | 5 | **prompt path owns its buffers above 4k context** (option finalisation) | 8192-context prefill **94.95/90.25 → 265.21/264.59 (+179 %)**; 4k unchanged at 302.5 |
+| 6 | **own-buffers chunk = the traffic minimum just under expert saturation (832, not 2048)** | 8192 prefill **265.21/264.59 → 341.43/340.00 (+28.7 %)**; 4k unchanged; chunk 1024 collapses to 213.37 because it saturates all 512 experts per chunk |
+| 7 | **speculative window swept** (documented config, not a default) | decode **28.2 → 30.82/30.88 tok/s (+9.5 %)** at `--spec 6 --spec-min-p 0.3`; surface is sharply interactive (spec 4/0.3 is worse; spec 8/0.2 is 11.78) |
 
 Earlier kernel-level wins that stand (committed before this file):
 

@@ -814,6 +814,148 @@ Consequences, all of which should have been applied before spending a turn instr
 before touching the protocol.  The candidate fix is `hipStreamWaitValue32` (HIP-FIRST-AUDIT.md section 2), which
 needs an edit and therefore a real dev loop.
 
+
+## 8. 2026-11-17 - three-way debate, reversed roofline, and the chunk optimum
+
+Three independent analyses (RDNA2 ISA implementer, memory/scheduling, architecture principles) produced nine
+recommendations.  Four died on measurement inside the same session.  This section records what survived, what the
+hardware arithmetic says the targets actually are, and the two measured wins that came out of chasing it.
+
+### 8a. The prefill ledger CLOSES - the "missing 20 %" was a wrapped log
+
+The memory analysis reported 10,739 ms of named stages against a 13,400 ms timeline and made "reconcile the ledger"
+its top item.  The table is printed across four wrapped lines; reading all of them, the 25 stages sum to EXACTLY
+13,400 ms.  Nothing is hidden.  What it does show is a larger D/U chain than the notes carried:
+
+    gather 908 + gemm down 1086 + down+silu 654 + up 295 = 2,943 ms (22.0 %)
+
+not the ~2,000 previously attributed to it, so the latent MoE chain is gate/up 4,426-4,675 + D/U 2,943 = **7.4-7.6 s
+of 13.4 s (55-57 %)**.  Reading a wrapped log is the same trap class as the profiler labels in section 6g.
+
+### 8b. "Move fewer bytes" is REFUTED as a prefill lever
+
+With the loan held constant (8k, both arms owning), fewer bytes measured SLOWER:
+
+    8k chunk  512: 60,338 blobs -> 287.98 / 296.26 / 301.97 tok/s
+    8k chunk 2048: 48,710 blobs -> 263.99 / 264.69
+
+Traffic and time are not monotonically related, because the chunk also sets the prompt reserve
+(`160 + chunk*680/1024` MiB) and therefore the expert cache.  A byte argument that ignores the cache is incomplete.
+
+### 8c. The chunk optimum is a TRAFFIC MINIMUM just under expert saturation - 832
+
+8k, own buffers, 4063-token prompt, Q4 table, alternating pairs:
+
+| chunk | cache slots | blobs | prefill |
+|---|---|---|---|
+| 256 | 1,292 | 99,117 | 205.69 |
+| 384 | 1,226 | 75,783 | 246.18 |
+| 512 | 1,141-1,149 | 60,338 | 287.98 / 296.26 |
+| 640 | 1,064 | 54,320 | 311.91 / 312.43 |
+| 704 | 1,026 | 48,863 | 323.76 |
+| 768 | 973-988 | 48,171 | 325.73 / 318.88 |
+| **832** | **930-950** | **42,514** | **341.17 / 341.43 / 341.72 / 341.75 / 340.00** |
+| 896 | 911 | 42,606 | 339.21 |
+| 960 | 873 | 41,837 | 332.08 |
+| 1024 | 833 | 80,785 | **213.37** |
+
+The 1024 collapse is NOT a cache cliff - 833 slots still function at other chunks.  It is **expert saturation**: at
+1024 tokens a chunk routes nearly every one of the 512 experts, so distinct-per-chunk jumps and blobs nearly double
+(41.8k -> 80.8k).  The minimum therefore sits just under saturation (~832), and it wins because it improves BOTH
+terms at once: 30 % fewer blobs than 512 AND 1.9x the cache slots of 2048.  Shipped as the own-buffers default
+(generate.cpp option finalisation); 8k prefill **265.21 / 264.59 -> 341.43 / 340.00 (+28.7 %)**.
+
+### 8d. "Dual submission" / deeper pipelining is NEUTRAL at the chunk optimum
+
+At chunk 832 the exposed DMA is already only 585-623 ms (4.4 %), against 1,360 ms at chunk 512:
+
+| arm | ring | `wait copy` | prefill |
+|---|---|---|---|
+| baseline | 310 | 623 | 339.01 / 341.75 |
+| `--prefill-pipe 2` | 309 | 588 | 341.42 |
+| `--prefill-pipe 3` | 299 | 603 | 340.78 |
+| `STRATA_PREFILL_RING=1024` | 308 | 585 | 341.61 |
+| `STRATA_PREFILL_RING=2048` | 308 | 594 | 341.98 |
+
+All within 1 %.  The ring will not exceed ~310 slots at this chunk regardless of the override, and the chunk has
+already absorbed the exposure a second in-flight chunk was meant to hide.  Two chunks in flight has nothing to buy.
+
+### 8e. The A stage: measured geometry, and why occupancy is at most a fifth of the deficit
+
+`STRATA_LAT_Q3K_INFO=1` reports the truth the ISA analysis could not know:
+
+    latq3kinfo gu: grid=(5,32,1) block=512 smem=51456 regs=213 scratch=96 blocks/cu=1 waves/cu=16 of 64
+
+* the grid is `kItems(5) x n_groups(32) x 1` = **160 blocks**, block = **512** threads (not 128 - the "20 waves /
+  12.5 % fill" claim assumed 128-thread blocks and a 1-group grid, so its 1.5-3x prediction is unanchored);
+* `blocks/cu = 1` because `lat_smem_bytes() = 2*256*80 (weights, 80 %) + 2*64*80 + 256 = 51,456 B`, and 2x that
+  exceeds the 64 KiB CU LDS -> **16 waves of 64 = 25 %**;
+* the cliff CANNOT be crossed by tuning: `WROWS=256` weight rows x 2 threads/row IS `LTHREADS=512`, so halving both
+  leaves waves/CU at 16, and 32 waves needs 512 weight rows = 92 KB of LDS.  It needs a tile redesign;
+* `scratch=96` = real spills;
+* arithmetic: 3.19 T MAC in 4,509 ms = **0.71 T MAC/s = 3.3 %** of the measured 21.8 T MAC/s dp4a probe.  At 25 %
+  occupancy the issue ceiling predicts 5.45 T MAC/s, so **occupancy explains at most 1/7.7 of the deficit** and the
+  rest is per-tile dependent latency (spills + the LDS chain), not fill.
+
+Staging pattern is flat and stays closed: 4,509 control / 4,444 `STRATA_A_RDNA=1` / 4,495 `STRATA_A_NAT=0` / 4,489
+control.
+
+### 8f. Decode: the speculative window is a real multiplier, and a fragile one
+
+Acceptance is 0.740-0.800, but the adaptive controller picks a window of ONE token in 9-12 of ~30 rounds, throwing the
+multiplier away.  Swept (decode 64, prompt64, min-p = the draft acceptance floor):
+
+| arm | decode | tokens/round |
+|---|---|---|
+| spec 4 / min-p 0.5 (the harness base) | 27.16 / 27.29 / 27.33 / 27.31 / 27.38 / 29.38 / 29.46 / 29.47 | 2.23-2.29 |
+| spec 5 / 0.2 | 28.85 | 2.71 |
+| spec 6 / 0.2 | 30.20 / 30.24 / 30.25 | 3.14 |
+| **spec 6 / 0.3** | **30.82 / 30.88** | **3.00** (accept 0.721) |
+| spec 6 / 0.35 | 26.73 | 2.72 |
+| spec 6 / 0.4 | 25.02 | 2.29 |
+| spec 6 / 0.0 | 26.40 | 3.05 |
+| spec 7 / 0.2 | 29.02 | 3.30 |
+| spec 8 / 0.2 | 11.78 | 2.21 |
+| spec 4 / 0.3 | 26.48 / 26.37 | 2.31 |
+
+So **spec 6 / min-p 0.3 = 30.82-30.88 against 28.2 mean base (+9.5 %)** - the first decode gain in several turns,
+and it is configuration, not a kernel.  It is NOT shipped as a default: `0.3` helps spec 6 and HURTS spec 4
+(26.4 vs 29.5), and `0.2` guts spec 8 (11.78), so the surface is sharply interactive; and the 512K + MTP gate pins
+`--spec 2`, which any global floor would move.  Documented as the decode configuration instead.
+
+**Instability to know about:** the same flags produced 10.88 tok/s once, with acceptance 0.103 (8 of 78) instead of
+0.721.  That is the spec path landing in a degenerate state, not timing noise - a separate defect worth chasing.
+
+### 8g. Reversed roofline - what 1000 tok/s prefill and 400 tok/s decode would require
+
+Prefill 1000 tok/s = 4063 tokens in 4.063 s (today 11.9 s at chunk 832):
+
+* traffic at the measured minimum (42,514 blobs x 1.16 MB = 49.3 GB) -> **17.2 GB/s = 61 % of the 28.0 GB/s link**;
+  a true single pass (48 x 512 x 1.16 MB = 28.5 GB) would be 7.0 GB/s = 25 %;
+* compute 3.19 T MAC at 21.8 T MAC/s = **146 ms**, i.e. 6 % of the dot peak over 4 s;
+* so 1000 tok/s is **not physically blocked** - it needs every one of the 25 stages to shrink 3.4x.  Both ceilings sit
+  far above the requirement, which is why the deficit is scheduling/tile shape, not arithmetic.
+
+Decode 400 tok/s = 2.5 ms/token:
+
+* one token routes 48 layers x 8 experts x 1.16 MB = **445 MB of weights**;
+* 445 MB / 2.5 ms = **178 GB/s sustained**, against a measured **28.0 GB/s** link and **372 GB/s** DRAM;
+* the link supplies 6.3 % of that, so **93.7 % must be VRAM-resident = 25.0 GiB** of the 26.66 GiB expert set, on a
+  **12 GiB** card.  **400 tok/s is arithmetically impossible here by ~2.1x**, regardless of kernel quality.
+
+The ladder that IS reachable:
+
+| decode | requires | status |
+|---|---|---|
+| 27-30 | today, link at ~45 % duty | shipped |
+| ~45 | remove the per-layer expert-blob latency tail | open, edit |
+| **62.9** | the link fully saturated at 0 % residency - **this is exactly the 62.4 reference target** | roof of the current design |
+| ~114 | 45 % residency (11.9 GiB of 26.66) + a saturated link | hardware roof |
+
+So the reference targets are not arbitrary: **430 prefill is ~12 % of the prefill roof, and 62.4 decode is the link
+ceiling of the current residency design.**  Decode beyond ~114 needs a card with more VRAM or a faster link; prefill
+beyond ~1000 needs the A-stage redesign in 8e plus uniform 3.4x.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
