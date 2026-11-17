@@ -1284,6 +1284,55 @@
 > tile, 8-16 rows, one block per label x column tile, ~150 blocks a layer - is still the right one and is still
 > not written.
 
+> ### 0.39 SHIPPED: the CPU rows' U on the grouped kernel, -24 % on that stage; and 0.38's arithmetic is CORRECTED
+>
+> **Correction first, because 0.38 was wrong.**  It used `lat_ELL_ = 2560`.  The real latent dimension is
+> **ELL = 1792** - latent.cu says so in the matvec's own shared-memory line (`nb*36 = 56*36, ELL=1792 (latent)
+> fixed`), and latent_dense.cpp:65-66 gives the authoritative formula:
+>
+> ```
+> d_bytes = G * ELL * (H/32) * 34     u_bytes = G * H * (ELL/32) * 34
+> G = 8, H (n_embd) = 2560, ELL = 1792, Q8_0 -> 34 B a 32-weight block
+> both = 8 * 1792 * 80 * 34 = 38,993,920 B = 37.19 MiB a layer  (not 53.1),  1.74 GiB a round (not 2.38)
+> ```
+>
+> So the corrected bandwidths, against a 170 GB/s ceiling:
+>
+> | stage | bytes/round | measured | implied | headroom |
+> |---|---|---|---|---|
+> | D | 1.74 GiB | 16.5 ms | **113 GB/s** | 34 % |
+> | `u: gemv` (GPU rows) | 1.74 GiB | 18.05 ms | 103 GB/s | 39 % |
+> | `u: matvec` (CPU rows) | 1.74 GiB | 14.62 ms | 128 GB/s | 25 % |
+>
+> **None of the three is at the ceiling.**  0.38's "the D stage is at the DRAM ceiling, only bit-width helps" is
+> therefore withdrawn: all three latent-table stages run at 60-75 % of the achievable rate, and there is real
+> per-kernel headroom that needs no quality gate and no new table format.  The bit-width argument still holds as
+> *an* additional lever, but it is not the only one.
+>
+> **The shipped win.**  verify.cpp's own note records the difference and never took it: `latent_u_matvec` "walks
+> every entry per block (81 GB/s effective)" while `latent_u_grouped` - the kernel the GPU rows already use -
+> reaches 126 GB/s, with a knob (`STRATA_VERIFY_U_CPU_GROUPED`) already present.  A/B, alternating pairs, U_PROF
+> open so slots 33/34/35 are visible, everything else identical:
+>
+> | arm | `u: matvec` (GDN + QSA) | window | decode |
+> |---|---|---|---|
+> | `latent_u_matvec` (was default) | 14.599 / 14.636 ms | 140.94 / 140.57 ms | 19.34 / 19.51 tok/s |
+> | **`latent_u_grouped` (now default)** | **11.045 / 11.241 ms** | **137.07 / 136.52 ms** | **20.39 / 20.13 tok/s** |
+>
+> **-24 % on the CPU rows' U, -3.7 to -4.1 ms a window, 32-token output byte-identical in all four arms.**  Both
+> kernels compute `U[labels[ids[r]]] . hq[r]` for the rows the pool owns, so this is a kernel swap, not an
+> approximation.  `STRATA_VERIFY_U_CPU_GROUPED=0` restores the old path.
+>
+> Verified on the shipped default with no env overrides: chunk 512, prefill 231.75 / 231.39, decode 18.76 / 21.12,
+> output byte-identical.  The decode end-to-end figure is noisy at `--max-new 32` (a 12 % spread between two
+> identical arms), which is exactly why the stage-level slot is the evidence of record here and the tok/s is not.
+> `run_512k_mtp.ps1 -Embed 1`: **exit 0 after 30 s, `output : 715 1822 1822 1822`** - unchanged.
+>
+> **What this leaves as the largest measured decode items, all with headroom:** `u: gemv` 18.05 ms at 103 GB/s,
+> D 16.5 ms at 113 GB/s, `u: matvec` 11.0 ms at ~168 GB/s (now the fastest), dense GEMVs 18.25 ms.  The
+> highest-value single change is now the same treatment for the *GPU rows'* U and the D stage: both are the same
+> `latent_u_grouped` / grouped-gather shape that just moved the CPU rows from 81 to 126 GB/s.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).

@@ -2584,9 +2584,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // blocks and walks every entry per block (81 GB/s effective), the grouped kernel is the one the
                 // GPU rows already use (126 GB/s).  Rows the GPU owns are computed from hq here - wrong values -
                 // but moe_hit_set ASSIGNS them from hit_out immediately after, so they never escape.
+                // Default GROUPED, not matvec.  Measured on gfx1031 in alternating pairs (STRATA_VERIFY_U_PROF
+                // open, everything else equal): the CPU rows' U is 11.045 / 11.241 ms on latent_u_grouped against
+                // 14.599 / 14.636 on latent_u_matvec (-24 %), the window 140.6 / 140.9 -> 136.5 / 137.1 ms, and
+                // decode 19.34 / 19.51 -> 20.39 / 20.13 tok/s, with the 32-token output byte-identical in all
+                // four arms.  This is the 81 -> 126 GB/s difference the note above records, finally taken.
+                // STRATA_VERIFY_U_CPU_GROUPED=0 restores latent_u_matvec.
                 static const bool u_cpu_grouped = [] {
                     const char* v = std::getenv("STRATA_VERIFY_U_CPU_GROUPED");
-                    return v != nullptr && v[0] == '1';
+                    return v == nullptr || v[0] != '0';
                 }();
                 if (u_cpu_grouped)
                     latent_u_grouped(lat_u_ + (size_t) l * lat_dense_.u_bytes(), (const uint8_t*) hq_dev_,
