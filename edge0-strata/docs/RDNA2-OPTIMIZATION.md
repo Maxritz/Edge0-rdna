@@ -216,6 +216,30 @@ pool's partial contributions to the combine, float atomics) - and it is worth no
 The dump captures the decode windows (positions past the prompt), which is exactly where a decode table lever
 lives.
 
+### 6b. The gate, validated and calibrated (the acceptance bound for a table change)
+
+Two runs of the **same** Q8 latent table, `--max-new 128`, compared on the coherent prefix:
+
+| sample | positions | KL mean | p50 | p95 | max | top-1 |
+|---|---|---|---|---|---|---|
+| `--max-new 16` | 16 | 1.193e-03 | 8.6e-05 | 5.58e-03 | 1.12e-02 | **100 %** |
+| `--max-new 128` | 87 | 1.248e-03 | 2.38e-04 | 6.03e-03 | 1.81e-02 | **100 %** |
+
+Two independent samples agreeing on the mean is what makes this a calibration.  The engine reproduces its
+*tokens* exactly (87/87 top-1) but is **not bitwise reproducible in its logits** (~1.2e-3 mean KL run to run).
+
+Two requirements for the harness, both learned the hard way:
+
+* **truncate at the first argmax divergence.**  The two runs are separate *generations*; once they pick different
+  tokens the contexts differ and later positions score different token streams.  Without truncation this run
+  reported mean 4.31e-02 / max 5.285 from a first flip at position 4151 — meaningless.  With it, 87 positions and
+  stable numbers.
+* `--max-context` must exceed prompt + `--max-new` (4096 cannot hold 4063 + 128), hence 8192 here.
+
+**Acceptance bound for Q4_0:** top-1 agreement is the reliable statistic; KL below ~1.2e-3 mean (6e-3 p95) is the
+engine's own noise and cannot distinguish a table change.  A Q4 latent-D table has to clear that, measured on the
+same truncated-prefix basis.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a

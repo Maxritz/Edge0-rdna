@@ -64,6 +64,8 @@ def main():
     ap.add_argument("--top1-min", type=float, default=0.99)
     ap.add_argument("--kl-max", type=float, default=0.01)
     ap.add_argument("--worst", type=int, default=5, help="print the N worst positions")
+    ap.add_argument("--keep-after-divergence", action="store_true",
+                    help="score the whole overlap even after the two runs pick different tokens (inflated)")
     args = ap.parse_args()
 
     a, b = read_records(args.a), read_records(args.b)
@@ -91,25 +93,41 @@ def main():
 
     kl_rows, top1_rows, worst = [], [], []
     bit_identical = True
+    diverged_at = None
     for p in common:
         ra, rb = ma[p], mb[p]
         if ra.shape != rb.shape:
             raise SystemExit(f"position {p}: shape {ra.shape} vs {rb.shape}")
+        if diverged_at is not None and not args.keep_after_divergence:
+            break                                    # contexts differ from here: the comparison is meaningless
         if not np.array_equal(ra, rb):
             bit_identical = False
         la, lb = log_softmax(ra), log_softmax(rb)
         kl = float((np.exp(la) * (la - lb)).sum())
+        agree = 1.0 if ra.argmax() == rb.argmax() else 0.0
+        if agree == 0.0:
+            diverged_at = p                        # do not score it: from here the token streams differ
+            break
         kl_rows.append(kl)
-        top1_rows.append(1.0 if ra.argmax() == rb.argmax() else 0.0)
+        top1_rows.append(agree)
         worst.append((kl, p, int(ra.argmax()), int(rb.argmax())))
 
     kl = np.asarray(kl_rows)
     t1 = np.asarray(top1_rows)
     worst.sort(reverse=True)
 
+    # TRUNCATION.  The two runs are separate generations; once the argmax differs the trajectories have split and
+    # every later position is scoring a different token stream (observed: a first flip at position 4151 turned the
+    # remaining "KL" into nonsense up to 5.29).  Only the positions before that are comparable, and that is the
+    # window the floor is measured in.
+    print(f"records {len(a)} vs {len(b)}; positions {len(ma)} vs {len(mb)}; common {len(common)}")
+    if diverged_at is not None:
+        print(f"first argmax divergence at position {diverged_at}; comparing the {kl.size} positions before it"
+              f"  (--keep-after-divergence to score the whole overlap anyway)")
     print(f"positions compared {kl.size}, vocab {nv}")
     print(f"bit-identical logits:      {'yes' if bit_identical else 'no'}")
     print(f"KL(a||b) mean / max:       {kl.mean():.6e} / {kl.max():.6e}")
+    print(f"KL p50 / p95:              {np.percentile(kl, 50):.6e} / {np.percentile(kl, 95):.6e}")
     print(f"top-1 agreement:           {t1.mean() * 100:.3f} %  ({int(t1.sum())}/{t1.size})")
     print("worst positions (KL, pos, argmax_a, argmax_b):")
     for w in worst[:args.worst]:
