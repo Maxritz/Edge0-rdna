@@ -1398,6 +1398,45 @@
 > So the plan changes: do not merge, write the decode tile.  It is a new kernel and it needs its own build,
 > alternating A/B and the 32-token gate, which is why it is not in this commit.
 
+> ### 0.42 Correction to 0.41: the decode U tile is worth ~20 %, not 10x - rows do not share weight slices
+>
+> 0.41 said a decode tile "reads the table once, 4.87 MB a layer instead of 48.7: about 10x less traffic".  That
+> is wrong, and the same source says so two lines from where I read the loop:
+>
+> ```
+> const int g = (e >= 0 && e < E) ? labels[e] : 0;          // latent_u_k, line 78
+> const uint8_t* w = u_q8 + (size_t) g * (size_t) H * (size_t) wrow;
+> const uint8_t* wb = w + (size_t) h * (size_t) wrow;       // the weight row is g's, not a row-independent one
+> ```
+>
+> **The weight slice is indexed by the routed row's GROUP**, so two rows can share a weight read only if they
+> route to the same group.  With cap ~10 rows spread over G = 8 groups, at most ~2 rows share, so the real ceiling
+> on a row-sharing tile is
+>
+>   distinct groups among 10 rows (<= 8) x H x ELL x 1.0625 = <= 39 MB  against the 48.7 MB read today
+>
+> i.e. **~20 % of the U stage, not 10x**: about 2 ms a round, not 27.  The prefill tile's neutral result is now
+> fully explained - there is almost no reuse to capture at 10 rows over 8 groups, which is also why the row-walk
+> variant measured 15 % slower in-engine rather than faster.
+>
+> So the U and D stages stand closed at Q8 on this geometry:
+>
+> | stage | irreducible traffic a round | measured | implied |
+> |---|---|---|---|
+> | D (20,480... 14,336 rows x 80 blocks x 34 B x 48) | 1.74 GiB | 16.5 ms | 113 GB/s |
+> | U, GPU rows | 1.74 GiB | 17.4 ms | 103 GB/s |
+> | U, CPU rows | 1.74 GiB | 11.0 ms | 168 GB/s |
+>
+> The 20-35 % of per-kernel headroom that 0.39 found is real but small in absolute terms (a few ms), and the
+> ~25 % that row-sharing could give is unavailable by construction.  **The only large decode lever left on these
+> tables is fewer bytes - Q4_0 - and that needs the KL/NLL quality gate this repo does not have.**  Everything
+> else in decode is now either at the memory rate (U CPU rows), within a few ms of it (D, U GPU rows), or blocked
+> on the pool (6.7 ms of wait, which 0.41 showed is the cheaper of the two schedules).
+>
+> **Therefore this stretch's decode thread is closed, and the objective's remaining headroom is prefill**: A stage
+> 5,298 ms at 29.9 % of device time, `wait copy` 2,530 ms, PLE blocked 1,562 ms, against 231.8 tok/s and a ~430
+> reference.  That is where the next work goes.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
