@@ -433,12 +433,19 @@ inline int stage_slots(size_t T) {
     // Ring depth itself is measured FLAT at a fixed chunk on this card - 96 / 80 / 112 slots give 235.34 /
     // 235.46 / 237.12 tok/s (0.8 % apart) - so the 16 slots cost nothing and buy the chunk.  A deeper ring is
     // still reachable with STRATA_STAGE_SLOTS, and a box with more free VRAM keeps picking 512 either way.
-    // 80.  MEASURED, TWICE, WITH OPPOSITE ANSWERS: a pinned A/B (`STRATA_STAGE_SLOTS` 80 vs 128, alternating pairs,
-    // tokens identical) gave wait copy 3,306/3,162 -> 2,410/2,522 ms and prefill 243.59/251.01 -> 264.96/263.19
-    // (+6.8 %); the SAME 80-vs-128 change driven in-engine from the cache's slot count gave 272.5/271.5 at 80 and
-    // 271.8/271.8 at 128, i.e. nothing.  So the depth is NOT a reproducible lever on this card and the default stays
-    // 80; `g_cache_slots` and the print below exist so it is never inferred from `wait copy` again.
-    const int base = env > 0 ? env : 80;
+    // DEPTH FROM THE CACHE, WITH THE REAL LEND TEST.  Measured same-binary, constant bytes, chunk 512:
+    //   ring  80: wait copy 3,168 / 3,159 ms, prefill 271.02 / 270.93 tok/s
+    //   ring 512: wait copy 1,765 / 1,761 ms, prefill 299.76 / 299.20 tok/s   (-44 % wait, +10.6 % prefill)
+    // with the SAME 62,926 streamed blobs and byte-identical output: pure latency hiding, not fewer bytes.
+    // The earlier "ring depth is flat" reading came from testing 80 vs 128 - a 60 % change in a 6.4x-too-small
+    // range (80 slots hold ~3.1 ms of a ~20 ms layer-chunk).  The binding test is the one the chunk scan uses,
+    // `chunk + ring + 128 <= slots`, so the Q4 table (1,910 slots) affords 512 while the Q8 one (720) affords 80
+    // and keeps the behaviour it was measured with.  Never a hardcoded box or harness pin: the cache decides.
+    const int from_cache = g_cache_slots > 0 ? g_cache_slots - (512 + 128) : 0;   // chunk 512 + headroom
+    // Floor 64, not 80: the Q8 table leaves the cache at ~708 slots, and 512 + 80 + 128 = 720 > 708 collapses the
+    // auto chunk to 256 (measured 186 tok/s against 261).  Letting the ring SHRINK to fit keeps chunk 512, which is
+    // worth far more than 16 ring slots - 512+68+128 = 708 fits exactly.
+    const int base = env > 0 ? env : std::min(512, std::max(64, from_cache));
     const int out = std::min(std::max(base, std::max(ring_slots(T), (int) STAGE_GRP)), ring_cap());
     {   // the depth the prompt path actually stages at, and where it came from, printed whenever it CHANGES.  This was
         // inferred from `wait copy` three times and read wrong twice - a depth is cheap to print and expensive to guess.
