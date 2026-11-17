@@ -425,7 +425,25 @@ int4 activations: not worth a precision change.
 instruction ceiling: **about 4 %**.  The shipped kernel already carries `acc[4][2][4]` = 32 accumulators, i.e. it is
 already at or past ILP16, so the dots are NOT what makes it 4,631 ms.  What is: the Q3_K unpack around them -
 `v_perm_b32` 120, `v_lshrrev_b32` 59, `v_alignbit_b32` 58 of 2,115 instructions - plus the LDS staging and the two
-`__syncthreads` per 64-value chunk.  **The A stage is an unpack-and-stage problem, not a dot-product problem.**
+`__syncthreads` per 64-value chunk.  **A first reading of this - "so it is an unpack problem" - was then measured and OVERTURNED.**  The Q3_K
+unpack (`qs` 2-bit field + hmask + the staged byte order) costs, in isolation, `probe_unpack.cpp`:
+
+```
+unpack ILP1 0.080 ns / 64 values    ILP4 0.072    ILP8 0.071    (903 Gvalue/s)
+dp4a   ILP16                                        9,932 Gvalue/s   (probe_ilp3, template, corrected accounting)
+dot8   ILP16                                       15,443 Gvalue/s   -> dot8 is 1.55x dp4a at equal ILP
+```
+
+The unpack is ~11x the dot PER VALUE - and it still cannot be the 4,631 ms, because the unpacked weight tile is
+reused by all 64 tokens of the tile: per staged weight value there are 64 tokens of dots, so the unpack is about
+**one eighth** of the inner work, not 86 %.  (The earlier `dot8 1.08x` figure was a 4x accounting error - an
+accumulator receives NINS x 4 = 16 values, not 64 - corrected above.)
+
+So the 4,631 ms is neither the dots (~4 % of the instruction ceiling) nor the unpack (amortised 64x): it is the
+staged-tile traffic and its ordering - two `__syncthreads` per 64-value chunk (40 barriers a tile), LDS bandwidth,
+and the five 128-row work items a 1,280-row expert splits into.  **The next measurement must time a WHOLE tile
+iteration**, not its parts: four pieces of this stage have now been measured in isolation and each one, multiplied
+out, indicts one of the other three.
 
 Probes kept in `tools/rdna2/probe_*.cpp` (f16 vs dp4a, dot8 rate, dot variants, ILP sweep).
 
