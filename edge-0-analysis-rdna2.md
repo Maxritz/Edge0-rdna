@@ -1774,6 +1774,46 @@
 > A stage is 4.6 s of dp4a work whose remaining cost is the arithmetic itself, not the loads.  Removing 37 % of
 > the shared traffic bought 2.6 %, which is the measure of how little of the stage was LDS-bound.
 
+> ### 0.53 The gdn stage (3,080 ms) is arithmetic-bound on the engine's own SIMT f16 GEMM - and nothing dispatches faster here
+>
+> `gdn` is the four dense projections a GDN layer runs before its conv (`native_proj` for attn_qkv and
+> attn_gate, `bf16_proj` for ssm_alpha and ssm_beta) - 3,080 ms, 18 % of device time, and never examined before.
+>
+> **Bound test, from the chunk.**  Weights are read once per *chunk*, so halving the chunk doubles the chunks:
+>
+> | component | chunk 512 (288 marks) | chunk 256 (576 marks) | verdict |
+> |---|---|---|---|
+> | **`gdn`** | 3,085 / 3,074 | **3,119** | per-chunk work halves, **total constant** -> **arithmetic-bound** |
+> | `gdn out proj` | 368 / 339 | **1,153** | 3.2x -> weight-bandwidth-bound |
+> | `qsa proj` | 413 / 408 | **1,280** | 3.1x -> weight-bandwidth-bound |
+>
+> So the projections split into two classes, and they need different work: `gdn`'s four (3,080 ms) scale with
+> tokens and need a faster GEMM; `gdn out proj` + `qsa proj` (~1,100 ms of the chunk-512 budget) scale with bytes.
+>
+> **Nothing faster dispatches on gfx1031.**  `Gemm::f16` tries, in order: `strata_pf_gemm_f16`
+> (`STRATA_PF_GEMM=1`), `strata_wmma_gemm_f16` (`STRATA_WMMA_GEMM=1`, RDNA3+), `f16_inplace`, hipBLASLt.  The
+> gfx11 padded variant is gated on `strata_pf_padded_gemm_available()`, which needs the WMMA product RDNA2 does
+> not have.  Measured, alternating:
+>
+> | arm | `gdn` |
+> |---|---|
+> | default | 3,075 / 3,082 ms |
+> | `STRATA_PF_GEMM=1` | 3,079 ms |
+> | `+ STRATA_WMMA_GEMM=1` | 3,084 ms |
+>
+> Flat to 0.3 %, output byte-identical everywhere.  Both opt-ins decline on this card, so `gdn` runs the engine's
+> own SIMT f16 GEMM and its 3,080 ms are that kernel's arithmetic.
+>
+> **The lever is packed fp16 - the one RDNA2 extension this tree has never used (0 occurrences of `v_pk_*` /
+> `V_DOT2_F32_F16` in the 0.32 audit).**  For an fp16 x fp16 -> f32 GEMM, `v_pk_fma_f16` and `V_DOT2_F32_F16` do
+> two fp16 multiplies per instruction against a scalar FMA's one, and RDNA2 has no tensor cores to compete with
+> them, so this is the *native* tool rather than a fallback.  A dense-GEMM inner loop rewritten that way is the
+> next real project on this engine: it targets 3,080 ms of arithmetic-bound work in prefill (`gdn`) and the same
+> kernel shape behind `qsa proj`, `gdn out proj` and the decode dense GEMVs.
+>
+> Sized honestly: 2x would be ~1.5 s of the 17.0 s prefill (~240 -> ~262 tok/s), and it is a kernel rewrite with
+> its own byte-exact gate (`gemm_f32_parity` / `gemm_bf16_parity` exist).
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
