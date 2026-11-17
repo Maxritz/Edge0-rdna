@@ -1437,6 +1437,51 @@
 > 5,298 ms at 29.9 % of device time, `wait copy` 2,530 ms, PLE blocked 1,562 ms, against 231.8 tok/s and a ~430
 > reference.  That is where the next work goes.
 
+> ### 0.43 Prefill is balanced host/GPU at 17.68 s each - the biggest single item is CPU-side, not the A stage
+>
+> The ledger as it stands after the ring-80 change (4063 tokens, chunk 512, wall 17,688 ms, 63,715 blobs
+> streamed = ~73.5 GB):
+>
+> | component | dev ms | %dev | host ms | %host |
+> |---|---|---|---|---|
+> | gemm gate/up (the A stage) | 5,388 | 30.5 % | 306 | 1.7 % |
+> | gdn | 3,086 | 17.5 % | 32 | 0.2 % |
+> | wait copy | 2,983 | 16.9 % | 7,547 | 42.7 % |
+> | gemm down | 1,146 | 6.5 % | 6 | 0.0 % |
+> | gather | 972 | 5.5 % | 51 | 0.3 % |
+> | hc read: down+silu | 680 | 3.8 % | 131 | 0.7 % |
+> | qsa attn | 632 | 3.6 % | 8 | 0.0 % |
+> | router+shared | 560 | 3.2 % | 51 | 0.3 % |
+> | qsa proj | 405 | 2.3 % | 9 | 0.0 % |
+> | hc read: up | 317 | 1.8 % | 13 | 0.1 % |
+> | gdn out proj | 331 | 1.9 % | 6 | 0.0 % |
+> | gdn recurrence | 303 | 1.7 % | 1 | 0.0 % |
+> | **host grouping** | 171 | 1.0 % | **9,335** | **52.8 %** |
+> | ... | | | | |
+> | **sum of marked phases** | **17,683** | 100 % | **17,675** | |
+>
+> **Device and host are balanced to within 0.05 %** (17,683 vs 17,675 ms), so prefill wall time is set by
+> *both*, and a change that only shortens the GPU timeline cannot move it: the host becomes the limit as soon as
+> the GPU drops below 17.68 s.  Every previous framing of this as "the A stage is 29.9 % of device time" was
+> therefore incomplete - the A stage is 30.5 % of a 17.7 s GPU timeline that is itself only half the story.
+>
+> **The largest single item in prefill is CPU-side: `host grouping` 9,335 ms = 52.8 % of host.**  It is the
+> expert-to-row grouping the prompt path does per layer-chunk, and it already runs off the timeline (dev 171 ms
+> against host 9,335 ms), so it is pure host CPU work that the GPU waits on through `wait copy` (host 7,547 ms,
+> device 2,983 ms).  Those two numbers are the same cost seen from both ends: the GPU idles 2.98 s waiting for
+> copies the host has not issued yet because the host is grouping.
+>
+> So the prefill work for the next stretch, in order:
+>
+> 1. **host grouping, 9.3 s of CPU** - it is the thing `wait copy` waits for.  Anything that makes it cheaper
+>    (fewer passes over the ids, batching the label compare, moving it onto the GPU) attacks both numbers at once.
+> 2. **gemm gate/up, 5.4 s of GPU** - the A stage proper; needs a lower-VGPR variant, and the earlier attempts at
+>    128 VGPR (234 spills, 2.4x slower) and `launch_bounds(256,2)` (ignored) both failed.
+> 3. `wait copy` 2.98 s of device idle - falls out of (1) in proportion.
+>
+> Doing (2) alone is the trap this ledger exposes: it would take the GPU to ~12 s and leave the wall at the
+> host's 17.7 s.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
