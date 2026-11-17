@@ -1360,6 +1360,44 @@
 >   against 136.60 ms in the degraded arm), over end-to-end tok/s.
 '
 
+> ### 0.41 The single-pass U merge is a REGRESSION (arithmetic from the engine's own slots), and the real defect is elsewhere
+>
+> The merge was the planned next step: the U table is read twice a layer, once for the GPU rows (`u: gemv`
+> 17.4 ms) and once for the CPU rows (`u: matvec` 11.0 ms), 2 x 48.7 MB = 4.67 GB a round.  It is not worth
+> doing, and the reason is the ordering in verify.cpp:
+>
+> ```
+> current :  U_gpu(17.4) + pool wait(6.7) + copy(0.19) + U_cpu(11.0) = 35.3 ms
+> merged  :  pool wait(24.1) + one pass(~17.4)                      = 41.5 ms   -> -6.4 ms
+> ```
+>
+> The U on the GPU rows runs **before** the wait for the CPU pool's activations, so 17.4 ms of it is hidden
+> behind the CPU's own work: `T_cpu = 17.4 + 6.7 = 24.1 ms`, and the 6.7 ms `u: pool wait` is exactly the
+> remainder.  A single pass cannot start until BOTH activation sets exist, so it trades a hidden 17.4 ms for an
+> exposed 17.4 ms and saves only the second read - a net loss.  **The double read is the price of using an
+> otherwise idle GPU during the pool's wait, and it is cheaper than the alternative.**
+>
+> **What the code shows is the actual defect: the table is read `cap` times a call, not once.**  `latent_u_k`
+> is one block per *(row, column tile)* - `r = blockIdx.x`, `h = blockIdx.y*warps + warp`, and each warp reads
+> `wb = u_q8 + g*H*wrow + h*wrow`, a full ELL-long weight row.  So one call reads
+>
+> ```
+> cap(10) rows x H(2560) columns x ELL(1792) weights x 1.0625 B = 48.7 MB a layer   (the table itself is 39 MB)
+> ```
+>
+> i.e. the weights are re-read for every routed row because every row is a separate block.  A decode tile that
+> puts the ~10 activation rows in registers and walks the columns once - one block per column tile, the shape
+> §0.19 named - would read the table **once**, 4.87 MB a layer instead of 48.7: about **10x less traffic**, and
+> it subsumes both calls because one pass serves every row.  That is the change worth making, and it is worth
+> far more than the merge (which only halves a cost this would divide by ten).
+>
+> Why the existing tiles do not already do it: `latent_u_tile_k` is the *prefill* tile with kUTileRows = 64,
+> which pads 10 real rows to 64 and stages 64 weight rows per block - §0.19 measured it neutral-to-worse here.
+> The missing kernel is the same idea at 8-16 rows with ~150 blocks a layer.
+>
+> So the plan changes: do not merge, write the decode tile.  It is a new kernel and it needs its own build,
+> alternating A/B and the 32-token gate, which is why it is not in this commit.
+
 **Audit date:** 2026-11-16
 **Revision audited:** `b826102` (`feat(kv): gate turbo3/rot4 on the Kraken-x CPU oracle; measure the prefetch question`), tree dirty in 14 paths (all logs / harness scripts, no source).
 **Target:** AMD Radeon RX 6700 XT, `gfx1031`, 20 CUs, 12 GiB, Windows 11 / WDDM, ROCm 10.2 userland (`C:\Rocm10`).
