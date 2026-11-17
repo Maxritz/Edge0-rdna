@@ -1537,6 +1537,43 @@ behaviour for a wrong answer that looks fast.
 decision, now sized slots).  Each was plausible and each was cheap to test because the OUTPUT check is immune to the
 GPU clock throttle - which is why this work could proceed on a throttled card at all.
 
+
+### 8v. `--expert-cache N` zeros: the g_cache_slots theory is DISPROVEN too - the ring line can be made IDENTICAL
+
+8u localised the defect to `g_cache_slots != 0` (auto published 0, explicit published the real count, and the two took
+different staging decisions).  Both publication sites were then gated behind `STRATA_SET_CACHE_SLOTS` - the SECOND one
+(generate.cpp:9438, in the split/serve planning) is the effective one; suppressing only the first changed nothing, which
+is itself worth knowing.  With both suppressed:
+
+    arm                                    ring line                                    output
+    auto            (T=256)    prefill ring: 64 slots (base 64, ..., cache slots 0)     CORRECT
+    explicit 1472   (T=832)    prefill ring: 64 slots (base 64, ..., cache slots 0)     ZEROS
+    explicit 1472   (T=256)    prefill ring: 64 slots (base 64, ..., cache slots 0)     ZEROS
+    explicit 1472   (T=512)    prefill ring: 64 slots (base 64, ..., cache slots 0)     ZEROS
+
+**An IDENTICAL ring line - same depth, same base, same published count, same chunk - still gives zeros for explicit
+and a correct answer for auto.**  So `g_cache_slots` is not the cause either; it was a correlate.
+
+Hypotheses now all eliminated by measurement, each with its own run:
+
+    capacity            384 / 448 / 512 / 640 / 700 / 1472 / 2000 / 3000 slots   all zeros
+    borrow              on and off                                               zeros either way
+    hit decision        (from 1fc98ed)                                           zeros either way
+    open_sized()        bypassed, uniform slots; explicit 1472 opened an
+                        IDENTICAL cache to auto (1472 slots, 1.60 GiB)           still zeros
+    ring depth          64 (same as the working auto run) / 128 / 256 / 316/512  all zeros
+    chunk               128 / 256 / 512 / 832                                    all zeros
+    g_cache_slots       publish suppressed at BOTH sites                         still zeros
+
+There is no `--expert-cache`-was-given flag in the source (`cache_given` / `expert_cache_set` / `explicit_cache` do not
+exist), so the branching is on `o.expert_cache > 0` or on `auto_cache` somewhere not yet instrumented.  **The next step is
+no longer a CLI bisect - every CLI-reachable axis is eliminated.  It needs a differential trace of the expert source
+between the two runs (which expert ids are requested, what the hit path returns, what the CPU pool sees), i.e. an
+instrumented build, not another flag sweep.**
+
+The refusal stands (the probe changes were reverted and the tree rebuilt), which remains the right behaviour: the flag
+still returns a wrong answer, and a wrong answer that looks fast is worse than a refusal.
+
 ## 7. The method that actually worked
 
 1. **Measure the component, never infer it from an aggregate.**  Every wrong conclusion this stretch came from a
