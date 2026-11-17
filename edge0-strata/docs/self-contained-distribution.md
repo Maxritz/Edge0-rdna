@@ -71,6 +71,45 @@ E:\.kpack\                        gfx1031 blas/fft/rand kpacks
    Pass the key through `STRATA_API_KEY`, not `--api-key`, so it stays out of the
    process list. Do not add `C:\Rocm10` to `PATH`; the DLLs are beside the exe.
 
+## Optional `edge0-infer` front-end
+
+`edge0-infer.exe` is a second, top-level binary. It is **not** a second inference
+engine for Edge0 120B: for that model it detects the pack, launches this Strata
+binary and proxies the API. It is the native inference engine only for Edge0 35B,
+which is not part of this distribution. The primary launcher therefore does not
+need it. Ship it as an optional CLI/API front-end when `edge0-infer serve` /
+`edge0-infer chat` compatibility is wanted.
+
+Its delegate mode requires a strata-shaped tree, so a small shim is staged next to
+the flat distribution:
+
+```
+E:\edge-0\
+  edge0-infer.exe                 built from edge0-infer/CMakePresets.json (windows)
+  EDGE0-INFER.bat                 opt-in launcher, default port 8000
+  api-key.txt                     key file for the proxy (non-loopback requires it)
+  strata-home\
+    edge0\CONTRACT                must equal the value edge0-infer supports (5)
+    edge0\models\edge0-120b.json  launch template with the RDNA2 config, absolute paths
+    serve\server.py               shim: adds runtime\app to sys.path and runpy's the real server
+```
+
+The launcher passes `--strata-dir <deploy>\strata-home` and
+`--strata-python <deploy>\runtime\python\python.exe`, so no checkout or `.venv`
+shim is used. The template must keep the verified RDNA2 engine arguments and
+`STRATA_LAT_FUSED_Q3K=0`; the upstream CUDA template must not be copied over it.
+`edge0-infer` strips `STRATA_API_KEY` from the engine child's environment and
+authenticates its own proxy with `--api-key-file`. Loopback requests are allowed
+without a key by design; non-loopback requests return 401 without it.
+
+The `cublas64_13.dll not found` warning from `edge0-infer` on AMD is expected and
+non-fatal. Do not run both launchers at once: only one GPU engine at a time.
+
+Verified on the distribution: `inspect --model E:\Edge0-120B-q3k --json` reports
+`delegated:true`, `/health` loaded, `/v1/models` `edge0-120b`, chat and
+`/v1/messages` OK on loopback and LAN, LAN 401 without a key, and only
+`edge0-infer.exe`, the bundled Python and `strata.exe` running from `E:\edge-0`.
+
 ## Verification checklist
 
 - `strata-device.exe --list-devices` reports the expected `gfx1031` card.
